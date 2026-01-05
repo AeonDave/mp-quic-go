@@ -2,17 +2,31 @@ package quic
 
 import (
 	"context"
+	"net"
 	"reflect"
 	"testing"
 	"time"
 
-	"github.com/quic-go/quic-go/internal/protocol"
-	"github.com/quic-go/quic-go/qlogwriter"
-	"github.com/quic-go/quic-go/quicvarint"
+	"github.com/AeonDave/mp-quic-go/internal/protocol"
+	"github.com/AeonDave/mp-quic-go/qlogwriter"
+	"github.com/AeonDave/mp-quic-go/quicvarint"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type testMultipathController struct{}
+
+func (testMultipathController) SelectPath(PathSelectionContext) (PathInfo, bool) {
+	return PathInfo{}, false
+}
+func (testMultipathController) PathIDForPacket(net.Addr, net.Addr) (PathID, bool) {
+	return 0, false
+}
+
+type testExtensionFrameHandler struct{}
+
+func (testExtensionFrameHandler) HandleFrame(ExtensionFrameContext) (int, error) { return 0, nil }
 
 func TestConfigValidation(t *testing.T) {
 	t.Run("nil config", func(t *testing.T) {
@@ -128,6 +142,26 @@ func configWithNonZeroNonFunctionFields(t *testing.T) *Config {
 			f.Set(reflect.ValueOf(true))
 		case "EnableStreamResetPartialDelivery":
 			f.Set(reflect.ValueOf(true))
+		case "MultipathController":
+			f.Set(reflect.ValueOf(&testMultipathController{}))
+		case "MultipathDuplicationPolicy":
+			policy := NewMultipathDuplicationPolicy()
+			policy.Enable()
+			f.Set(reflect.ValueOf(policy))
+		case "MultipathReinjectionPolicy":
+			policy := NewMultipathReinjectionPolicy()
+			policy.Enable()
+			f.Set(reflect.ValueOf(policy))
+		case "MultipathAutoPaths":
+			f.Set(reflect.ValueOf(true))
+		case "MultipathAutoAdvertise":
+			f.Set(reflect.ValueOf(true))
+		case "MultipathAutoAddrs":
+			f.Set(reflect.ValueOf([]net.IP{net.IPv4(127, 0, 0, 1)}))
+		case "MaxPaths":
+			f.Set(reflect.ValueOf(5))
+		case "ExtensionFrameHandler":
+			f.Set(reflect.ValueOf(&testExtensionFrameHandler{}))
 		default:
 			t.Fatalf("all fields must be accounted for, but saw unknown field %q", fn)
 		}

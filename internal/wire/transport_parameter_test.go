@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/quic-go/quic-go/internal/protocol"
-	"github.com/quic-go/quic-go/internal/qerr"
-	"github.com/quic-go/quic-go/quicvarint"
+	"github.com/AeonDave/mp-quic-go/internal/protocol"
+	"github.com/AeonDave/mp-quic-go/internal/qerr"
+	"github.com/AeonDave/mp-quic-go/quicvarint"
 
 	"github.com/stretchr/testify/require"
 )
@@ -49,10 +49,11 @@ func TestTransportParametersStringRepresentation(t *testing.T) {
 		StatelessResetToken:             &protocol.StatelessResetToken{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00},
 		ActiveConnectionIDLimit:         123,
 		MaxDatagramFrameSize:            876,
+		EnableMultipath:                 true,
 		EnableResetStreamAt:             true,
 		MinAckDelay:                     &minAckDelay,
 	}
-	expected := "&wire.TransportParameters{OriginalDestinationConnectionID: deadbeef, InitialSourceConnectionID: decafbad, RetrySourceConnectionID: deadc0de, InitialMaxStreamDataBidiLocal: 1234, InitialMaxStreamDataBidiRemote: 2345, InitialMaxStreamDataUni: 3456, InitialMaxData: 4567, MaxBidiStreamNum: 1337, MaxUniStreamNum: 7331, MaxIdleTimeout: 42s, AckDelayExponent: 14, MaxAckDelay: 37ms, ActiveConnectionIDLimit: 123, StatelessResetToken: 0x112233445566778899aabbccddeeff00, MaxDatagramFrameSize: 876, EnableResetStreamAt: true, MinAckDelay: 42ms}"
+	expected := "&wire.TransportParameters{OriginalDestinationConnectionID: deadbeef, InitialSourceConnectionID: decafbad, RetrySourceConnectionID: deadc0de, InitialMaxStreamDataBidiLocal: 1234, InitialMaxStreamDataBidiRemote: 2345, InitialMaxStreamDataUni: 3456, InitialMaxData: 4567, MaxBidiStreamNum: 1337, MaxUniStreamNum: 7331, MaxIdleTimeout: 42s, AckDelayExponent: 14, MaxAckDelay: 37ms, ActiveConnectionIDLimit: 123, StatelessResetToken: 0x112233445566778899aabbccddeeff00, MaxDatagramFrameSize: 876, EnableMultipath: true, EnableResetStreamAt: true, MinAckDelay: 42ms}"
 	require.Equal(t, expected, p.String())
 }
 
@@ -72,7 +73,7 @@ func TestTransportParametersStringRepresentationWithoutOptionalFields(t *testing
 		ActiveConnectionIDLimit:         89,
 		MaxDatagramFrameSize:            protocol.InvalidByteCount,
 	}
-	expected := "&wire.TransportParameters{OriginalDestinationConnectionID: deadbeef, InitialSourceConnectionID: (empty), InitialMaxStreamDataBidiLocal: 1234, InitialMaxStreamDataBidiRemote: 2345, InitialMaxStreamDataUni: 3456, InitialMaxData: 4567, MaxBidiStreamNum: 1337, MaxUniStreamNum: 7331, MaxIdleTimeout: 42s, AckDelayExponent: 14, MaxAckDelay: 37s, ActiveConnectionIDLimit: 89, EnableResetStreamAt: false}"
+	expected := "&wire.TransportParameters{OriginalDestinationConnectionID: deadbeef, InitialSourceConnectionID: (empty), InitialMaxStreamDataBidiLocal: 1234, InitialMaxStreamDataBidiRemote: 2345, InitialMaxStreamDataUni: 3456, InitialMaxData: 4567, MaxBidiStreamNum: 1337, MaxUniStreamNum: 7331, MaxIdleTimeout: 42s, AckDelayExponent: 14, MaxAckDelay: 37s, ActiveConnectionIDLimit: 89, EnableMultipath: false, EnableResetStreamAt: false}"
 	require.Equal(t, expected, p.String())
 }
 
@@ -99,6 +100,7 @@ func TestMarshalAndUnmarshalTransportParameters(t *testing.T) {
 		ActiveConnectionIDLimit:         2 + getRandomValueUpTo(quicvarint.Max-2),
 		MaxUDPPayloadSize:               1200 + protocol.ByteCount(getRandomValueUpTo(quicvarint.Max-1200)),
 		MaxDatagramFrameSize:            protocol.ByteCount(getRandomValue()),
+		EnableMultipath:                 getRandomValue()%2 == 0,
 		EnableResetStreamAt:             getRandomValue()%2 == 0,
 		MinAckDelay:                     &minAckDelay,
 	}
@@ -123,6 +125,7 @@ func TestMarshalAndUnmarshalTransportParameters(t *testing.T) {
 	require.Equal(t, params.ActiveConnectionIDLimit, p.ActiveConnectionIDLimit)
 	require.Equal(t, params.MaxUDPPayloadSize, p.MaxUDPPayloadSize)
 	require.Equal(t, params.MaxDatagramFrameSize, p.MaxDatagramFrameSize)
+	require.Equal(t, params.EnableMultipath, p.EnableMultipath)
 	require.Equal(t, params.EnableResetStreamAt, p.EnableResetStreamAt)
 	require.NotNil(t, p.MinAckDelay)
 	require.Equal(t, minAckDelay, *p.MinAckDelay)
@@ -600,6 +603,7 @@ func TestTransportParametersFromSessionTicket(t *testing.T) {
 		MaxUniStreamNum:                protocol.StreamNum(getRandomValueUpTo(uint64(protocol.MaxStreamCount))),
 		ActiveConnectionIDLimit:        2 + getRandomValueUpTo(quicvarint.Max-2),
 		MaxDatagramFrameSize:           protocol.ByteCount(getRandomValueUpTo(uint64(MaxDatagramSize))),
+		EnableMultipath:                getRandomValue()%2 == 0,
 		EnableResetStreamAt:            getRandomValue()%2 == 0,
 	}
 	require.True(t, params.ValidFor0RTT(params))
@@ -614,6 +618,7 @@ func TestTransportParametersFromSessionTicket(t *testing.T) {
 	require.Equal(t, params.MaxUniStreamNum, tp.MaxUniStreamNum)
 	require.Equal(t, params.ActiveConnectionIDLimit, tp.ActiveConnectionIDLimit)
 	require.Equal(t, params.MaxDatagramFrameSize, tp.MaxDatagramFrameSize)
+	require.Equal(t, params.EnableMultipath, tp.EnableMultipath)
 	require.Equal(t, params.EnableResetStreamAt, tp.EnableResetStreamAt)
 }
 
@@ -641,6 +646,7 @@ func TestTransportParametersValidFor0RTT(t *testing.T) {
 		MaxUniStreamNum:                6,
 		ActiveConnectionIDLimit:        7,
 		MaxDatagramFrameSize:           1000,
+		EnableMultipath:                true,
 	}
 
 	tests := []struct {
@@ -736,6 +742,11 @@ func TestTransportParametersValidFor0RTT(t *testing.T) {
 			modify: func(p *TransportParameters) { p.MaxDatagramFrameSize = saved.MaxDatagramFrameSize - 1 },
 			valid:  false,
 		},
+		{
+			name:   "EnableMultipath disabled",
+			modify: func(p *TransportParameters) { p.EnableMultipath = false },
+			valid:  false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -757,6 +768,7 @@ func TestTransportParametersValidAfter0RTT(t *testing.T) {
 		MaxUniStreamNum:                6,
 		ActiveConnectionIDLimit:        7,
 		MaxDatagramFrameSize:           1000,
+		EnableMultipath:                true,
 	}
 
 	tests := []struct {
@@ -850,6 +862,11 @@ func TestTransportParametersValidAfter0RTT(t *testing.T) {
 		{
 			name:   "MaxDatagramFrameSize reduced",
 			modify: func(p *TransportParameters) { p.MaxDatagramFrameSize = saved.MaxDatagramFrameSize - 1 },
+			reject: true,
+		},
+		{
+			name:   "EnableMultipath disabled",
+			modify: func(p *TransportParameters) { p.EnableMultipath = false },
 			reject: true,
 		},
 		{

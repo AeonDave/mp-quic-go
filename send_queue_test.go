@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/quic-go/quic-go/internal/protocol"
-	"github.com/quic-go/quic-go/internal/synctest"
+	"github.com/AeonDave/mp-quic-go/internal/protocol"
+	"github.com/AeonDave/mp-quic-go/internal/synctest"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -198,4 +198,146 @@ func TestSendQueueSendProbe(t *testing.T) {
 	addr := &net.UDPAddr{IP: net.IPv4(42, 42, 42, 42), Port: 42}
 	c.EXPECT().WriteTo([]byte("foobar"), addr)
 	q.SendProbe(getPacketWithContents([]byte("foobar")), addr)
+}
+
+type pathSendCall struct {
+	data    []byte
+	gsoSize uint16
+	ecn     protocol.ECN
+	addr    net.Addr
+	info    packetInfo
+}
+
+type testPathSendConn struct {
+	t     *testing.T
+	calls chan pathSendCall
+}
+
+func (c *testPathSendConn) WritePath(b []byte, gsoSize uint16, ecn protocol.ECN, addr net.Addr, info packetInfo) error {
+	c.calls <- pathSendCall{
+		data:    append([]byte(nil), b...),
+		gsoSize: gsoSize,
+		ecn:     ecn,
+		addr:    addr,
+		info:    info,
+	}
+	return nil
+}
+
+func (c *testPathSendConn) Write([]byte, uint16, protocol.ECN) error {
+	c.t.Helper()
+	c.t.Fatalf("unexpected Write call")
+	return nil
+}
+
+func (c *testPathSendConn) WriteTo([]byte, net.Addr) error {
+	c.t.Helper()
+	c.t.Fatalf("unexpected WriteTo call")
+	return nil
+}
+
+func (c *testPathSendConn) Close() error                          { return nil }
+func (c *testPathSendConn) LocalAddr() net.Addr                   { return &net.UDPAddr{} }
+func (c *testPathSendConn) RemoteAddr() net.Addr                  { return &net.UDPAddr{} }
+func (c *testPathSendConn) ChangeRemoteAddr(net.Addr, packetInfo) {}
+func (c *testPathSendConn) capabilities() connCapabilities        { return connCapabilities{} }
+
+func TestSendQueueSendPathUsesPathSender(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		conn := &testPathSendConn{
+			t:     t,
+			calls: make(chan pathSendCall, 1),
+		}
+		q := newSendQueue(conn).(*sendQueue)
+
+		errChan := make(chan error, 1)
+		go func() { errChan <- q.Run() }()
+
+		addr := &net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 4242}
+		q.SendPath(getPacketWithContents([]byte("foobar")), 0, protocol.ECNNon, addr, packetInfo{})
+		synctest.Wait()
+
+		select {
+		case call := <-conn.calls:
+			require.Equal(t, []byte("foobar"), call.data)
+			require.Equal(t, uint16(0), call.gsoSize)
+			require.Equal(t, protocol.ECNNon, call.ecn)
+			require.Equal(t, addr, call.addr)
+			require.Equal(t, packetInfo{}, call.info)
+		default:
+			t.Fatal("WritePath should have been called")
+		}
+
+		q.Close()
+		synctest.Wait()
+
+		select {
+		case err := <-errChan:
+			require.NoError(t, err)
+		default:
+			t.Fatal("Run should have returned")
+		}
+	})
+}
+
+type writeToCall struct {
+	data []byte
+	addr net.Addr
+}
+
+type testWriteToConn struct {
+	t      *testing.T
+	writes chan writeToCall
+}
+
+func (c *testWriteToConn) Write([]byte, uint16, protocol.ECN) error {
+	c.t.Helper()
+	c.t.Fatalf("unexpected Write call")
+	return nil
+}
+
+func (c *testWriteToConn) WriteTo(b []byte, addr net.Addr) error {
+	c.writes <- writeToCall{data: append([]byte(nil), b...), addr: addr}
+	return nil
+}
+
+func (c *testWriteToConn) Close() error                          { return nil }
+func (c *testWriteToConn) LocalAddr() net.Addr                   { return &net.UDPAddr{} }
+func (c *testWriteToConn) RemoteAddr() net.Addr                  { return &net.UDPAddr{} }
+func (c *testWriteToConn) ChangeRemoteAddr(net.Addr, packetInfo) {}
+func (c *testWriteToConn) capabilities() connCapabilities        { return connCapabilities{} }
+
+func TestSendQueueSendPathFallsBackToWriteTo(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		conn := &testWriteToConn{
+			t:      t,
+			writes: make(chan writeToCall, 1),
+		}
+		q := newSendQueue(conn).(*sendQueue)
+
+		errChan := make(chan error, 1)
+		go func() { errChan <- q.Run() }()
+
+		addr := &net.UDPAddr{IP: net.IPv4(10, 0, 0, 2), Port: 4243}
+		q.SendPath(getPacketWithContents([]byte("baz")), 0, protocol.ECNNon, addr, packetInfo{})
+		synctest.Wait()
+
+		select {
+		case call := <-conn.writes:
+			require.Equal(t, []byte("baz"), call.data)
+			require.Equal(t, addr, call.addr)
+		default:
+			t.Fatal("WriteTo should have been called")
+		}
+
+		q.Close()
+		synctest.Wait()
+
+		select {
+		case err := <-errChan:
+			require.NoError(t, err)
+		default:
+			t.Fatal("Run should have returned")
+		}
+	})
 }

@@ -4,14 +4,14 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/quic-go/quic-go/internal/protocol"
-	"github.com/quic-go/quic-go/quicvarint"
+	"github.com/AeonDave/mp-quic-go/internal/protocol"
+	"github.com/AeonDave/mp-quic-go/quicvarint"
 )
 
 // Clone clones a Config.
 func (c *Config) Clone() *Config {
-	copy := *c
-	return &copy
+	cc := *c
+	return &cc
 }
 
 func (c *Config) handshakeTimeout() time.Duration {
@@ -104,6 +104,10 @@ func populateConfig(config *Config) *Config {
 	if initialPacketSize == 0 {
 		initialPacketSize = protocol.InitialPacketSize
 	}
+	maxPaths := config.MaxPaths
+	if maxPaths == 0 {
+		maxPaths = 3 // default value
+	}
 
 	return &Config{
 		GetConfigForClient:               config.GetConfigForClient,
@@ -123,6 +127,14 @@ func populateConfig(config *Config) *Config {
 		InitialPacketSize:                initialPacketSize,
 		DisablePathMTUDiscovery:          config.DisablePathMTUDiscovery,
 		EnableStreamResetPartialDelivery: config.EnableStreamResetPartialDelivery,
+		MaxPaths:                         maxPaths,
+		MultipathController:              config.MultipathController,
+		MultipathDuplicationPolicy:       config.MultipathDuplicationPolicy,
+		MultipathReinjectionPolicy:       config.MultipathReinjectionPolicy,
+		MultipathAutoPaths:               config.MultipathAutoPaths,
+		MultipathAutoAdvertise:           config.MultipathAutoAdvertise,
+		MultipathAutoAddrs:               config.MultipathAutoAddrs,
+		ExtensionFrameHandler:            config.ExtensionFrameHandler,
 		Allow0RTT:                        config.Allow0RTT,
 		Tracer:                           config.Tracer,
 	}

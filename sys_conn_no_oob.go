@@ -15,7 +15,8 @@ func inspectReadBuffer(any) (int, error)  { return 0, nil }
 func inspectWriteBuffer(any) (int, error) { return 0, nil }
 
 type packetInfo struct {
-	addr netip.Addr
+	addr    netip.Addr
+	ifIndex uint32
 }
 
 func (i *packetInfo) OOB() []byte { return nil }

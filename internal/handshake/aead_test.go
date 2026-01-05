@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/quic-go/quic-go/internal/protocol"
+	"github.com/AeonDave/mp-quic-go/internal/protocol"
 
 	"github.com/stretchr/testify/require"
 )

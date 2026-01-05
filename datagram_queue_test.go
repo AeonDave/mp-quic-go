@@ -4,9 +4,9 @@ import (
 	"context"
 	"testing"
 
-	"github.com/quic-go/quic-go/internal/synctest"
-	"github.com/quic-go/quic-go/internal/utils"
-	"github.com/quic-go/quic-go/internal/wire"
+	"github.com/AeonDave/mp-quic-go/internal/synctest"
+	"github.com/AeonDave/mp-quic-go/internal/utils"
+	"github.com/AeonDave/mp-quic-go/internal/wire"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

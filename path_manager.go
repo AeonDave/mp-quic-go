@@ -6,21 +6,16 @@ import (
 	"slices"
 	"time"
 
-	"github.com/quic-go/quic-go/internal/ackhandler"
-	"github.com/quic-go/quic-go/internal/monotime"
-	"github.com/quic-go/quic-go/internal/protocol"
-	"github.com/quic-go/quic-go/internal/utils"
-	"github.com/quic-go/quic-go/internal/wire"
+	"github.com/AeonDave/mp-quic-go/internal/ackhandler"
+	"github.com/AeonDave/mp-quic-go/internal/monotime"
+	"github.com/AeonDave/mp-quic-go/internal/protocol"
+	"github.com/AeonDave/mp-quic-go/internal/utils"
+	"github.com/AeonDave/mp-quic-go/internal/wire"
 )
 
 type pathID int64
 
 const invalidPathID pathID = -1
-
-// Maximum number of paths to keep track of.
-// If the peer probes another path (before the pathTimeout of an existing path expires),
-// this probing attempt is ignored.
-const maxPaths = 3
 
 // If no packet is received for a path for pathTimeout,
 // the path can be evicted when the peer probes another path.
@@ -45,18 +40,24 @@ type pathManager struct {
 	getConnID    func(pathID) (_ protocol.ConnectionID, ok bool)
 	retireConnID func(pathID)
 
-	logger utils.Logger
+	maxPaths int
+	logger   utils.Logger
 }
 
 func newPathManager(
 	getConnID func(pathID) (_ protocol.ConnectionID, ok bool),
 	retireConnID func(pathID),
+	maxPaths int,
 	logger utils.Logger,
 ) *pathManager {
+	if maxPaths <= 0 {
+		maxPaths = 3 // default
+	}
 	return &pathManager{
 		paths:        make([]*path, 0, maxPaths+1),
 		getConnID:    getConnID,
 		retireConnID: retireConnID,
+		maxPaths:     maxPaths,
 		logger:       logger,
 	}
 }
@@ -93,7 +94,7 @@ func (pm *pathManager) HandlePacket(
 		}
 	}
 
-	if len(pm.paths) >= maxPaths {
+	if len(pm.paths) >= pm.maxPaths {
 		if pm.paths[0].lastPacketTime.Add(pathTimeout).After(t) {
 			if pm.logger.Debug() {
 				pm.logger.Debugf("received packet for previously unseen path %s, but already have %d paths", remoteAddr, len(pm.paths))
@@ -190,17 +191,5 @@ func (pm *pathManagerAckHandler) OnLost(f wire.Frame) {
 			pm.retireConnID(path.id)
 			break
 		}
-	}
 }
-
-func addrsEqual(addr1, addr2 net.Addr) bool {
-	if addr1 == nil || addr2 == nil {
-		return false
-	}
-	a1, ok1 := addr1.(*net.UDPAddr)
-	a2, ok2 := addr2.(*net.UDPAddr)
-	if ok1 && ok2 {
-		return a1.IP.Equal(a2.IP) && a1.Port == a2.Port
-	}
-	return addr1.String() == addr2.String()
 }

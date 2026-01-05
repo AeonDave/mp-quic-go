@@ -7,11 +7,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/quic-go/quic-go/internal/ackhandler"
-	"github.com/quic-go/quic-go/internal/flowcontrol"
-	"github.com/quic-go/quic-go/internal/monotime"
-	"github.com/quic-go/quic-go/internal/protocol"
-	"github.com/quic-go/quic-go/internal/wire"
+	"github.com/AeonDave/mp-quic-go/internal/ackhandler"
+	"github.com/AeonDave/mp-quic-go/internal/flowcontrol"
+	"github.com/AeonDave/mp-quic-go/internal/monotime"
+	"github.com/AeonDave/mp-quic-go/internal/protocol"
+	"github.com/AeonDave/mp-quic-go/internal/wire"
 )
 
 type deadlineError struct{}

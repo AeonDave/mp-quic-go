@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/quic-go/quic-go/internal/protocol"
-	"github.com/quic-go/quic-go/internal/qerr"
-	"github.com/quic-go/quic-go/quicvarint"
+	"github.com/AeonDave/mp-quic-go/internal/protocol"
+	"github.com/AeonDave/mp-quic-go/internal/qerr"
+	"github.com/AeonDave/mp-quic-go/quicvarint"
 )
 
 var errUnknownFrameType = errors.New("unknown frame type")
@@ -18,10 +18,13 @@ type FrameParser struct {
 	supportsDatagrams     bool
 	supportsResetStreamAt bool
 	supportsAckFrequency  bool
+	supportsMultipath     bool
 
 	// To avoid allocating when parsing, keep a single ACK frame struct.
 	// It is used over and over again.
 	ackFrame *AckFrame
+
+	allowUnknownFrameTypes bool
 }
 
 // NewFrameParser creates a new frame parser.
@@ -52,11 +55,11 @@ func (p *FrameParser) ParseType(b []byte, encLevel protocol.EncryptionLevel) (Fr
 			continue
 		}
 		ft := FrameType(typ)
-		valid := ft.isValidRFC9000() ||
-			(p.supportsDatagrams && ft.IsDatagramFrameType()) ||
-			(p.supportsResetStreamAt && ft == FrameTypeResetStreamAt) ||
-			(p.supportsAckFrequency && (ft == FrameTypeAckFrequency || ft == FrameTypeImmediateAck))
+		valid := p.IsKnownFrameType(ft)
 		if !valid {
+			if p.allowUnknownFrameTypes {
+				return ft, parsed, nil
+			}
 			return 0, parsed, &qerr.TransportError{
 				ErrorCode:    qerr.FrameEncodingError,
 				FrameType:    typ,
@@ -73,6 +76,25 @@ func (p *FrameParser) ParseType(b []byte, encLevel protocol.EncryptionLevel) (Fr
 		return ft, parsed, nil
 	}
 	return 0, parsed, io.EOF
+}
+
+// AllowUnknownFrameTypes enables parsing of frame types not known to quic-go.
+func (p *FrameParser) AllowUnknownFrameTypes() {
+	p.allowUnknownFrameTypes = true
+}
+
+// EnableMultipath enables parsing of multipath extension frames.
+func (p *FrameParser) EnableMultipath() {
+	p.supportsMultipath = true
+}
+
+// IsKnownFrameType reports if the frame type is supported by the parser.
+func (p *FrameParser) IsKnownFrameType(frameType FrameType) bool {
+	return frameType.isValidRFC9000() ||
+		(p.supportsDatagrams && frameType.IsDatagramFrameType()) ||
+		(p.supportsResetStreamAt && frameType == FrameTypeResetStreamAt) ||
+		(p.supportsAckFrequency && (frameType == FrameTypeAckFrequency || frameType == FrameTypeImmediateAck)) ||
+		(p.supportsMultipath && (frameType == FrameTypeAddAddress || frameType == FrameTypePaths || frameType == FrameTypeClosePath))
 }
 
 func (p *FrameParser) ParseStreamFrame(frameType FrameType, data []byte, v protocol.Version) (*StreamFrame, int, error) {
@@ -165,6 +187,12 @@ func (p *FrameParser) ParseLessCommonFrame(frameType FrameType, data []byte, v p
 		frame, l, err = parseAckFrequencyFrame(data, v)
 	case FrameTypeImmediateAck:
 		frame = &ImmediateAckFrame{}
+	case FrameTypeAddAddress:
+		frame, l, err = parseAddAddressFrame(data, v)
+	case FrameTypePaths:
+		frame, l, err = parsePathsFrame(data, v)
+	case FrameTypeClosePath:
+		frame, l, err = parseClosePathFrame(data, v)
 	default:
 		err = errUnknownFrameType
 	}

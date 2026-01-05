@@ -7,9 +7,9 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/http3/qlog"
-	"github.com/quic-go/quic-go/testutils/events"
+	"github.com/AeonDave/mp-quic-go"
+	"github.com/AeonDave/mp-quic-go/http3/qlog"
+	"github.com/AeonDave/mp-quic-go/testutils/events"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

@@ -11,9 +11,9 @@ import (
 	"slices"
 	"time"
 
-	"github.com/quic-go/quic-go/internal/protocol"
-	"github.com/quic-go/quic-go/internal/qerr"
-	"github.com/quic-go/quic-go/quicvarint"
+	"github.com/AeonDave/mp-quic-go/internal/protocol"
+	"github.com/AeonDave/mp-quic-go/internal/qerr"
+	"github.com/AeonDave/mp-quic-go/quicvarint"
 )
 
 // AdditionalTransportParametersClient are additional transport parameters that will be added
@@ -46,6 +46,8 @@ const (
 	retrySourceConnectionIDParameterID         transportParameterID = 0x10
 	// RFC 9221
 	maxDatagramFrameSizeParameterID transportParameterID = 0x20
+	// Multipath QUIC (private use for mp-quic-go)
+	enableMultipathParameterID transportParameterID = 0x1f0f9c0d2a
 	// https://datatracker.ietf.org/doc/draft-ietf-quic-reliable-stream-reset/06/
 	resetStreamAtParameterID transportParameterID = 0x17f7586d2cb571
 	// https://datatracker.ietf.org/doc/draft-ietf-quic-ack-frequency/11/
@@ -88,6 +90,7 @@ type TransportParameters struct {
 	ActiveConnectionIDLimit uint64
 
 	MaxDatagramFrameSize protocol.ByteCount // RFC 9221
+	EnableMultipath      bool               // Multipath QUIC (mp-quic-go private use)
 	EnableResetStreamAt  bool               // https://datatracker.ietf.org/doc/draft-ietf-quic-reliable-stream-reset/06/
 	MinAckDelay          *time.Duration
 }
@@ -210,6 +213,11 @@ func (p *TransportParameters) unmarshal(b []byte, sentBy protocol.Perspective, f
 				return fmt.Errorf("wrong length for reset_stream_at: %d (expected empty)", paramLen)
 			}
 			p.EnableResetStreamAt = true
+		case enableMultipathParameterID:
+			if paramLen != 0 {
+				return fmt.Errorf("wrong length for enable_multipath: %d (expected empty)", paramLen)
+			}
+			p.EnableMultipath = true
 		default:
 			b = b[paramLen:]
 		}
@@ -450,6 +458,11 @@ func (p *TransportParameters) Marshal(pers protocol.Perspective) []byte {
 	if p.MaxDatagramFrameSize != protocol.InvalidByteCount {
 		b = p.marshalVarintParam(b, maxDatagramFrameSizeParameterID, uint64(p.MaxDatagramFrameSize))
 	}
+	// Multipath QUIC (mp-quic-go private use)
+	if p.EnableMultipath {
+		b = quicvarint.Append(b, uint64(enableMultipathParameterID))
+		b = quicvarint.Append(b, 0)
+	}
 	// QUIC Stream Resets with Partial Delivery
 	if p.EnableResetStreamAt {
 		b = quicvarint.Append(b, uint64(resetStreamAtParameterID))
@@ -505,6 +518,11 @@ func (p *TransportParameters) MarshalForSessionTicket(b []byte) []byte {
 	if p.MaxDatagramFrameSize != protocol.InvalidByteCount {
 		b = p.marshalVarintParam(b, maxDatagramFrameSizeParameterID, uint64(p.MaxDatagramFrameSize))
 	}
+	// enable_multipath
+	if p.EnableMultipath {
+		b = quicvarint.Append(b, uint64(enableMultipathParameterID))
+		b = quicvarint.Append(b, 0)
+	}
 	// reset_stream_at
 	if p.EnableResetStreamAt {
 		b = quicvarint.Append(b, uint64(resetStreamAtParameterID))
@@ -530,6 +548,9 @@ func (p *TransportParameters) ValidFor0RTT(saved *TransportParameters) bool {
 	if saved.MaxDatagramFrameSize != protocol.InvalidByteCount && (p.MaxDatagramFrameSize == protocol.InvalidByteCount || p.MaxDatagramFrameSize < saved.MaxDatagramFrameSize) {
 		return false
 	}
+	if saved.EnableMultipath && !p.EnableMultipath {
+		return false
+	}
 	return p.InitialMaxStreamDataBidiLocal >= saved.InitialMaxStreamDataBidiLocal &&
 		p.InitialMaxStreamDataBidiRemote >= saved.InitialMaxStreamDataBidiRemote &&
 		p.InitialMaxStreamDataUni >= saved.InitialMaxStreamDataUni &&
@@ -543,6 +564,9 @@ func (p *TransportParameters) ValidFor0RTT(saved *TransportParameters) bool {
 // It is only used on the client side.
 func (p *TransportParameters) ValidForUpdate(saved *TransportParameters) bool {
 	if saved.MaxDatagramFrameSize != protocol.InvalidByteCount && (p.MaxDatagramFrameSize == protocol.InvalidByteCount || p.MaxDatagramFrameSize < saved.MaxDatagramFrameSize) {
+		return false
+	}
+	if saved.EnableMultipath && !p.EnableMultipath {
 		return false
 	}
 	return p.ActiveConnectionIDLimit >= saved.ActiveConnectionIDLimit &&
@@ -572,6 +596,8 @@ func (p *TransportParameters) String() string {
 		logString += ", MaxDatagramFrameSize: %d"
 		logParams = append(logParams, p.MaxDatagramFrameSize)
 	}
+	logString += ", EnableMultipath: %t"
+	logParams = append(logParams, p.EnableMultipath)
 	logString += ", EnableResetStreamAt: %t"
 	logParams = append(logParams, p.EnableResetStreamAt)
 	if p.MinAckDelay != nil {

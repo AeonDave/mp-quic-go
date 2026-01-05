@@ -98,6 +98,12 @@ type ByteCount int64
 
 type AtomicByteCount atomic.Int64
 
+// A PathID identifies a network path for multipath QUIC.
+type PathID uint64
+
+// InvalidPathID represents an unspecified path.
+const InvalidPathID PathID = ^PathID(0)
+
 // MaxByteCount is the maximum value of a ByteCount
 const MaxByteCount = ByteCount(1<<62 - 1)
 

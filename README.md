@@ -2,60 +2,169 @@
   <img src="./assets/quic-go-logo.png" width="700" height="auto">
 </div>
 
-# A QUIC implementation in pure Go
+# mp-quic-go: QUIC with Multipath Support
 
+mp-quic-go is a fork of [quic-go](https://github.com/quic-go/quic-go) that adds production-grade multipath QUIC while keeping full compatibility with standard QUIC.
+All credits for the base implementation go to the original authors.
 
-[![Documentation](https://img.shields.io/badge/docs-quic--go.net-red?style=flat)](https://quic-go.net/docs/)
-[![PkgGoDev](https://pkg.go.dev/badge/github.com/quic-go/quic-go)](https://pkg.go.dev/github.com/quic-go/quic-go)
-[![Code Coverage](https://img.shields.io/codecov/c/github/quic-go/quic-go/master.svg?style=flat-square)](https://codecov.io/gh/quic-go/quic-go/)
-[![Fuzzing Status](https://oss-fuzz-build-logs.storage.googleapis.com/badges/quic-go.svg)](https://issues.oss-fuzz.com/issues?q=quic-go)
+quic-go implements QUIC ([RFC 9000](https://datatracker.ietf.org/doc/html/rfc9000), [RFC 9001](https://datatracker.ietf.org/doc/html/rfc9001), [RFC 9002](https://datatracker.ietf.org/doc/html/rfc9002)) in Go, with support for HTTP/3 ([RFC 9114](https://datatracker.ietf.org/doc/html/rfc9114)), QPACK ([RFC 9204](https://datatracker.ietf.org/doc/html/rfc9204)), and HTTP Datagrams ([RFC 9297](https://datatracker.ietf.org/doc/html/rfc9297)).
 
-quic-go is an implementation of the QUIC protocol ([RFC 9000](https://datatracker.ietf.org/doc/html/rfc9000), [RFC 9001](https://datatracker.ietf.org/doc/html/rfc9001), [RFC 9002](https://datatracker.ietf.org/doc/html/rfc9002)) in Go. It has support for HTTP/3 ([RFC 9114](https://datatracker.ietf.org/doc/html/rfc9114)), including QPACK ([RFC 9204](https://datatracker.ietf.org/doc/html/rfc9204)) and HTTP Datagrams ([RFC 9297](https://datatracker.ietf.org/doc/html/rfc9297)).
+## Multipath QUIC Features
 
-In addition to these base RFCs, it also implements the following RFCs:
+This fork extends quic-go with:
 
-* Unreliable Datagram Extension ([RFC 9221](https://datatracker.ietf.org/doc/html/rfc9221))
-* Datagram Packetization Layer Path MTU Discovery (DPLPMTUD, [RFC 8899](https://datatracker.ietf.org/doc/html/rfc8899))
-* QUIC Version 2 ([RFC 9369](https://datatracker.ietf.org/doc/html/rfc9369))
-* QUIC Event Logging using qlog ([draft-ietf-quic-qlog-main-schema](https://datatracker.ietf.org/doc/draft-ietf-quic-qlog-main-schema/) and [draft-ietf-quic-qlog-quic-events](https://datatracker.ietf.org/doc/draft-ietf-quic-qlog-quic-events/))
-* QUIC Stream Resets with Partial Delivery ([draft-ietf-quic-reliable-stream-reset](https://datatracker.ietf.org/doc/html/draft-ietf-quic-reliable-stream-reset-07))
+- Multiple path scheduling algorithms: RoundRobin, LowLatency, MinRTT (bias-based)
+- Per-path packet numbers, RTT tracking, and congestion control (OLIA)
+- Packet duplication with configurable policies and target counts
+- Packet reinjection with preferred paths, queue limits, and backoff
+- Runtime path management (add, validate, activate, close)
+- Transport parameter negotiation for opt-in multipath
+- Optional multi-socket manager for hot-plug interfaces and local address fan-out
+- Full RFC 9000 compatibility in single-path mode
 
-Support for WebTransport over HTTP/3 ([draft-ietf-webtrans-http3](https://datatracker.ietf.org/doc/draft-ietf-webtrans-http3/)) is implemented in [webtransport-go](https://github.com/quic-go/webtransport-go).
+## Quick Start: Multipath
 
-Detailed documentation can be found on [quic-go.net](https://quic-go.net/docs/).
+```go
+import quic "github.com/AeonDave/mp-quic-go"
 
-## Projects using quic-go
+config := &quic.Config{
+    MaxPaths: 5,
+    MultipathController: quic.NewDefaultMultipathController(
+        quic.NewRoundRobinScheduler(),
+    ),
+}
 
-| Project                                                   | Description                                                                                                                                                       | Stars                                                                                               |
-| ---------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| [AdGuardHome](https://github.com/AdguardTeam/AdGuardHome) | Free and open source, powerful network-wide ads & trackers blocking DNS server.                                                                                   | ![GitHub Repo stars](https://img.shields.io/github/stars/AdguardTeam/AdGuardHome?style=flat-square) |
-| [algernon](https://github.com/xyproto/algernon)           | Small self-contained pure-Go web server with Lua, Markdown, HTTP/2, QUIC, Redis and PostgreSQL support                                                            | ![GitHub Repo stars](https://img.shields.io/github/stars/xyproto/algernon?style=flat-square)        |
-| [caddy](https://github.com/caddyserver/caddy/)            | Fast, multi-platform web server with automatic HTTPS                                                                                                              | ![GitHub Repo stars](https://img.shields.io/github/stars/caddyserver/caddy?style=flat-square)       |
-| [cloudflared](https://github.com/cloudflare/cloudflared)  | A tunneling daemon that proxies traffic from the Cloudflare network to your origins                                                                               | ![GitHub Repo stars](https://img.shields.io/github/stars/cloudflare/cloudflared?style=flat-square)  |
-| [frp](https://github.com/fatedier/frp)                    | A fast reverse proxy to help you expose a local server behind a NAT or firewall to the internet                                                                   | ![GitHub Repo stars](https://img.shields.io/github/stars/fatedier/frp?style=flat-square)            |
-| [go-libp2p](https://github.com/libp2p/go-libp2p)          | libp2p implementation in Go, powering [Kubo](https://github.com/ipfs/kubo) (IPFS) and [Lotus](https://github.com/filecoin-project/lotus) (Filecoin), among others | ![GitHub Repo stars](https://img.shields.io/github/stars/libp2p/go-libp2p?style=flat-square)     |
-| [gost](https://github.com/go-gost/gost)                   | A simple security tunnel written in Go                                                                                                                        | ![GitHub Repo stars](https://img.shields.io/github/stars/go-gost/gost?style=flat-square)            |
-| [Hysteria](https://github.com/apernet/hysteria)           | A powerful, lightning fast and censorship resistant proxy                                                                                                         | ![GitHub Repo stars](https://img.shields.io/github/stars/apernet/hysteria?style=flat-square)        |
-| [Mercure](https://github.com/dunglas/mercure)             | An open, easy, fast, reliable and battery-efficient solution for real-time communications                                                                         | ![GitHub Repo stars](https://img.shields.io/github/stars/dunglas/mercure?style=flat-square)         |
-| [nodepass](https://github.com/yosebyte/nodepass) | A secure, efficient TCP/UDP tunneling solution that delivers fast, reliable access across network restrictions using pre-established TCP/QUIC connections | ![GitHub Repo stars](https://img.shields.io/github/stars/yosebyte/nodepass?style=flat-square)  |
-| [OONI Probe](https://github.com/ooni/probe-cli)           | Next generation OONI Probe. Library and CLI tool.                                                                                                                 | ![GitHub Repo stars](https://img.shields.io/github/stars/ooni/probe-cli?style=flat-square)          |
-| [reverst](https://github.com/flipt-io/reverst)            | Reverse Tunnels in Go over HTTP/3 and QUIC                                                                                                                        | ![GitHub Repo stars](https://img.shields.io/github/stars/flipt-io/reverst?style=flat-square) |
-| [RoadRunner](https://github.com/roadrunner-server/roadrunner) | High-performance PHP application server, process manager written in Go and powered with plugins | ![GitHub Repo stars](https://img.shields.io/github/stars/roadrunner-server/roadrunner?style=flat-square) |
-| [syncthing](https://github.com/syncthing/syncthing/)      | Open Source Continuous File Synchronization                                                                                                                       | ![GitHub Repo stars](https://img.shields.io/github/stars/syncthing/syncthing?style=flat-square)     |
-| [traefik](https://github.com/traefik/traefik)             | The Cloud Native Application Proxy                                                                                                                                | ![GitHub Repo stars](https://img.shields.io/github/stars/traefik/traefik?style=flat-square)         |
-| [v2ray-core](https://github.com/v2fly/v2ray-core)         | A platform for building proxies to bypass network restrictions                                                                                                    | ![GitHub Repo stars](https://img.shields.io/github/stars/v2fly/v2ray-core?style=flat-square)        |
-| [YoMo](https://github.com/yomorun/yomo)                   | Streaming Serverless Framework for Geo-distributed System                                                                                                         | ![GitHub Repo stars](https://img.shields.io/github/stars/yomorun/yomo?style=flat-square)            |
+conn, err := quic.DialAddr(context.Background(), "localhost:4242", tlsConf, config)
+if err != nil {
+    // handle error
+}
 
-If you'd like to see your project added to this list, please send us a PR.
+// Multipath activates only when both peers advertise support.
+// If the peer is not multipath-aware, the connection stays single-path.
+```
 
-## Release Policy
+## Auto-Path Creation + ADD_ADDRESS (Opt-in)
 
-quic-go always aims to support the latest two Go releases.
+```go
+config := &quic.Config{
+    MaxPaths:              5,
+    MultipathController:   quic.NewDefaultMultipathController(quic.NewLowLatencyScheduler()),
+    MultipathAutoPaths:     true,
+    MultipathAutoAdvertise: true,
+    // Optional allowlist:
+    // MultipathAutoAddrs: []net.IP{net.ParseIP("192.168.1.10"), net.ParseIP("10.0.0.2")},
+}
+```
 
-## Contributing
+## Multipath Policies
 
-We are always happy to welcome new contributors! We have a number of self-contained issues that are suitable for first-time contributors, they are tagged with [help wanted](https://github.com/quic-go/quic-go/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22). If you have any questions, please feel free to reach out by opening an issue or leaving a comment.
+### Packet Duplication
+
+```go
+dup := quic.NewMultipathDuplicationPolicy()
+dup.Enable()
+dup.SetDuplicatePathCount(2) // original + one duplicate
+
+a := &quic.Config{
+    MaxPaths: 3,
+    MultipathController: quic.NewDefaultMultipathController(
+        quic.NewLowLatencyScheduler(),
+    ),
+    MultipathDuplicationPolicy: dup,
+}
+```
+
+### Packet Reinjection
+
+```go
+reinjection := quic.NewMultipathReinjectionPolicy()
+reinjection.Enable()
+reinjection.SetReinjectionDelay(50 * time.Millisecond)
+reinjection.SetMaxReinjections(2)
+reinjection.SetMaxReinjectionQueuePerPath(4)
+reinjection.SetMinReinjectionInterval(20 * time.Millisecond)
+
+config := &quic.Config{
+    MaxPaths: 3,
+    MultipathController: quic.NewDefaultMultipathController(
+        quic.NewMinRTTScheduler(0.7),
+    ),
+    MultipathReinjectionPolicy: reinjection,
+}
+```
+
+## Multi-Socket Manager (Optional)
+
+The multi-socket manager provides a `net.PacketConn` that can send from multiple local IPs and react to interface changes.
+It can be used with `Dial` / `Listen`:
+
+```go
+base, _ := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+mgr, _ := quic.NewMultiSocketManager(quic.MultiSocketManagerConfig{BaseConn: base})
+_ = mgr.SetLocalAddrs([]net.IP{net.ParseIP("192.168.1.10"), net.ParseIP("10.0.0.2")})
+
+conn, err := quic.Dial(context.Background(), mgr, serverAddr, tlsConf, config)
+```
+
+## Standard QUIC Features
+
+- Unreliable Datagram Extension ([RFC 9221](https://datatracker.ietf.org/doc/html/rfc9221))
+- Datagram Packetization Layer Path MTU Discovery ([RFC 8899](https://datatracker.ietf.org/doc/html/rfc8899))
+- QUIC Version 2 ([RFC 9369](https://datatracker.ietf.org/doc/html/rfc9369))
+- qlog tracing (draft-ietf-quic-qlog-main-schema / draft-ietf-quic-qlog-quic-events)
+- Stream Resets with Partial Delivery (draft-ietf-quic-reliable-stream-reset)
+
+## Documentation
+
+- Architecture & implementation guide: `docs/MP_QUIC_README.md`
+- Usage examples: `docs/MULTIPATH_EXAMPLES.md`
+- GoDoc: https://pkg.go.dev/github.com/AeonDave/mp-quic-go
+- Upstream QUIC docs: https://quic-go.net/docs/
+
+## Installation
+
+```bash
+go get -u github.com/AeonDave/mp-quic-go
+```
+
+## Requirements
+
+- Go 1.21 or later
+- For multipath: Linux, macOS, or Windows with multiple network interfaces
+
+## Testing
+
+```bash
+go test ./...
+```
+
+Multipath-specific tests:
+
+```bash
+go test -v -run TestMultipath
+```
+
+## Compatibility with Upstream quic-go
+
+- Drop-in replacement for standard quic-go
+- Multipath is opt-in and negotiated via transport parameters
+- Standard QUIC behavior is preserved when multipath is disabled
+
+## Differences from Upstream quic-go
+
+| Feature | Upstream | This Fork |
+|---------|----------|-----------|
+| Multiple paths | No | Yes |
+| Path scheduling | No | RoundRobin, LowLatency, MinRTT |
+| Congestion control | NewReno | NewReno + OLIA |
+| Packet duplication | No | Yes |
+| Packet reinjection | No | Yes |
+| Per-path packet numbers | No | Yes |
+| Path limits | Fixed | Configurable (`MaxPaths`) |
+| Path statistics | Limited | Per-path stats and RTT |
+| Multi-socket manager | No | Optional |
 
 ## License
 
-The code is licensed under the MIT license. The logo and brand assets are excluded from the MIT license. See [assets/LICENSE.md](https://github.com/quic-go/quic-go/tree/master/assets/LICENSE.md) for the full usage policy and details.
+The code is licensed under the MIT license. The logo and brand assets are excluded from the MIT license.
+See `assets/LICENSE.md` for the full usage policy and details.

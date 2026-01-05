@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/quic-go/quic-go/internal/protocol"
-	"github.com/quic-go/quic-go/internal/qerr"
-	"github.com/quic-go/quic-go/quicvarint"
+	"github.com/AeonDave/mp-quic-go/internal/protocol"
+	"github.com/AeonDave/mp-quic-go/internal/qerr"
+	"github.com/AeonDave/mp-quic-go/quicvarint"
 	"github.com/stretchr/testify/require"
 )
 
@@ -567,6 +567,17 @@ func TestFrameParserInvalidFrameType(t *testing.T) {
 	var transportErr *qerr.TransportError
 	require.ErrorAs(t, err, &transportErr)
 	require.Equal(t, qerr.FrameEncodingError, transportErr.ErrorCode)
+}
+
+func TestFrameParserAllowsUnknownFrameTypes(t *testing.T) {
+	parser := NewFrameParser(true, true, true)
+	parser.AllowUnknownFrameTypes()
+
+	require.False(t, parser.IsKnownFrameType(FrameType(0x42)))
+	frameType, l, err := parser.ParseType(encodeVarInt(0x42), protocol.Encryption1RTT)
+	require.NoError(t, err)
+	require.Equal(t, FrameType(0x42), frameType)
+	require.Equal(t, 2, l)
 }
 
 func TestFrameParsingErrorsOnInvalidFrames(t *testing.T) {

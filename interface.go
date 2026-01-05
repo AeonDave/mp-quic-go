@@ -8,9 +8,9 @@ import (
 	"slices"
 	"time"
 
-	"github.com/quic-go/quic-go/internal/handshake"
-	"github.com/quic-go/quic-go/internal/protocol"
-	"github.com/quic-go/quic-go/qlogwriter"
+	"github.com/AeonDave/mp-quic-go/internal/handshake"
+	"github.com/AeonDave/mp-quic-go/internal/protocol"
+	"github.com/AeonDave/mp-quic-go/qlogwriter"
 )
 
 // The StreamID is the ID of a QUIC stream.
@@ -30,6 +30,111 @@ const (
 func SupportedVersions() []Version {
 	// clone the slice to prevent the caller from modifying the slice
 	return slices.Clone(protocol.SupportedVersions)
+}
+
+// PathID identifies a network path.
+type PathID = protocol.PathID
+
+// InvalidPathID represents an unspecified path.
+const InvalidPathID PathID = protocol.InvalidPathID
+
+// PacketNumber is a QUIC packet number.
+type PacketNumber = protocol.PacketNumber
+
+// ByteCount is a QUIC byte count.
+type ByteCount = protocol.ByteCount
+
+// EncryptionLevel is the QUIC encryption level.
+type EncryptionLevel = protocol.EncryptionLevel
+
+// PathInfo describes a path used for sending.
+type PathInfo struct {
+	ID         PathID
+	LocalAddr  net.Addr
+	RemoteAddr net.Addr
+	IfIndex    int
+}
+
+// PathSelectionContext provides context for path selection.
+type PathSelectionContext struct {
+	Now               time.Time
+	AckOnly           bool
+	HasRetransmission bool
+	BytesInFlight     ByteCount
+}
+
+// MultipathController selects paths and maps received packets to paths.
+type MultipathController interface {
+	SelectPath(PathSelectionContext) (PathInfo, bool)
+	PathIDForPacket(remoteAddr, localAddr net.Addr) (PathID, bool)
+}
+
+// ReinjectionTargetContext provides context for selecting a reinjection target.
+type ReinjectionTargetContext struct {
+	Now            time.Time
+	OriginalPathID PathID
+	Candidates     []PathInfo
+	Packet         *PacketReinjectionInfo
+}
+
+// MultipathReinjectionTargetSelector allows overriding reinjection target selection.
+// Implement this on your MultipathController to customize reinjection path choice.
+type MultipathReinjectionTargetSelector interface {
+	SelectReinjectionTarget(ReinjectionTargetContext) (PathID, bool)
+}
+
+// MultipathScheduler provides advanced path scheduling capabilities.
+// This is an optional extension to MultipathController.
+type MultipathScheduler interface {
+	MultipathController
+	// GetScheduler returns the underlying PathScheduler if available.
+	GetScheduler() PathScheduler
+}
+
+// MultipathObserver receives per-packet events with path information.
+type MultipathObserver interface {
+	OnPacketSent(PathEvent)
+	OnPacketAcked(PathEvent)
+	OnPacketLost(PathEvent)
+}
+
+// PathEvent reports a packet lifecycle event for a specific path.
+type PathEvent struct {
+	PathID          PathID
+	PacketNumber    PacketNumber
+	PacketSize      ByteCount
+	EncryptionLevel EncryptionLevel
+	AckEliciting    bool
+	IsPathProbe     bool
+	IsPathMTUProbe  bool
+	IsDuplicate     bool // True if this is a duplicate packet
+	SentAt          time.Time
+	EventAt         time.Time
+	SmoothedRTT     time.Duration
+	RTTVar          time.Duration
+}
+
+// ExtensionFrameHandler allows parsing of custom frame types.
+type ExtensionFrameHandler interface {
+	HandleFrame(ctx ExtensionFrameContext) (int, error)
+}
+
+// ExtensionFrameContext provides context for a custom frame.
+type ExtensionFrameContext struct {
+	FrameType       uint64
+	EncryptionLevel EncryptionLevel
+	Version         Version
+	Data            []byte // frame payload without the type varint
+}
+
+// RawFrame represents a custom frame payload with optional callbacks.
+type RawFrame struct {
+	FrameType        uint64
+	Data             []byte // payload without the frame type varint
+	NonAckEliciting  bool
+	RetransmitOnLoss bool
+	OnAcked          func()
+	OnLost           func()
 }
 
 // A ClientToken is a token received by the client.
@@ -175,6 +280,25 @@ type Config struct {
 	// Enable QUIC Stream Resets with Partial Delivery.
 	// See https://datatracker.ietf.org/doc/html/draft-ietf-quic-reliable-stream-reset-07.
 	EnableStreamResetPartialDelivery bool
+	// MaxPaths is the maximum number of paths to keep track of simultaneously.
+	// If set to 0, it defaults to 3.
+	// When a peer probes another path after this limit is reached (before pathTimeout of an existing path expires),
+	// the probing attempt is ignored.
+	MaxPaths int
+	// MultipathController enables path-aware scheduling and packet mapping.
+	MultipathController MultipathController
+	// MultipathDuplicationPolicy enables packet duplication across paths.
+	MultipathDuplicationPolicy *MultipathDuplicationPolicy
+	// MultipathReinjectionPolicy enables packet reinjection on alternate paths.
+	MultipathReinjectionPolicy *MultipathReinjectionPolicy
+	// MultipathAutoPaths automatically creates additional paths after the handshake.
+	MultipathAutoPaths bool
+	// MultipathAutoAdvertise automatically advertises local addresses using ADD_ADDRESS frames.
+	MultipathAutoAdvertise bool
+	// MultipathAutoAddrs optionally overrides auto-discovered local addresses.
+	MultipathAutoAddrs []net.IP
+	// ExtensionFrameHandler enables parsing of custom frame types.
+	ExtensionFrameHandler ExtensionFrameHandler
 
 	Tracer func(ctx context.Context, isClient bool, connID ConnectionID) qlogwriter.Trace
 }
@@ -199,6 +323,9 @@ type ConnectionState struct {
 	// This is a unilateral declaration by the peer - receiving datagrams is only possible if
 	// datagram support was enabled locally via Config.EnableDatagrams.
 	SupportsDatagrams bool
+	// SupportsMultipath indicates whether the peer advertised support for multipath QUIC.
+	// When true, multipath features can be enabled if configured locally.
+	SupportsMultipath bool
 	// SupportsStreamResetPartialDelivery indicates whether the peer advertised support for QUIC Stream Resets with Partial Delivery.
 	SupportsStreamResetPartialDelivery bool
 	// Used0RTT says if 0-RTT resumption was used.

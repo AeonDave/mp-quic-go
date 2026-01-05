@@ -1,9 +1,10 @@
 package quic
 
 import (
+	"fmt"
 	"net"
 
-	"github.com/quic-go/quic-go/internal/protocol"
+	"github.com/AeonDave/mp-quic-go/internal/protocol"
 )
 
 type sender interface {
@@ -15,10 +16,16 @@ type sender interface {
 	Close()
 }
 
+type pathSender interface {
+	WritePath(b []byte, gsoSize uint16, ecn protocol.ECN, addr net.Addr, info packetInfo) error
+}
+
 type queueEntry struct {
 	buf     *packetBuffer
 	gsoSize uint16
 	ecn     protocol.ECN
+	addr    net.Addr
+	info    packetInfo
 }
 
 type sendQueue struct {
@@ -47,8 +54,15 @@ func newSendQueue(conn sendConn) sender {
 // Callers need to make sure that there's actually space in the send queue by calling WouldBlock.
 // Otherwise Send will panic.
 func (h *sendQueue) Send(p *packetBuffer, gsoSize uint16, ecn protocol.ECN) {
+	h.SendPath(p, gsoSize, ecn, nil, packetInfo{})
+}
+
+// SendPath sends out a packet on a specific path. It's guaranteed to not block.
+// Callers need to make sure that there's actually space in the send queue by calling WouldBlock.
+// Otherwise SendPath will panic.
+func (h *sendQueue) SendPath(p *packetBuffer, gsoSize uint16, ecn protocol.ECN, addr net.Addr, info packetInfo) {
 	select {
-	case h.queue <- queueEntry{buf: p, gsoSize: gsoSize, ecn: ecn}:
+	case h.queue <- queueEntry{buf: p, gsoSize: gsoSize, ecn: ecn, addr: addr, info: info}:
 		// clear available channel if we've reached capacity
 		if len(h.queue) == sendQueueCapacity {
 			select {
@@ -87,7 +101,19 @@ func (h *sendQueue) Run() error {
 			// make sure that all queued packets are actually sent out
 			shouldClose = true
 		case e := <-h.queue:
-			if err := h.conn.Write(e.buf.Data, e.gsoSize, e.ecn); err != nil {
+			var err error
+			if e.addr != nil {
+				if ps, ok := h.conn.(pathSender); ok {
+					err = ps.WritePath(e.buf.Data, e.gsoSize, e.ecn, e.addr, e.info)
+				} else if e.gsoSize == 0 && (e.ecn == protocol.ECNNon || e.ecn == protocol.ECNUnsupported) {
+					err = h.conn.WriteTo(e.buf.Data, e.addr)
+				} else {
+					err = fmt.Errorf("sendQueue: path send unsupported")
+				}
+			} else {
+				err = h.conn.Write(e.buf.Data, e.gsoSize, e.ecn)
+			}
+			if err != nil {
 				// This additional check enables:
 				// 1. Checking for "datagram too large" message from the kernel, as such,
 				// 2. Path MTU discovery,and

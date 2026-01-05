@@ -3,9 +3,47 @@ package ackhandler
 import (
 	"sync"
 
-	"github.com/quic-go/quic-go/internal/monotime"
-	"github.com/quic-go/quic-go/internal/protocol"
+	"github.com/AeonDave/mp-quic-go/internal/monotime"
+	"github.com/AeonDave/mp-quic-go/internal/protocol"
 )
+
+// PacketEvent describes a sent packet with its path association.
+type PacketEvent struct {
+	PacketNumber         protocol.PacketNumber
+	Length               protocol.ByteCount
+	EncryptionLevel      protocol.EncryptionLevel
+	PathID               protocol.PathID
+	IsAckEliciting       bool
+	IsPathProbePacket    bool
+	IsPathMTUProbePacket bool
+	SendTime             monotime.Time
+	EventTime            monotime.Time
+	Frames               []Frame
+	StreamFrames         []StreamFrame
+}
+
+// PacketObserver receives packet lifecycle events.
+type PacketObserver interface {
+	OnPacketSent(PacketEvent)
+	OnPacketAcked(PacketEvent)
+	OnPacketLost(PacketEvent)
+}
+
+func newPacketEvent(pn protocol.PacketNumber, p *packet, eventTime monotime.Time) PacketEvent {
+	return PacketEvent{
+		PacketNumber:         pn,
+		Length:               p.Length,
+		EncryptionLevel:      p.EncryptionLevel,
+		PathID:               p.PathID,
+		IsAckEliciting:       p.IsAckEliciting(),
+		IsPathProbePacket:    p.isPathProbePacket,
+		IsPathMTUProbePacket: p.IsPathMTUProbePacket,
+		SendTime:             p.SendTime,
+		EventTime:            eventTime,
+		Frames:               p.Frames,
+		StreamFrames:         p.StreamFrames,
+	}
+}
 
 type packetWithPacketNumber struct {
 	PacketNumber protocol.PacketNumber
@@ -20,12 +58,14 @@ type packet struct {
 	LargestAcked    protocol.PacketNumber // InvalidPacketNumber if the packet doesn't contain an ACK
 	Length          protocol.ByteCount
 	EncryptionLevel protocol.EncryptionLevel
+	PathID          protocol.PathID
 
 	IsPathMTUProbePacket bool // We don't report the loss of Path MTU probe packets to the congestion controller.
 
 	includedInBytesInFlight bool
 	declaredLost            bool
 	isPathProbePacket       bool
+	sentNotified            bool
 }
 
 func (p *packet) Outstanding() bool {
@@ -45,11 +85,13 @@ func getPacket() *packet {
 	p.LargestAcked = 0
 	p.Length = 0
 	p.EncryptionLevel = protocol.EncryptionLevel(0)
+	p.PathID = protocol.InvalidPathID
 	p.SendTime = 0
 	p.IsPathMTUProbePacket = false
 	p.includedInBytesInFlight = false
 	p.declaredLost = false
 	p.isPathProbePacket = false
+	p.sentNotified = false
 	return p
 }
 
@@ -58,5 +100,7 @@ func getPacket() *packet {
 func putPacket(p *packet) {
 	p.Frames = nil
 	p.StreamFrames = nil
+	p.PathID = protocol.InvalidPathID
+	p.sentNotified = false
 	packetPool.Put(p)
 }

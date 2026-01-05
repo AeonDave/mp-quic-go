@@ -8,23 +8,25 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"reflect"
 	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/quic-go/quic-go/internal/ackhandler"
-	"github.com/quic-go/quic-go/internal/flowcontrol"
-	"github.com/quic-go/quic-go/internal/handshake"
-	"github.com/quic-go/quic-go/internal/monotime"
-	"github.com/quic-go/quic-go/internal/protocol"
-	"github.com/quic-go/quic-go/internal/qerr"
-	"github.com/quic-go/quic-go/internal/utils"
-	"github.com/quic-go/quic-go/internal/utils/ringbuffer"
-	"github.com/quic-go/quic-go/internal/wire"
-	"github.com/quic-go/quic-go/qlog"
-	"github.com/quic-go/quic-go/qlogwriter"
+	"github.com/AeonDave/mp-quic-go/internal/ackhandler"
+	"github.com/AeonDave/mp-quic-go/internal/flowcontrol"
+	"github.com/AeonDave/mp-quic-go/internal/handshake"
+	"github.com/AeonDave/mp-quic-go/internal/monotime"
+	"github.com/AeonDave/mp-quic-go/internal/protocol"
+	"github.com/AeonDave/mp-quic-go/internal/qerr"
+	"github.com/AeonDave/mp-quic-go/internal/utils"
+	"github.com/AeonDave/mp-quic-go/internal/utils/ringbuffer"
+	"github.com/AeonDave/mp-quic-go/internal/wire"
+	"github.com/AeonDave/mp-quic-go/qlog"
+	"github.com/AeonDave/mp-quic-go/qlogwriter"
+	"github.com/AeonDave/mp-quic-go/quicvarint"
 )
 
 type unpacker interface {
@@ -138,6 +140,20 @@ type Conn struct {
 
 	conn      sendConn
 	sendQueue sender
+
+	multipathController         MultipathController
+	multipathObserver           MultipathObserver
+	extensionFrameHandler       ExtensionFrameHandler
+	multipathDuplicationPolicy  *MultipathDuplicationPolicy
+	multipathReinjectionManager *MultipathReinjectionManager
+	multipathEnabled            bool
+	reinjectionPathQueue        []protocol.PathID
+	reinjectionQueueCounts      map[protocol.PathID]int
+	autoPathsStarted            bool
+	autoAdvertisedAddrs         map[string]bool
+	autoAddedPaths              map[string]bool
+	nextAddAddressID            uint64
+	nextAutoPathID              protocol.PathID
 
 	// lazily initialzed: most connections never migrate
 	pathManager         *pathManager
@@ -322,6 +338,7 @@ var newConnection = func(
 		s.qlogger,
 		s.logger,
 	)
+	s.setupMultipath()
 	s.currentMTUEstimate.Store(uint32(estimateMaxPayloadSize(protocol.ByteCount(s.config.InitialPacketSize))))
 	statelessResetToken := statelessResetter.GetStatelessResetToken(srcConnID)
 	params := &wire.TransportParameters{
@@ -341,11 +358,12 @@ var newConnection = func(
 		// different from protocol.DefaultActiveConnectionIDLimit.
 		// If set to the default value, it will be omitted from the transport parameters, which will make
 		// old quic-go versions interpret it as 0, instead of the default value of 2.
-		// See https://github.com/quic-go/quic-go/pull/3806.
+		// See https://github.com/AeonDave/mp-quic-go/pull/3806.
 		ActiveConnectionIDLimit:   protocol.MaxActiveConnectionIDs,
 		InitialSourceConnectionID: srcConnID,
 		RetrySourceConnectionID:   retrySrcConnID,
 		EnableResetStreamAt:       conf.EnableStreamResetPartialDelivery,
+		EnableMultipath:           conf.MultipathController != nil,
 	}
 	if s.config.EnableDatagrams {
 		params.MaxDatagramFrameSize = wire.MaxDatagramSize
@@ -368,7 +386,7 @@ var newConnection = func(
 		s.version,
 	)
 	s.cryptoStreamHandler = cs
-	s.packer = newPacketPacker(srcConnID, s.connIDManager.Get, s.initialStream, s.handshakeStream, s.sentPacketHandler, s.retransmissionQueue, cs, s.framer, &s.receivedPacketHandler, s.datagramQueue, s.perspective)
+	s.packer = newPacketPacker(srcConnID, s.connIDManager.Get, s.initialStream, s.handshakeStream, s.sentPacketHandler, s.retransmissionQueue, cs, s.framer, &s.receivedPacketHandler, s.datagramQueue, s.perspective, s.multipathController)
 	s.unpacker = newPacketUnpacker(cs, s.srcConnIDLen)
 	s.cryptoStreamManager = newCryptoStreamManager(s.initialStream, s.handshakeStream, s.oneRTTStream)
 	return &wrappedConn{Conn: s}
@@ -451,6 +469,7 @@ var newClientConnection = func(
 		s.qlogger,
 		s.logger,
 	)
+	s.setupMultipath()
 	s.currentMTUEstimate.Store(uint32(estimateMaxPayloadSize(protocol.ByteCount(s.config.InitialPacketSize))))
 	oneRTTStream := newCryptoStream()
 	params := &wire.TransportParameters{
@@ -468,10 +487,11 @@ var newClientConnection = func(
 		// different from protocol.DefaultActiveConnectionIDLimit.
 		// If set to the default value, it will be omitted from the transport parameters, which will make
 		// old quic-go versions interpret it as 0, instead of the default value of 2.
-		// See https://github.com/quic-go/quic-go/pull/3806.
+		// See https://github.com/AeonDave/mp-quic-go/pull/3806.
 		ActiveConnectionIDLimit:   protocol.MaxActiveConnectionIDs,
 		InitialSourceConnectionID: srcConnID,
 		EnableResetStreamAt:       conf.EnableStreamResetPartialDelivery,
+		EnableMultipath:           conf.MultipathController != nil,
 	}
 	if s.config.EnableDatagrams {
 		params.MaxDatagramFrameSize = wire.MaxDatagramSize
@@ -494,7 +514,7 @@ var newClientConnection = func(
 	s.cryptoStreamHandler = cs
 	s.cryptoStreamManager = newCryptoStreamManager(s.initialStream, s.handshakeStream, oneRTTStream)
 	s.unpacker = newPacketUnpacker(cs, s.srcConnIDLen)
-	s.packer = newPacketPacker(srcConnID, s.connIDManager.Get, s.initialStream, s.handshakeStream, s.sentPacketHandler, s.retransmissionQueue, cs, s.framer, &s.receivedPacketHandler, s.datagramQueue, s.perspective)
+	s.packer = newPacketPacker(srcConnID, s.connIDManager.Get, s.initialStream, s.handshakeStream, s.sentPacketHandler, s.retransmissionQueue, cs, s.framer, &s.receivedPacketHandler, s.datagramQueue, s.perspective, s.multipathController)
 	if len(tlsConf.ServerName) > 0 {
 		s.tokenStoreKey = tlsConf.ServerName
 	} else {
@@ -520,6 +540,10 @@ func (c *Conn) preSetup() {
 		c.config.EnableStreamResetPartialDelivery,
 		false, // ACK_FREQUENCY is not supported yet
 	)
+	if c.config.ExtensionFrameHandler != nil {
+		c.extensionFrameHandler = c.config.ExtensionFrameHandler
+		c.frameParser.AllowUnknownFrameTypes()
+	}
 	c.rttStats = utils.NewRTTStats()
 	c.connFlowController = flowcontrol.NewConnectionFlowController(
 		protocol.ByteCount(c.config.InitialConnectionReceiveWindow),
@@ -770,6 +794,10 @@ func (c *Conn) supportsDatagrams() bool {
 	return c.peerParams.MaxDatagramFrameSize > 0
 }
 
+func (c *Conn) supportsMultipath() bool {
+	return c.multipathController != nil && c.peerParams != nil && c.peerParams.EnableMultipath
+}
+
 // ConnectionState returns basic details about the QUIC connection.
 func (c *Conn) ConnectionState() ConnectionState {
 	c.connStateMutex.Lock()
@@ -778,6 +806,7 @@ func (c *Conn) ConnectionState() ConnectionState {
 	c.connState.TLS = cs.ConnectionState
 	c.connState.Used0RTT = cs.Used0RTT
 	c.connState.SupportsStreamResetPartialDelivery = c.peerParams.EnableResetStreamAt
+	c.connState.SupportsMultipath = c.supportsMultipath()
 	c.connState.GSO = c.conn.capabilities().GSO
 	return c.connState
 }
@@ -942,6 +971,7 @@ func (c *Conn) handleHandshakeComplete(now monotime.Time) error {
 	// During a 0-RTT connection, the client is only allowed to use the new transport parameters for 1-RTT packets.
 	if c.perspective == protocol.PerspectiveClient {
 		c.applyTransportParameters()
+		c.maybeStartAutoPaths()
 		return nil
 	}
 
@@ -989,6 +1019,7 @@ func (c *Conn) handleHandshakeConfirmed(now monotime.Time) error {
 	if !c.config.DisablePathMTUDiscovery && c.conn.capabilities().DF {
 		c.mtuDiscoverer.Start(now)
 	}
+	c.maybeStartAutoPaths()
 	return nil
 }
 
@@ -1045,6 +1076,7 @@ func (c *Conn) handlePackets() (wasProcessed bool, _ error) {
 
 func (c *Conn) handleOnePacket(rp receivedPacket, datagramID qlog.DatagramID) (wasProcessed bool, _ error) {
 	c.sentPacketHandler.ReceivedBytes(rp.Size(), rp.rcvTime)
+	pathID := c.notifyMultipathReceived(rp)
 
 	if wire.IsVersionNegotiationPacket(rp.data) {
 		return false, c.handleVersionNegotiationPacket(rp)
@@ -1133,7 +1165,7 @@ func (c *Conn) handleOnePacket(rp receivedPacket, datagramID qlog.DatagramID) (w
 
 			p.data = packetData
 
-			processed, err := c.handleLongHeaderPacket(p, hdr, datagramID)
+			processed, err := c.handleLongHeaderPacket(p, hdr, datagramID, pathID)
 			if err != nil {
 				return false, err
 			}
@@ -1145,7 +1177,7 @@ func (c *Conn) handleOnePacket(rp receivedPacket, datagramID qlog.DatagramID) (w
 			if counter > 0 {
 				p.buffer.Split()
 			}
-			processed, err := c.handleShortHeaderPacket(p, counter > 0, datagramID)
+			processed, err := c.handleShortHeaderPacket(p, counter > 0, datagramID, pathID)
 			if err != nil {
 				return false, err
 			}
@@ -1165,6 +1197,7 @@ func (c *Conn) handleShortHeaderPacket(
 	p receivedPacket,
 	isCoalesced bool,
 	datagramID qlog.DatagramID, // only for logging
+	pathID protocol.PathID,
 ) (wasProcessed bool, _ error) {
 	var wasQueued bool
 
@@ -1211,7 +1244,7 @@ func (c *Conn) handleShortHeaderPacket(
 		wire.LogShortHeader(c.logger, destConnID, pn, pnLen, keyPhase)
 	}
 
-	if c.receivedPacketHandler.IsPotentiallyDuplicate(pn, protocol.Encryption1RTT) {
+	if c.receivedPacketHandler.IsPotentiallyDuplicate(pn, protocol.Encryption1RTT, pathID) {
 		c.logger.Debugf("Dropping (potentially) duplicate packet.")
 		if c.qlogger != nil {
 			c.qlogger.RecordEvent(qlog.PacketDropped{
@@ -1247,7 +1280,7 @@ func (c *Conn) handleShortHeaderPacket(
 			})
 		}
 	}
-	isNonProbing, pathChallenge, err := c.handleUnpackedShortHeaderPacket(destConnID, pn, data, p.ecn, p.rcvTime, log)
+	isNonProbing, pathChallenge, err := c.handleUnpackedShortHeaderPacket(destConnID, pn, data, p.ecn, p.rcvTime, log, pathID)
 	if err != nil {
 		return false, err
 	}
@@ -1265,12 +1298,13 @@ func (c *Conn) handleShortHeaderPacket(
 		c.pathManager = newPathManager(
 			c.connIDManager.GetConnIDForPath,
 			c.connIDManager.RetireConnIDForPath,
+			c.config.MaxPaths,
 			c.logger,
 		)
 	}
 	destConnID, frames, shouldSwitchPath := c.pathManager.HandlePacket(p.remoteAddr, p.rcvTime, pathChallenge, isNonProbing)
 	if len(frames) > 0 {
-		probe, buf, err := c.packer.PackPathProbePacket(destConnID, frames, c.version)
+		probe, buf, err := c.packer.PackPathProbePacket(destConnID, frames, c.version, protocol.InvalidPathID)
 		if err != nil {
 			return true, err
 		}
@@ -1299,7 +1333,7 @@ func (c *Conn) handleShortHeaderPacket(
 	return true, nil
 }
 
-func (c *Conn) handleLongHeaderPacket(p receivedPacket, hdr *wire.Header, datagramID qlog.DatagramID) (wasProcessed bool, _ error) {
+func (c *Conn) handleLongHeaderPacket(p receivedPacket, hdr *wire.Header, datagramID qlog.DatagramID, _ protocol.PathID) (wasProcessed bool, _ error) {
 	var wasQueued bool
 
 	defer func() {
@@ -1357,7 +1391,7 @@ func (c *Conn) handleLongHeaderPacket(p receivedPacket, hdr *wire.Header, datagr
 		packet.hdr.Log(c.logger)
 	}
 
-	if pn := packet.hdr.PacketNumber; c.receivedPacketHandler.IsPotentiallyDuplicate(pn, packet.encryptionLevel) {
+	if pn := packet.hdr.PacketNumber; c.receivedPacketHandler.IsPotentiallyDuplicate(pn, packet.encryptionLevel, protocol.InvalidPathID) {
 		c.logger.Debugf("Dropping (potentially) duplicate packet.")
 		if c.qlogger != nil {
 			c.qlogger.RecordEvent(qlog.PacketDropped{
@@ -1626,7 +1660,7 @@ func (c *Conn) handleVersionNegotiationPacket(p receivedPacket) error {
 	}
 
 	c.logger.Infof("Switching to QUIC version %s.", newVersion)
-	nextPN, _ := c.sentPacketHandler.PeekPacketNumber(protocol.EncryptionInitial)
+	nextPN, _ := c.sentPacketHandler.PeekPacketNumber(protocol.InvalidPathID, protocol.EncryptionInitial)
 	return &errCloseForRecreating{
 		nextPacketNumber: nextPN,
 		nextVersion:      newVersion,
@@ -1729,12 +1763,12 @@ func (c *Conn) handleUnpackedLongHeaderPacket(
 			})
 		}
 	}
-	isAckEliciting, _, _, err := c.handleFrames(packet.data, packet.hdr.DestConnectionID, packet.encryptionLevel, log, rcvTime)
+	isAckEliciting, _, _, err := c.handleFrames(packet.data, packet.hdr.DestConnectionID, packet.encryptionLevel, log, rcvTime, protocol.InvalidPathID)
 	if err != nil {
 		return err
 	}
 	c.sentPacketHandler.ReceivedPacket(packet.encryptionLevel, rcvTime)
-	return c.receivedPacketHandler.ReceivedPacket(packet.hdr.PacketNumber, ecn, packet.encryptionLevel, rcvTime, isAckEliciting)
+	return c.receivedPacketHandler.ReceivedPacket(packet.hdr.PacketNumber, ecn, packet.encryptionLevel, rcvTime, isAckEliciting, protocol.InvalidPathID)
 }
 
 func (c *Conn) handleUnpackedShortHeaderPacket(
@@ -1744,17 +1778,18 @@ func (c *Conn) handleUnpackedShortHeaderPacket(
 	ecn protocol.ECN,
 	rcvTime monotime.Time,
 	log func([]qlog.Frame),
+	pathID protocol.PathID,
 ) (isNonProbing bool, pathChallenge *wire.PathChallengeFrame, _ error) {
 	c.lastPacketReceivedTime = rcvTime
 	c.firstAckElicitingPacketAfterIdleSentTime = 0
 	c.keepAlivePingSent = false
 
-	isAckEliciting, isNonProbing, pathChallenge, err := c.handleFrames(data, destConnID, protocol.Encryption1RTT, log, rcvTime)
+	isAckEliciting, isNonProbing, pathChallenge, err := c.handleFrames(data, destConnID, protocol.Encryption1RTT, log, rcvTime, pathID)
 	if err != nil {
 		return false, nil, err
 	}
 	c.sentPacketHandler.ReceivedPacket(protocol.Encryption1RTT, rcvTime)
-	if err := c.receivedPacketHandler.ReceivedPacket(pn, ecn, protocol.Encryption1RTT, rcvTime, isAckEliciting); err != nil {
+	if err := c.receivedPacketHandler.ReceivedPacket(pn, ecn, protocol.Encryption1RTT, rcvTime, isAckEliciting, pathID); err != nil {
 		return false, nil, err
 	}
 	return isNonProbing, pathChallenge, nil
@@ -1768,6 +1803,7 @@ func (c *Conn) handleFrames(
 	encLevel protocol.EncryptionLevel,
 	log func([]qlog.Frame),
 	rcvTime monotime.Time,
+	pathID protocol.PathID,
 ) (isAckEliciting, isNonProbing bool, pathChallenge *wire.PathChallengeFrame, _ error) {
 	// Only used for tracing.
 	// If we're not tracing, this slice will always remain empty.
@@ -1796,6 +1832,34 @@ func (c *Conn) handleFrames(
 		}
 		if !wire.IsProbingFrameType(frameType) {
 			isNonProbing = true
+		}
+
+		if !c.frameParser.IsKnownFrameType(frameType) {
+			if c.extensionFrameHandler == nil {
+				return false, false, nil, &qerr.TransportError{
+					ErrorCode:    qerr.FrameEncodingError,
+					FrameType:    uint64(frameType),
+					ErrorMessage: "unknown frame type",
+				}
+			}
+			n, err := c.extensionFrameHandler.HandleFrame(ExtensionFrameContext{
+				FrameType:       uint64(frameType),
+				EncryptionLevel: encLevel,
+				Version:         c.version,
+				Data:            data,
+			})
+			if err != nil {
+				return false, false, nil, err
+			}
+			if n <= 0 || n > len(data) {
+				return false, false, nil, &qerr.TransportError{
+					ErrorCode:    qerr.FrameEncodingError,
+					FrameType:    uint64(frameType),
+					ErrorMessage: "invalid custom frame length",
+				}
+			}
+			data = data[n:]
+			continue
 		}
 
 		// We're inlining common cases, to avoid using interfaces
@@ -1830,7 +1894,7 @@ func (c *Conn) handleFrames(
 				continue
 			}
 			wire.LogFrame(c.logger, ackFrame, false)
-			handleErr = c.handleAckFrame(ackFrame, encLevel, rcvTime)
+			handleErr = c.handleAckFrame(ackFrame, encLevel, rcvTime, pathID)
 		} else if frameType.IsDatagramFrameType() {
 			datagramFrame, l, err := c.frameParser.ParseDatagramFrame(frameType, data, c.version)
 			if err != nil {
@@ -1935,6 +1999,30 @@ func (c *Conn) handleFrame(
 		err = c.connIDManager.Add(frame)
 	case *wire.RetireConnectionIDFrame:
 		err = c.connIDGenerator.Retire(frame.SequenceNumber, destConnID, rcvTime.Add(3*c.rttStats.PTO(false)))
+	case *wire.AddAddressFrame:
+		if c.multipathEnabled {
+			if handler, ok := c.multipathController.(interface {
+				HandleAddAddressFrame(*wire.AddAddressFrame)
+			}); ok {
+				handler.HandleAddAddressFrame(frame)
+			}
+		}
+	case *wire.PathsFrame:
+		if c.multipathEnabled {
+			if handler, ok := c.multipathController.(interface {
+				HandlePathsFrame(*wire.PathsFrame)
+			}); ok {
+				handler.HandlePathsFrame(frame)
+			}
+		}
+	case *wire.ClosePathFrame:
+		if c.multipathEnabled {
+			if handler, ok := c.multipathController.(interface {
+				HandleClosePathFrame(*wire.ClosePathFrame)
+			}); ok {
+				handler.HandleClosePathFrame(frame)
+			}
+		}
 	case *wire.HandshakeDoneFrame:
 		err = c.handleHandshakeDoneFrame(rcvTime)
 	default:
@@ -2104,8 +2192,8 @@ func (c *Conn) handleHandshakeDoneFrame(rcvTime monotime.Time) error {
 	return nil
 }
 
-func (c *Conn) handleAckFrame(frame *wire.AckFrame, encLevel protocol.EncryptionLevel, rcvTime monotime.Time) error {
-	acked1RTTPacket, err := c.sentPacketHandler.ReceivedAck(frame, encLevel, c.lastPacketReceivedTime)
+func (c *Conn) handleAckFrame(frame *wire.AckFrame, encLevel protocol.EncryptionLevel, rcvTime monotime.Time, pathID protocol.PathID) error {
+	acked1RTTPacket, err := c.sentPacketHandler.ReceivedAck(frame, encLevel, c.lastPacketReceivedTime, pathID)
 	if err != nil {
 		return err
 	}
@@ -2344,6 +2432,7 @@ func (c *Conn) restoreTransportParameters(params *wire.TransportParameters) {
 	c.streamsMap.HandleTransportParameters(params)
 	c.connStateMutex.Lock()
 	c.connState.SupportsDatagrams = c.supportsDatagrams()
+	c.connState.SupportsMultipath = c.supportsMultipath()
 	c.connStateMutex.Unlock()
 }
 
@@ -2377,6 +2466,7 @@ func (c *Conn) handleTransportParameters(params *wire.TransportParameters) error
 
 	c.connStateMutex.Lock()
 	c.connState.SupportsDatagrams = c.supportsDatagrams()
+	c.connState.SupportsMultipath = c.supportsMultipath()
 	c.connStateMutex.Unlock()
 	return nil
 }
@@ -2443,6 +2533,7 @@ func (c *Conn) applyTransportParameters() {
 		maxPacketSize,
 		c.qlogger,
 	)
+	c.maybeEnableMultipath()
 }
 
 func (c *Conn) triggerSending(now monotime.Time) error {
@@ -2490,7 +2581,7 @@ func (c *Conn) sendPackets(now monotime.Time) error {
 		if pm := c.pathManagerOutgoing.Load(); pm != nil {
 			connID, frame, tr, ok := pm.NextPathToProbe()
 			if ok {
-				probe, buf, err := c.packer.PackPathProbePacket(connID, []ackhandler.Frame{frame}, c.version)
+				probe, buf, err := c.packer.PackPathProbePacket(connID, []ackhandler.Frame{frame}, c.version, protocol.InvalidPathID)
 				if err != nil {
 					return err
 				}
@@ -2511,7 +2602,7 @@ func (c *Conn) sendPackets(now monotime.Time) error {
 	// MTU probe packets per connection.
 	if c.handshakeConfirmed && c.mtuDiscoverer != nil && c.mtuDiscoverer.ShouldSendProbe(now) {
 		ping, size := c.mtuDiscoverer.GetPing(now)
-		p, buf, err := c.packer.PackMTUProbePacket(ping, size, c.version)
+		p, buf, err := c.packer.PackMTUProbePacket(ping, size, c.version, protocol.InvalidPathID)
 		if err != nil {
 			return err
 		}
@@ -2532,7 +2623,11 @@ func (c *Conn) sendPackets(now monotime.Time) error {
 	}
 
 	if !c.handshakeConfirmed {
-		packet, err := c.packer.PackCoalescedPacket(false, c.maxPacketSize(), now, c.version)
+		pathID := protocol.InvalidPathID
+		if c.multipathEnabled {
+			pathID = 0
+		}
+		packet, err := c.packer.PackCoalescedPacket(false, c.maxPacketSize(), now, c.version, pathID)
 		if err != nil || packet == nil {
 			return err
 		}
@@ -2551,16 +2646,37 @@ func (c *Conn) sendPackets(now monotime.Time) error {
 	}
 
 	if c.conn.capabilities().GSO {
+		if c.multipathEnabled {
+			return c.sendPacketsWithoutGSO(now)
+		}
 		return c.sendPacketsWithGSO(now)
 	}
 	return c.sendPacketsWithoutGSO(now)
 }
 
 func (c *Conn) sendPacketsWithoutGSO(now monotime.Time) error {
+	c.handlePendingReinjections(now)
 	for {
+		var sel pathSelection
+		var usePath bool
+		if c.multipathEnabled {
+			var ok bool
+			hasRetransmission := c.retransmissionQueue.HasData(protocol.Encryption1RTT)
+			sel, ok = c.selectPathForSending(now, false, hasRetransmission)
+			if !ok {
+				return nil
+			}
+			usePath = true
+		}
+
 		buf := getPacketBuffer()
 		ecn := c.sentPacketHandler.ECNMode(true)
-		if _, err := c.appendOneShortHeaderPacket(buf, c.maxPacketSize(), ecn, now); err != nil {
+		pathID := protocol.InvalidPathID
+		if usePath {
+			pathID = sel.id
+		}
+		_, packet, err := c.appendOneShortHeaderPacket(buf, c.maxPacketSize(), ecn, now, pathID)
+		if err != nil {
 			if err == errNothingToPack {
 				buf.Release()
 				return nil
@@ -2568,7 +2684,28 @@ func (c *Conn) sendPacketsWithoutGSO(now monotime.Time) error {
 			return err
 		}
 
-		c.sendQueue.Send(buf, 0, ecn)
+		if usePath {
+			c.setPacketPathID(packet, sel.id)
+			if psq, ok := c.sendQueue.(pathSenderQueue); ok {
+				duplicatePaths := c.selectDuplicatePaths(packet, sel.id)
+				var duplicateBuffers []*packetBuffer
+				if len(duplicatePaths) > 0 {
+					duplicateBuffers = make([]*packetBuffer, 0, len(duplicatePaths))
+					for range duplicatePaths {
+						duplicateBuffers = append(duplicateBuffers, clonePacketBuffer(buf))
+					}
+				}
+				psq.SendPath(buf, 0, ecn, sel.remoteAddr, sel.info)
+				for i, dup := range duplicatePaths {
+					psq.SendPath(duplicateBuffers[i], 0, ecn, dup.RemoteAddr, packetInfoFromPathInfo(dup))
+					c.notifyMultipathDuplicateSent(packet, protocol.PathID(dup.ID), now)
+				}
+			} else {
+				c.sendQueue.Send(buf, 0, ecn)
+			}
+		} else {
+			c.sendQueue.Send(buf, 0, ecn)
+		}
 
 		if c.sendQueue.WouldBlock() {
 			return nil
@@ -2599,7 +2736,7 @@ func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
 	ecn := c.sentPacketHandler.ECNMode(true)
 	for {
 		var dontSendMore bool
-		size, err := c.appendOneShortHeaderPacket(buf, maxSize, ecn, now)
+		size, _, err := c.appendOneShortHeaderPacket(buf, maxSize, ecn, now, protocol.InvalidPathID)
 		if err != nil {
 			if err != errNothingToPack {
 				return err
@@ -2667,7 +2804,11 @@ func (c *Conn) resetPacingDeadline() {
 func (c *Conn) maybeSendAckOnlyPacket(now monotime.Time) error {
 	if !c.handshakeConfirmed {
 		ecn := c.sentPacketHandler.ECNMode(false)
-		packet, err := c.packer.PackCoalescedPacket(true, c.maxPacketSize(), now, c.version)
+		pathID := protocol.InvalidPathID
+		if c.multipathEnabled {
+			pathID = 0
+		}
+		packet, err := c.packer.PackCoalescedPacket(true, c.maxPacketSize(), now, c.version, pathID)
 		if err != nil {
 			return err
 		}
@@ -2677,17 +2818,289 @@ func (c *Conn) maybeSendAckOnlyPacket(now monotime.Time) error {
 		return c.sendPackedCoalescedPacket(packet, ecn, now)
 	}
 
+	var sel pathSelection
+	var usePath bool
+	if c.multipathEnabled {
+		var ok bool
+		hasRetransmission := c.retransmissionQueue.HasData(protocol.Encryption1RTT)
+		sel, ok = c.selectPathForSending(now, true, hasRetransmission)
+		if !ok {
+			return nil
+		}
+		usePath = true
+	}
+
 	ecn := c.sentPacketHandler.ECNMode(true)
-	p, buf, err := c.packer.PackAckOnlyPacket(c.maxPacketSize(), now, c.version)
+	pathID := protocol.InvalidPathID
+	if usePath {
+		pathID = sel.id
+	}
+	p, buf, err := c.packer.PackAckOnlyPacket(c.maxPacketSize(), now, c.version, pathID)
 	if err != nil {
 		if err == errNothingToPack {
 			return nil
 		}
 		return err
 	}
+	if usePath {
+		p.PathID = uint64(sel.id)
+	}
 	c.logShortHeaderPacket(p, ecn, buf.Len())
 	c.registerPackedShortHeaderPacket(p, ecn, now)
-	c.sendQueue.Send(buf, 0, ecn)
+	if usePath {
+		c.setPacketPathID(p, sel.id)
+		if psq, ok := c.sendQueue.(pathSenderQueue); ok {
+			psq.SendPath(buf, 0, ecn, sel.remoteAddr, sel.info)
+		} else {
+			c.sendQueue.Send(buf, 0, ecn)
+		}
+	} else {
+		c.sendQueue.Send(buf, 0, ecn)
+	}
+	return nil
+}
+
+func (c *Conn) handlePendingReinjections(now monotime.Time) {
+	if !c.multipathEnabled || c.multipathReinjectionManager == nil {
+		return
+	}
+	pending := c.multipathReinjectionManager.GetPendingReinjections(now.ToTime())
+	if len(pending) == 0 {
+		return
+	}
+	for _, info := range pending {
+		targetPath := c.selectReinjectionTarget(info)
+		if targetPath != protocol.InvalidPathID {
+			if ok, next := c.multipathReinjectionManager.canReinjectOnPath(targetPath, now.ToTime()); !ok {
+				c.multipathReinjectionManager.deferReinjection(info, next)
+				continue
+			}
+			if limit := c.multipathReinjectionManager.policy.GetMaxReinjectionQueuePerPath(); limit > 0 {
+				if c.reinjectionQueueCounts == nil {
+					c.reinjectionQueueCounts = make(map[protocol.PathID]int)
+				}
+				if c.reinjectionQueueCounts[targetPath] >= limit {
+					delay := c.multipathReinjectionManager.policy.GetReinjectionDelay()
+					c.multipathReinjectionManager.deferReinjection(info, now.ToTime().Add(delay))
+					continue
+				}
+			}
+		}
+		info.TargetPathID = targetPath
+		queued := c.queueReinjectionFrames(info.Frames)
+		if queued && targetPath != protocol.InvalidPathID {
+			c.reinjectionPathQueue = append(c.reinjectionPathQueue, targetPath)
+			if c.reinjectionQueueCounts == nil {
+				c.reinjectionQueueCounts = make(map[protocol.PathID]int)
+			}
+			c.reinjectionQueueCounts[targetPath]++
+		}
+		c.multipathReinjectionManager.MarkReinjected(info.PacketNumber, targetPath)
+	}
+	c.scheduleSending()
+}
+
+func (c *Conn) queueReinjectionFrames(frames []ackhandler.Frame) bool {
+	queued := false
+	for _, frame := range frames {
+		if frame.Frame == nil || frame.Handler == nil {
+			continue
+		}
+		queued = true
+		frame.Handler.OnLost(frame.Frame)
+	}
+	return queued
+}
+
+func (c *Conn) selectReinjectionTarget(info *PacketReinjectionInfo) protocol.PathID {
+	if c.multipathController == nil || c.multipathReinjectionManager == nil {
+		return protocol.InvalidPathID
+	}
+	policy := c.multipathReinjectionManager.policy
+	if policy == nil {
+		return protocol.InvalidPathID
+	}
+	lister, ok := c.multipathController.(multipathPathLister)
+	if !ok {
+		return protocol.InvalidPathID
+	}
+	paths := lister.GetAvailablePaths()
+	if len(paths) == 0 {
+		return protocol.InvalidPathID
+	}
+
+	candidates := make([]PathInfo, 0, len(paths))
+	for _, path := range paths {
+		if path.ID == protocol.InvalidPathID || path.RemoteAddr == nil {
+			continue
+		}
+		if path.ID == info.OriginalPathID {
+			continue
+		}
+		if !policy.IsPreferredPathForReinjection(path.ID) {
+			continue
+		}
+		candidates = append(candidates, path)
+	}
+
+	candidateIDs := make(map[protocol.PathID]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		candidateIDs[protocol.PathID(candidate.ID)] = struct{}{}
+	}
+
+	if selector, ok := c.multipathController.(MultipathReinjectionTargetSelector); ok {
+		ctx := ReinjectionTargetContext{
+			Now:            time.Now(),
+			OriginalPathID: info.OriginalPathID,
+			Candidates:     slices.Clone(candidates),
+			Packet:         info,
+		}
+		if pathID, ok := selector.SelectReinjectionTarget(ctx); ok && pathID != protocol.InvalidPathID {
+			if _, ok := candidateIDs[pathID]; ok {
+				return pathID
+			}
+			if pathID == info.OriginalPathID && policy.IsPreferredPathForReinjection(pathID) {
+				if _, ok := c.pathInfoForID(pathID); ok {
+					return pathID
+				}
+			}
+		}
+	}
+
+	if len(candidates) == 0 {
+		if info.OriginalPathID != protocol.InvalidPathID && policy.IsPreferredPathForReinjection(info.OriginalPathID) {
+			return info.OriginalPathID
+		}
+		return protocol.InvalidPathID
+	}
+
+	slices.SortFunc(candidates, func(a, b PathInfo) int {
+		switch {
+		case a.ID < b.ID:
+			return -1
+		case a.ID > b.ID:
+			return 1
+		default:
+			return 0
+		}
+	})
+
+	best := candidates[0]
+	var bestRTT time.Duration
+	if statsProvider, ok := c.sentPacketHandler.(pathRTTProvider); ok {
+		if stats := statsProvider.GetPathRTTStats(best.ID); stats != nil {
+			bestRTT = stats.SmoothedRTT()
+		}
+		for _, candidate := range candidates[1:] {
+			stats := statsProvider.GetPathRTTStats(candidate.ID)
+			if stats == nil {
+				continue
+			}
+			rtt := stats.SmoothedRTT()
+			if bestRTT == 0 || (rtt > 0 && rtt < bestRTT) {
+				best = candidate
+				bestRTT = rtt
+			}
+		}
+	}
+
+	return protocol.PathID(best.ID)
+}
+
+func clonePacketBuffer(src *packetBuffer) *packetBuffer {
+	buf := getPacketBuffer()
+	buf.Data = append(buf.Data, src.Data...)
+	return buf
+}
+
+func (c *Conn) shouldDuplicatePacket(p shortHeaderPacket) bool {
+	if !c.multipathEnabled {
+		return false
+	}
+	policy := c.multipathDuplicationPolicy
+	if policy == nil || !policy.IsEnabled() {
+		return false
+	}
+	if p.IsPathProbePacket || p.IsPathMTUProbePacket {
+		return false
+	}
+	if len(p.StreamFrames) == 0 && !ackhandler.HasAckElicitingFrames(p.Frames) {
+		return false
+	}
+	for _, frame := range p.Frames {
+		switch frame.Frame.(type) {
+		case *wire.CryptoFrame:
+			if policy.ShouldDuplicateCrypto() {
+				return true
+			}
+		case *wire.ResetStreamFrame:
+			if policy.ShouldDuplicateReset() {
+				return true
+			}
+		}
+	}
+	for _, frame := range p.StreamFrames {
+		if frame.Frame == nil {
+			continue
+		}
+		if policy.ShouldDuplicateStream(frame.Frame.StreamID) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Conn) selectDuplicatePaths(p shortHeaderPacket, selectedPath protocol.PathID) []PathInfo {
+	if !c.shouldDuplicatePacket(p) {
+		return nil
+	}
+	if c.multipathController == nil {
+		return nil
+	}
+	targetCount := c.multipathDuplicationPolicy.GetDuplicatePathCount()
+	if targetCount <= 1 {
+		return nil
+	}
+	if lister, ok := c.multipathController.(multipathPathLister); ok {
+		paths := lister.GetAvailablePaths()
+		candidates := make([]PathInfo, 0, len(paths))
+		for _, path := range paths {
+			if path.ID == selectedPath || path.ID == protocol.InvalidPathID || path.RemoteAddr == nil {
+				continue
+			}
+			candidates = append(candidates, path)
+		}
+		if len(candidates) == 0 {
+			return nil
+		}
+		slices.SortFunc(candidates, func(a, b PathInfo) int {
+			if a.ID < b.ID {
+				return -1
+			}
+			if a.ID > b.ID {
+				return 1
+			}
+			return 0
+		})
+		limit := targetCount - 1
+		if len(candidates) > limit {
+			candidates = candidates[:limit]
+		}
+		return candidates
+	}
+	if selector, ok := c.multipathController.(interface {
+		ShouldDuplicatePacket(PathID) (PathID, bool)
+	}); ok {
+		dupID, ok := selector.ShouldDuplicatePacket(PathID(selectedPath))
+		if !ok || dupID == protocol.InvalidPathID || dupID == PathID(selectedPath) {
+			return nil
+		}
+		if provider, ok := c.multipathController.(multipathPathInfoProvider); ok {
+			if info, ok := provider.PathInfoForID(dupID); ok && info.RemoteAddr != nil {
+				return []PathInfo{info}
+			}
+		}
+	}
 	return nil
 }
 
@@ -2704,6 +3117,14 @@ func (c *Conn) sendProbePacket(sendMode ackhandler.SendMode, now monotime.Time) 
 	default:
 		return fmt.Errorf("connection BUG: unexpected send mode: %d", sendMode)
 	}
+	pathID := protocol.InvalidPathID
+	if encLevel == protocol.Encryption1RTT && c.multipathEnabled {
+		hasRetransmission := c.retransmissionQueue.HasData(protocol.Encryption1RTT)
+		if sel, ok := c.selectPathForSending(now, false, hasRetransmission); ok {
+			pathID = sel.id
+		}
+	}
+
 	// Queue probe packets until we actually send out a packet,
 	// or until there are no more packets to queue.
 	var packet *coalescedPacket
@@ -2712,14 +3133,14 @@ func (c *Conn) sendProbePacket(sendMode ackhandler.SendMode, now monotime.Time) 
 			break
 		}
 		var err error
-		packet, err = c.packer.PackPTOProbePacket(encLevel, c.maxPacketSize(), false, now, c.version)
+		packet, err = c.packer.PackPTOProbePacket(encLevel, c.maxPacketSize(), false, now, c.version, pathID)
 		if err != nil {
 			return err
 		}
 	}
 	if packet == nil {
 		var err error
-		packet, err = c.packer.PackPTOProbePacket(encLevel, c.maxPacketSize(), true, now, c.version)
+		packet, err = c.packer.PackPTOProbePacket(encLevel, c.maxPacketSize(), true, now, c.version, pathID)
 		if err != nil {
 			return err
 		}
@@ -2727,21 +3148,27 @@ func (c *Conn) sendProbePacket(sendMode ackhandler.SendMode, now monotime.Time) 
 	if packet == nil || (len(packet.longHdrPackets) == 0 && packet.shortHdrPacket == nil) {
 		return fmt.Errorf("connection BUG: couldn't pack %s probe packet: %v", encLevel, packet)
 	}
+	if packet.shortHdrPacket != nil && pathID != protocol.InvalidPathID {
+		packet.shortHdrPacket.PathID = uint64(pathID)
+	}
 	return c.sendPackedCoalescedPacket(packet, c.sentPacketHandler.ECNMode(packet.IsOnlyShortHeaderPacket()), now)
 }
 
 // appendOneShortHeaderPacket appends a new packet to the given packetBuffer.
 // If there was nothing to pack, the returned size is 0.
-func (c *Conn) appendOneShortHeaderPacket(buf *packetBuffer, maxSize protocol.ByteCount, ecn protocol.ECN, now monotime.Time) (protocol.ByteCount, error) {
+func (c *Conn) appendOneShortHeaderPacket(buf *packetBuffer, maxSize protocol.ByteCount, ecn protocol.ECN, now monotime.Time, pathID protocol.PathID) (protocol.ByteCount, shortHeaderPacket, error) {
 	startLen := buf.Len()
-	p, err := c.packer.AppendPacket(buf, maxSize, now, c.version)
+	p, err := c.packer.AppendPacket(buf, maxSize, now, c.version, pathID)
 	if err != nil {
-		return 0, err
+		return 0, shortHeaderPacket{}, err
 	}
 	size := buf.Len() - startLen
+	if pathID != protocol.InvalidPathID {
+		p.PathID = uint64(pathID)
+	}
 	c.logShortHeaderPacket(p, ecn, size)
 	c.registerPackedShortHeaderPacket(p, ecn, now)
-	return size, nil
+	return size, p, nil
 }
 
 func (c *Conn) registerPackedShortHeaderPacket(p shortHeaderPacket, ecn protocol.ECN, now monotime.Time) {
@@ -2757,6 +3184,7 @@ func (c *Conn) registerPackedShortHeaderPacket(p shortHeaderPacket, ecn protocol
 			p.Length,
 			p.IsPathMTUProbePacket,
 			true,
+			protocol.PathID(p.PathID),
 		)
 		return
 	}
@@ -2779,6 +3207,7 @@ func (c *Conn) registerPackedShortHeaderPacket(p shortHeaderPacket, ecn protocol
 		p.Length,
 		p.IsPathMTUProbePacket,
 		false,
+		protocol.PathID(p.PathID),
 	)
 	c.connIDManager.SentPacket()
 }
@@ -2804,6 +3233,7 @@ func (c *Conn) sendPackedCoalescedPacket(packet *coalescedPacket, ecn protocol.E
 			p.length,
 			false,
 			false,
+			protocol.InvalidPathID,
 		)
 		if c.perspective == protocol.PerspectiveClient && p.EncryptionLevel() == protocol.EncryptionHandshake &&
 			!c.droppedInitialKeys {
@@ -2833,9 +3263,24 @@ func (c *Conn) sendPackedCoalescedPacket(packet *coalescedPacket, ecn protocol.E
 			p.Length,
 			p.IsPathMTUProbePacket,
 			false,
+			protocol.PathID(p.PathID),
 		)
+		if c.multipathEnabled {
+			c.setPacketPathID(*p, protocol.PathID(p.PathID))
+		}
 	}
 	c.connIDManager.SentPacket()
+	if c.multipathEnabled && packet.shortHdrPacket != nil && len(packet.longHdrPackets) == 0 {
+		pathID := protocol.PathID(packet.shortHdrPacket.PathID)
+		if pathID != protocol.InvalidPathID {
+			if path, ok := c.pathInfoForID(pathID); ok && path.RemoteAddr != nil {
+				if psq, ok := c.sendQueue.(pathSenderQueue); ok {
+					psq.SendPath(packet.buffer, 0, ecn, path.RemoteAddr, packetInfoFromPathInfo(path))
+					return nil
+				}
+			}
+		}
+	}
 	c.sendQueue.Send(packet.buffer, 0, ecn)
 	return nil
 }
@@ -3145,4 +3590,518 @@ func (c *Conn) NextConnection(ctx context.Context) (*Conn, error) {
 // connection ID length), and the size of the encryption tag.
 func estimateMaxPayloadSize(mtu protocol.ByteCount) protocol.ByteCount {
 	return mtu - 1 /* type byte */ - 20 /* maximum connection ID length */ - 16 /* tag size */
+}
+
+type packetObserverSetter interface {
+	SetPacketObserver(ackhandler.PacketObserver)
+}
+
+type multipathEnabler interface {
+	EnableMultipath()
+}
+
+type multipathPathRegistrar interface {
+	RegisterPath(PathInfo)
+}
+
+type multipathPathCreator interface {
+	AddPath(PathInfo) (PathID, bool)
+}
+
+type multipathPathValidator interface {
+	ValidatePath(PathID)
+}
+
+type multipathPathLister interface {
+	GetAvailablePaths() []PathInfo
+}
+
+type multipathPathInfoProvider interface {
+	PathInfoForID(PathID) (PathInfo, bool)
+}
+
+type pathRTTProvider interface {
+	GetPathRTTStats(protocol.PathID) *utils.RTTStats
+}
+
+type packetPathSetter interface {
+	SetPacketPathID(encLevel protocol.EncryptionLevel, pn protocol.PacketNumber, pathID protocol.PathID)
+}
+
+type pathSenderQueue interface {
+	SendPath(p *packetBuffer, gsoSize uint16, ecn protocol.ECN, addr net.Addr, info packetInfo)
+}
+
+type packetObserverFanout struct {
+	observers []ackhandler.PacketObserver
+}
+
+func (f *packetObserverFanout) OnPacketSent(ev ackhandler.PacketEvent) {
+	for _, observer := range f.observers {
+		observer.OnPacketSent(ev)
+	}
+}
+
+func (f *packetObserverFanout) OnPacketAcked(ev ackhandler.PacketEvent) {
+	for _, observer := range f.observers {
+		observer.OnPacketAcked(ev)
+	}
+}
+
+func (f *packetObserverFanout) OnPacketLost(ev ackhandler.PacketEvent) {
+	for _, observer := range f.observers {
+		observer.OnPacketLost(ev)
+	}
+}
+
+type multipathReinjectionObserver struct {
+	manager *MultipathReinjectionManager
+}
+
+func (o *multipathReinjectionObserver) OnPacketSent(ackhandler.PacketEvent) {}
+
+func (o *multipathReinjectionObserver) OnPacketAcked(ev ackhandler.PacketEvent) {
+	o.manager.OnPacketAcked(ev.PacketNumber)
+}
+
+func (o *multipathReinjectionObserver) OnPacketLost(ev ackhandler.PacketEvent) {
+	frames := make([]ackhandler.Frame, 0, len(ev.Frames)+len(ev.StreamFrames))
+	for _, frame := range ev.Frames {
+		if frame.Frame == nil {
+			continue
+		}
+		frames = append(frames, frame)
+	}
+	for _, frame := range ev.StreamFrames {
+		if frame.Frame == nil {
+			continue
+		}
+		frames = append(frames, ackhandler.Frame{Frame: frame.Frame, Handler: frame.Handler})
+	}
+	if len(frames) == 0 {
+		return
+	}
+	o.manager.OnPacketLost(ev.PathID, ev.PacketNumber, ev.EncryptionLevel, frames)
+}
+
+type pathSelection struct {
+	id         protocol.PathID
+	remoteAddr net.Addr
+	info       packetInfo
+}
+
+type bytesInFlightProvider interface {
+	BytesInFlight() protocol.ByteCount
+}
+
+func (c *Conn) setupMultipath() {
+	c.multipathController = c.config.MultipathController
+	if c.multipathController == nil {
+		return
+	}
+	if c.config.MultipathDuplicationPolicy != nil {
+		c.multipathDuplicationPolicy = c.config.MultipathDuplicationPolicy
+	}
+	if c.config.MultipathReinjectionPolicy != nil {
+		c.multipathReinjectionManager = NewMultipathReinjectionManager(c.config.MultipathReinjectionPolicy)
+	}
+}
+
+func (c *Conn) maybeEnableMultipath() {
+	if c.multipathEnabled || c.multipathController == nil || c.peerParams == nil || !c.peerParams.EnableMultipath {
+		return
+	}
+
+	c.multipathEnabled = true
+	// Enable parsing of multipath-specific frames (ADD_ADDRESS, PATHS, CLOSE_PATH).
+	c.frameParser.EnableMultipath()
+
+	if enabler, ok := c.multipathController.(multipathEnabler); ok {
+		enabler.EnableMultipath()
+	}
+	if registrar, ok := c.multipathController.(multipathPathRegistrar); ok {
+		registrar.RegisterPath(PathInfo{
+			ID:         0,
+			LocalAddr:  c.conn.LocalAddr(),
+			RemoteAddr: c.conn.RemoteAddr(),
+		})
+	}
+
+	if obs, ok := c.multipathController.(MultipathObserver); ok {
+		c.multipathObserver = obs
+	}
+	if c.multipathObserver == nil {
+		_, hasSent := c.multipathController.(interface {
+			OnPacketSent(PathID, ByteCount)
+		})
+		_, hasAcked := c.multipathController.(interface {
+			OnPacketAcked(PathID)
+		})
+		_, hasLost := c.multipathController.(interface {
+			OnPacketLost(PathID)
+		})
+		_, hasUpdate := c.multipathController.(interface {
+			UpdatePathState(PathID, PathStateUpdate)
+		})
+		if hasSent || hasAcked || hasLost || hasUpdate {
+			var detector *pathFailureDetector
+			if hasUpdate {
+				detector = newPathFailureDetector()
+			}
+			c.multipathObserver = &multipathControllerObserver{
+				controller:      c.multipathController,
+				failureDetector: detector,
+			}
+		}
+	}
+
+	var observers []ackhandler.PacketObserver
+	if c.multipathObserver != nil {
+		observers = append(observers, &multipathPacketObserver{conn: c})
+	}
+	if c.multipathReinjectionManager != nil {
+		observers = append(observers, &multipathReinjectionObserver{manager: c.multipathReinjectionManager})
+	}
+	if len(observers) == 0 {
+		return
+	}
+	if setter, ok := c.sentPacketHandler.(packetObserverSetter); ok {
+		if len(observers) == 1 {
+			setter.SetPacketObserver(observers[0])
+		} else {
+			setter.SetPacketObserver(&packetObserverFanout{observers: observers})
+		}
+	}
+}
+
+func (c *Conn) selectPathForSending(now monotime.Time, ackOnly, hasRetransmission bool) (pathSelection, bool) {
+	if !c.multipathEnabled || c.multipathController == nil {
+		return pathSelection{}, false
+	}
+	if hasRetransmission && !ackOnly {
+		if sel, ok := c.popReinjectionSelection(); ok {
+			return sel, true
+		}
+	}
+	ctx := PathSelectionContext{
+		Now:               now.ToTime(),
+		AckOnly:           ackOnly,
+		HasRetransmission: hasRetransmission,
+	}
+	if provider, ok := c.sentPacketHandler.(bytesInFlightProvider); ok {
+		ctx.BytesInFlight = provider.BytesInFlight()
+	}
+	path, ok := c.multipathController.SelectPath(ctx)
+	if !ok || path.RemoteAddr == nil || path.ID == protocol.InvalidPathID {
+		return pathSelection{}, false
+	}
+	return pathSelection{
+		id:         path.ID,
+		remoteAddr: path.RemoteAddr,
+		info:       packetInfoFromPathInfo(path),
+	}, true
+}
+
+func (c *Conn) popReinjectionSelection() (pathSelection, bool) {
+	for len(c.reinjectionPathQueue) > 0 {
+		pathID := c.reinjectionPathQueue[0]
+		c.reinjectionPathQueue = c.reinjectionPathQueue[1:]
+		if c.reinjectionQueueCounts != nil {
+			if count, ok := c.reinjectionQueueCounts[pathID]; ok {
+				if count <= 1 {
+					delete(c.reinjectionQueueCounts, pathID)
+				} else {
+					c.reinjectionQueueCounts[pathID] = count - 1
+				}
+			}
+		}
+		if pathID == protocol.InvalidPathID {
+			continue
+		}
+		path, ok := c.pathInfoForID(pathID)
+		if !ok || path.RemoteAddr == nil {
+			continue
+		}
+		return pathSelection{
+			id:         pathID,
+			remoteAddr: path.RemoteAddr,
+			info:       packetInfoFromPathInfo(path),
+		}, true
+	}
+	return pathSelection{}, false
+}
+
+func (c *Conn) setPacketPathID(p shortHeaderPacket, pathID protocol.PathID) {
+	if setter, ok := c.sentPacketHandler.(packetPathSetter); ok {
+		setter.SetPacketPathID(protocol.Encryption1RTT, p.PacketNumber, pathID)
+	}
+}
+
+func (c *Conn) notifyMultipathReceived(p receivedPacket) protocol.PathID {
+	if !c.multipathEnabled || c.multipathController == nil {
+		return protocol.InvalidPathID
+	}
+	localAddr := localAddrFromPacketInfo(p.info, c.LocalAddr())
+	pathID, ok := c.multipathController.PathIDForPacket(p.remoteAddr, localAddr)
+	if !ok {
+		return protocol.InvalidPathID
+	}
+	return protocol.PathID(pathID)
+}
+
+func packetInfoFromPathInfo(path PathInfo) packetInfo {
+	var ip net.IP
+	switch addr := path.LocalAddr.(type) {
+	case *net.UDPAddr:
+		ip = addr.IP
+	case *net.IPAddr:
+		ip = addr.IP
+	}
+	if ip == nil {
+		return packetInfo{}
+	}
+	parsed, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return packetInfo{}
+	}
+	info := packetInfo{addr: parsed}
+	if path.IfIndex > 0 {
+		info.ifIndex = uint32(path.IfIndex)
+	}
+	return info
+}
+
+func (c *Conn) pathInfoForID(pathID protocol.PathID) (PathInfo, bool) {
+	if c.multipathController == nil {
+		return PathInfo{}, false
+	}
+	if provider, ok := c.multipathController.(multipathPathInfoProvider); ok {
+		return provider.PathInfoForID(PathID(pathID))
+	}
+	if lister, ok := c.multipathController.(multipathPathLister); ok {
+		for _, path := range lister.GetAvailablePaths() {
+			if path.ID == pathID {
+				return path, true
+			}
+		}
+	}
+	return PathInfo{}, false
+}
+
+func localAddrFromPacketInfo(info packetInfo, fallback net.Addr) net.Addr {
+	if !info.addr.IsValid() {
+		return fallback
+	}
+	ip := info.addr.AsSlice()
+	if udp, ok := fallback.(*net.UDPAddr); ok {
+		addr := *udp
+		addr.IP = ip
+		return &addr
+	}
+	return &net.UDPAddr{IP: ip}
+}
+
+type multipathPacketObserver struct {
+	conn *Conn
+}
+
+func (o *multipathPacketObserver) OnPacketSent(ev ackhandler.PacketEvent) {
+	o.conn.multipathObserver.OnPacketSent(o.conn.toPathEvent(ev))
+}
+
+func (o *multipathPacketObserver) OnPacketAcked(ev ackhandler.PacketEvent) {
+	o.conn.multipathObserver.OnPacketAcked(o.conn.toPathEvent(ev))
+}
+
+func (o *multipathPacketObserver) OnPacketLost(ev ackhandler.PacketEvent) {
+	o.conn.multipathObserver.OnPacketLost(o.conn.toPathEvent(ev))
+}
+
+type multipathControllerObserver struct {
+	controller      MultipathController
+	failureDetector *pathFailureDetector
+}
+
+func (o *multipathControllerObserver) OnPacketSent(ev PathEvent) {
+	if ev.PathID == InvalidPathID || ev.IsPathProbe || ev.IsPathMTUProbe || !ev.AckEliciting {
+		return
+	}
+	if sender, ok := o.controller.(interface {
+		OnPacketSent(PathID, ByteCount)
+	}); ok {
+		sender.OnPacketSent(ev.PathID, ev.PacketSize)
+	}
+	if o.failureDetector != nil {
+		changed, failed := o.failureDetector.onPacketSent(ev)
+		if changed {
+			if updater, ok := o.controller.(interface {
+				UpdatePathState(PathID, PathStateUpdate)
+			}); ok {
+				update := PathStateUpdate{PotentiallyFailed: &failed}
+				updater.UpdatePathState(ev.PathID, update)
+			}
+		}
+	}
+}
+
+func (o *multipathControllerObserver) OnPacketAcked(ev PathEvent) {
+	if ev.PathID == InvalidPathID || ev.IsPathProbe || ev.IsPathMTUProbe || !ev.AckEliciting {
+		return
+	}
+	if acked, ok := o.controller.(interface {
+		OnPacketAcked(PathID)
+	}); ok {
+		acked.OnPacketAcked(ev.PathID)
+	}
+	if updater, ok := o.controller.(interface {
+		UpdatePathState(PathID, PathStateUpdate)
+	}); ok {
+		update := PathStateUpdate{}
+		hasUpdate := false
+		if ev.SmoothedRTT > 0 {
+			update.SmoothedRTT = &ev.SmoothedRTT
+			update.RTTVar = &ev.RTTVar
+			hasUpdate = true
+		}
+		validated := true
+		update.Validated = &validated
+		hasUpdate = true
+		if o.failureDetector != nil {
+			if changed, failed := o.failureDetector.onPacketAcked(ev); changed {
+				update.PotentiallyFailed = &failed
+				hasUpdate = true
+			}
+		}
+		if hasUpdate {
+			updater.UpdatePathState(ev.PathID, update)
+		}
+	}
+}
+
+func (o *multipathControllerObserver) OnPacketLost(ev PathEvent) {
+	if ev.PathID == InvalidPathID || ev.IsPathProbe || ev.IsPathMTUProbe || !ev.AckEliciting {
+		return
+	}
+	if lost, ok := o.controller.(interface {
+		OnPacketLost(PathID)
+	}); ok {
+		lost.OnPacketLost(ev.PathID)
+	}
+}
+
+func (c *Conn) toPathEvent(ev ackhandler.PacketEvent) PathEvent {
+	event := PathEvent{
+		PathID:          ev.PathID,
+		PacketNumber:    ev.PacketNumber,
+		PacketSize:      ev.Length,
+		EncryptionLevel: ev.EncryptionLevel,
+		AckEliciting:    ev.IsAckEliciting,
+		IsPathProbe:     ev.IsPathProbePacket,
+		IsPathMTUProbe:  ev.IsPathMTUProbePacket,
+		SentAt:          ev.SendTime.ToTime(),
+		EventAt:         ev.EventTime.ToTime(),
+	}
+	if statsProvider, ok := c.sentPacketHandler.(pathRTTProvider); ok {
+		if stats := statsProvider.GetPathRTTStats(ev.PathID); stats != nil {
+			event.SmoothedRTT = stats.SmoothedRTT()
+			event.RTTVar = stats.MeanDeviation()
+		}
+	}
+	return event
+}
+
+func (c *Conn) notifyMultipathDuplicateSent(p shortHeaderPacket, pathID protocol.PathID, now monotime.Time) {
+	if !c.multipathEnabled || c.multipathObserver == nil || pathID == protocol.InvalidPathID {
+		return
+	}
+	event := PathEvent{
+		PathID:          pathID,
+		PacketNumber:    p.PacketNumber,
+		PacketSize:      p.Length,
+		EncryptionLevel: protocol.Encryption1RTT,
+		AckEliciting:    p.IsAckEliciting(),
+		IsPathProbe:     p.IsPathProbePacket,
+		IsPathMTUProbe:  p.IsPathMTUProbePacket,
+		IsDuplicate:     true,
+		SentAt:          now.ToTime(),
+		EventAt:         now.ToTime(),
+	}
+	if statsProvider, ok := c.sentPacketHandler.(pathRTTProvider); ok {
+		if stats := statsProvider.GetPathRTTStats(pathID); stats != nil {
+			event.SmoothedRTT = stats.SmoothedRTT()
+			event.RTTVar = stats.MeanDeviation()
+		}
+	}
+	c.multipathObserver.OnPacketSent(event)
+}
+
+type rawFrame struct {
+	frameType    uint64
+	data         []byte
+	ackEliciting bool
+}
+
+var _ wire.Frame = &rawFrame{}
+
+func (f *rawFrame) Append(b []byte, _ protocol.Version) ([]byte, error) {
+	b = quicvarint.Append(b, f.frameType)
+	b = append(b, f.data...)
+	return b, nil
+}
+
+func (f *rawFrame) Length(_ protocol.Version) protocol.ByteCount {
+	return protocol.ByteCount(quicvarint.Len(f.frameType) + len(f.data))
+}
+
+func (f *rawFrame) AckEliciting() bool {
+	return f.ackEliciting
+}
+
+type rawFrameHandler struct {
+	conn       *Conn
+	frame      *rawFrame
+	onAcked    func()
+	onLost     func()
+	retransmit bool
+}
+
+var _ ackhandler.FrameHandler = &rawFrameHandler{}
+
+func (h *rawFrameHandler) OnAcked(wire.Frame) {
+	if h.onAcked != nil {
+		h.onAcked()
+	}
+}
+
+func (h *rawFrameHandler) OnLost(wire.Frame) {
+	if h.onLost != nil {
+		h.onLost()
+	}
+	if h.retransmit {
+		h.conn.framer.QueueControlFrameWithHandler(h.frame, h)
+		h.conn.scheduleSending()
+	}
+}
+
+// QueueRawFrame queues a custom frame for sending.
+func (c *Conn) QueueRawFrame(frame RawFrame) {
+	data := append([]byte(nil), frame.Data...)
+	rf := &rawFrame{
+		frameType:    frame.FrameType,
+		data:         data,
+		ackEliciting: !frame.NonAckEliciting,
+	}
+	if frame.OnAcked != nil || frame.OnLost != nil || frame.RetransmitOnLoss {
+		h := &rawFrameHandler{
+			conn:       c,
+			frame:      rf,
+			onAcked:    frame.OnAcked,
+			onLost:     frame.OnLost,
+			retransmit: frame.RetransmitOnLoss,
+		}
+		c.framer.QueueControlFrameWithHandler(rf, h)
+	} else {
+		c.framer.QueueControlFrame(rf)
+	}
+	c.scheduleSending()
 }

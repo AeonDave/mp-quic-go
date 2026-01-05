@@ -3,26 +3,32 @@ package ackhandler
 import (
 	"fmt"
 
-	"github.com/quic-go/quic-go/internal/monotime"
-	"github.com/quic-go/quic-go/internal/protocol"
-	"github.com/quic-go/quic-go/internal/utils"
-	"github.com/quic-go/quic-go/internal/wire"
+	"github.com/AeonDave/mp-quic-go/internal/monotime"
+	"github.com/AeonDave/mp-quic-go/internal/protocol"
+	"github.com/AeonDave/mp-quic-go/internal/utils"
+	"github.com/AeonDave/mp-quic-go/internal/wire"
 )
 
 type ReceivedPacketHandler struct {
 	initialPackets   *receivedPacketTracker
 	handshakePackets *receivedPacketTracker
-	appDataPackets   appDataReceivedPacketTracker
+	appDataPackets   map[protocol.PathID]*appDataReceivedPacketTracker
 
-	lowest1RTTPacket protocol.PacketNumber
+	lowest1RTTPacket map[protocol.PathID]protocol.PacketNumber
+	logger           utils.Logger
 }
 
 func NewReceivedPacketHandler(logger utils.Logger) *ReceivedPacketHandler {
 	return &ReceivedPacketHandler{
 		initialPackets:   newReceivedPacketTracker(),
 		handshakePackets: newReceivedPacketTracker(),
-		appDataPackets:   *newAppDataReceivedPacketTracker(logger),
-		lowest1RTTPacket: protocol.InvalidPacketNumber,
+		appDataPackets: map[protocol.PathID]*appDataReceivedPacketTracker{
+			protocol.InvalidPathID: newAppDataReceivedPacketTracker(logger),
+		},
+		lowest1RTTPacket: map[protocol.PathID]protocol.PacketNumber{
+			protocol.InvalidPathID: protocol.InvalidPacketNumber,
+		},
+		logger: logger,
 	}
 }
 
@@ -32,6 +38,7 @@ func (h *ReceivedPacketHandler) ReceivedPacket(
 	encLevel protocol.EncryptionLevel,
 	rcvTime monotime.Time,
 	ackEliciting bool,
+	pathID protocol.PathID,
 ) error {
 	switch encLevel {
 	case protocol.EncryptionInitial:
@@ -44,22 +51,26 @@ func (h *ReceivedPacketHandler) ReceivedPacket(
 		}
 		return h.handshakePackets.ReceivedPacket(pn, ecn, ackEliciting)
 	case protocol.Encryption0RTT:
-		if h.lowest1RTTPacket != protocol.InvalidPacketNumber && pn > h.lowest1RTTPacket {
-			return fmt.Errorf("received packet number %d on a 0-RTT packet after receiving %d on a 1-RTT packet", pn, h.lowest1RTTPacket)
+		lowest1RTTPacket := h.getLowest1RTTPacket(pathID)
+		if lowest1RTTPacket != protocol.InvalidPacketNumber && pn > lowest1RTTPacket {
+			return fmt.Errorf("received packet number %d on a 0-RTT packet after receiving %d on a 1-RTT packet", pn, lowest1RTTPacket)
 		}
-		return h.appDataPackets.ReceivedPacket(pn, ecn, rcvTime, ackEliciting)
+		return h.getAppDataTracker(pathID).ReceivedPacket(pn, ecn, rcvTime, ackEliciting)
 	case protocol.Encryption1RTT:
-		if h.lowest1RTTPacket == protocol.InvalidPacketNumber || pn < h.lowest1RTTPacket {
-			h.lowest1RTTPacket = pn
+		lowest1RTTPacket := h.getLowest1RTTPacket(pathID)
+		if lowest1RTTPacket == protocol.InvalidPacketNumber || pn < lowest1RTTPacket {
+			h.lowest1RTTPacket[pathID] = pn
 		}
-		return h.appDataPackets.ReceivedPacket(pn, ecn, rcvTime, ackEliciting)
+		return h.getAppDataTracker(pathID).ReceivedPacket(pn, ecn, rcvTime, ackEliciting)
 	default:
 		panic(fmt.Sprintf("received packet with unknown encryption level: %s", encLevel))
 	}
 }
 
 func (h *ReceivedPacketHandler) IgnorePacketsBelow(pn protocol.PacketNumber) {
-	h.appDataPackets.IgnoreBelow(pn)
+	for _, tracker := range h.appDataPackets {
+		tracker.IgnoreBelow(pn)
+	}
 }
 
 func (h *ReceivedPacketHandler) DropPackets(encLevel protocol.EncryptionLevel) {
@@ -78,10 +89,17 @@ func (h *ReceivedPacketHandler) DropPackets(encLevel protocol.EncryptionLevel) {
 }
 
 func (h *ReceivedPacketHandler) GetAlarmTimeout() monotime.Time {
-	return h.appDataPackets.GetAlarmTimeout()
+	var alarm monotime.Time
+	for _, tracker := range h.appDataPackets {
+		t := tracker.GetAlarmTimeout()
+		if alarm.IsZero() || (!t.IsZero() && t.Before(alarm)) {
+			alarm = t
+		}
+	}
+	return alarm
 }
 
-func (h *ReceivedPacketHandler) GetAckFrame(encLevel protocol.EncryptionLevel, now monotime.Time, onlyIfQueued bool) *wire.AckFrame {
+func (h *ReceivedPacketHandler) GetAckFrame(encLevel protocol.EncryptionLevel, now monotime.Time, onlyIfQueued bool, pathID protocol.PathID) *wire.AckFrame {
 	//nolint:exhaustive // 0-RTT packets can't contain ACK frames.
 	switch encLevel {
 	case protocol.EncryptionInitial:
@@ -95,14 +113,14 @@ func (h *ReceivedPacketHandler) GetAckFrame(encLevel protocol.EncryptionLevel, n
 		}
 		return nil
 	case protocol.Encryption1RTT:
-		return h.appDataPackets.GetAckFrame(now, onlyIfQueued)
+		return h.getAppDataTracker(pathID).GetAckFrame(now, onlyIfQueued)
 	default:
 		// 0-RTT packets can't contain ACK frames
 		return nil
 	}
 }
 
-func (h *ReceivedPacketHandler) IsPotentiallyDuplicate(pn protocol.PacketNumber, encLevel protocol.EncryptionLevel) bool {
+func (h *ReceivedPacketHandler) IsPotentiallyDuplicate(pn protocol.PacketNumber, encLevel protocol.EncryptionLevel, pathID protocol.PathID) bool {
 	switch encLevel {
 	case protocol.EncryptionInitial:
 		if h.initialPackets != nil {
@@ -113,7 +131,25 @@ func (h *ReceivedPacketHandler) IsPotentiallyDuplicate(pn protocol.PacketNumber,
 			return h.handshakePackets.IsPotentiallyDuplicate(pn)
 		}
 	case protocol.Encryption0RTT, protocol.Encryption1RTT:
-		return h.appDataPackets.IsPotentiallyDuplicate(pn)
+		return h.getAppDataTracker(pathID).IsPotentiallyDuplicate(pn)
 	}
 	panic("unexpected encryption level")
+}
+
+func (h *ReceivedPacketHandler) getAppDataTracker(pathID protocol.PathID) *appDataReceivedPacketTracker {
+	if tracker, ok := h.appDataPackets[pathID]; ok {
+		return tracker
+	}
+	tracker := newAppDataReceivedPacketTracker(h.logger)
+	h.appDataPackets[pathID] = tracker
+	h.lowest1RTTPacket[pathID] = protocol.InvalidPacketNumber
+	return tracker
+}
+
+func (h *ReceivedPacketHandler) getLowest1RTTPacket(pathID protocol.PathID) protocol.PacketNumber {
+	if pn, ok := h.lowest1RTTPacket[pathID]; ok {
+		return pn
+	}
+	h.lowest1RTTPacket[pathID] = protocol.InvalidPacketNumber
+	return protocol.InvalidPacketNumber
 }

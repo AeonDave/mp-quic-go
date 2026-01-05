@@ -1,6 +1,6 @@
 package wire
 
-import "github.com/quic-go/quic-go/internal/protocol"
+import "github.com/AeonDave/mp-quic-go/internal/protocol"
 
 type FrameType uint64
 
@@ -38,6 +38,12 @@ const (
 
 	FrameTypeDatagramNoLength   FrameType = 0x30
 	FrameTypeDatagramWithLength FrameType = 0x31
+
+	// Multipath QUIC extension frames
+	// Using experimental range (0x40-0x4f for multipath)
+	FrameTypeAddAddress FrameType = 0x40
+	FrameTypePaths      FrameType = 0x41
+	FrameTypeClosePath  FrameType = 0x42
 )
 
 func (t FrameType) IsStreamFrameType() bool {

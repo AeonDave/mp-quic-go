@@ -4,8 +4,8 @@ import (
 	"net"
 	"sync/atomic"
 
-	"github.com/quic-go/quic-go/internal/protocol"
-	"github.com/quic-go/quic-go/internal/utils"
+	"github.com/AeonDave/mp-quic-go/internal/protocol"
+	"github.com/AeonDave/mp-quic-go/internal/utils"
 )
 
 // A sendConn allows sending using a simple Write() on a non-connected packet conn.
@@ -18,6 +18,10 @@ type sendConn interface {
 	ChangeRemoteAddr(addr net.Addr, info packetInfo)
 
 	capabilities() connCapabilities
+}
+
+type packetInfoWriter interface {
+	WritePacketWithInfo(b []byte, addr net.Addr, info packetInfo, gsoSize uint16, ecn protocol.ECN) (int, error)
 }
 
 type remoteAddrInfo struct {
@@ -85,6 +89,65 @@ func (c *sconn) Write(p []byte, gsoSize uint16, ecn protocol.ECN) error {
 				l = int(gsoSize)
 			}
 			if err := c.writePacket(p[:l], ai.addr, ai.oob, 0, ecn); err != nil {
+				return err
+			}
+			p = p[l:]
+		}
+		return nil
+	}
+	return err
+}
+
+func (c *sconn) WritePath(p []byte, gsoSize uint16, ecn protocol.ECN, addr net.Addr, info packetInfo) error {
+	ai := c.remoteAddrInfo.Load()
+	if addr == nil {
+		addr = ai.addr
+	}
+
+	if writer, ok := c.rawConn.(packetInfoWriter); ok {
+		_, err := writer.WritePacketWithInfo(p, addr, info, gsoSize, ecn)
+		if err != nil && isGSOError(err) {
+			c.gotGSOError = true
+			if c.logger.Debug() {
+				c.logger.Debugf("GSO failed when sending to %s", addr)
+			}
+			for len(p) > 0 {
+				l := len(p)
+				if l > int(gsoSize) {
+					l = int(gsoSize)
+				}
+				if _, err := writer.WritePacketWithInfo(p[:l], addr, info, 0, ecn); err != nil {
+					return err
+				}
+				p = p[l:]
+			}
+			return nil
+		}
+		return err
+	}
+
+	oob := info.OOB()
+	if len(oob) == 0 {
+		oob = ai.oob
+	} else {
+		l := len(oob)
+		oob = append(oob, make([]byte, 64)...)[:l]
+	}
+
+	err := c.writePacket(p, addr, oob, gsoSize, ecn)
+	if err != nil && isGSOError(err) {
+		// disable GSO for future calls
+		c.gotGSOError = true
+		if c.logger.Debug() {
+			c.logger.Debugf("GSO failed when sending to %s", addr)
+		}
+		// send out the packets one by one
+		for len(p) > 0 {
+			l := len(p)
+			if l > int(gsoSize) {
+				l = int(gsoSize)
+			}
+			if err := c.writePacket(p[:l], addr, oob, 0, ecn); err != nil {
 				return err
 			}
 			p = p[l:]

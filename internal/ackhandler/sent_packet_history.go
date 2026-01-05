@@ -5,7 +5,7 @@ import (
 	"iter"
 	"slices"
 
-	"github.com/quic-go/quic-go/internal/protocol"
+	"github.com/AeonDave/mp-quic-go/internal/protocol"
 )
 
 const maxSkippedPackets = 4
@@ -185,6 +185,36 @@ func (h *sentPacketHistory) RemovePathProbe(pn protocol.PacketNumber) *packet {
 		h.pathProbePackets = h.pathProbePackets[:len(h.pathProbePackets)-1]
 	}
 	return packetToDelete
+}
+
+func (h *sentPacketHistory) SetPathID(pn protocol.PacketNumber, pathID protocol.PathID) (*packet, bool) {
+	var found *packet
+	for i := range h.pathProbePackets {
+		if h.pathProbePackets[i].PacketNumber == pn {
+			h.pathProbePackets[i].packet.PathID = pathID
+			found = h.pathProbePackets[i].packet
+			break
+		}
+	}
+	idx, ok := h.getIndex(pn)
+	if !ok {
+		if found == nil {
+			return nil, false
+		}
+		return found, true
+	}
+	p := h.packets[idx]
+	if p == nil {
+		if found == nil {
+			return nil, false
+		}
+		return found, true
+	}
+	p.PathID = pathID
+	if found == nil {
+		found = p
+	}
+	return found, true
 }
 
 // getIndex gets the index of packet p in the packets slice.

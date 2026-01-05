@@ -6,11 +6,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/quic-go/quic-go/internal/ackhandler"
-	"github.com/quic-go/quic-go/internal/monotime"
-	"github.com/quic-go/quic-go/internal/protocol"
-	"github.com/quic-go/quic-go/internal/utils"
-	"github.com/quic-go/quic-go/internal/wire"
+	"github.com/AeonDave/mp-quic-go/internal/ackhandler"
+	"github.com/AeonDave/mp-quic-go/internal/monotime"
+	"github.com/AeonDave/mp-quic-go/internal/protocol"
+	"github.com/AeonDave/mp-quic-go/internal/utils"
+	"github.com/AeonDave/mp-quic-go/internal/wire"
 
 	"github.com/stretchr/testify/require"
 )
@@ -28,6 +28,7 @@ func TestPathManagerIntentionalMigration(t *testing.T) {
 	pm := newPathManager(
 		func(id pathID) (protocol.ConnectionID, bool) { return connIDs[id], true },
 		func(id pathID) { retiredConnIDs = append(retiredConnIDs, connIDs[id]) },
+		3,
 		utils.DefaultLogger,
 	)
 	now := monotime.Now()
@@ -131,6 +132,7 @@ func TestPathManagerMultipleProbes(t *testing.T) {
 	pm := newPathManager(
 		func(id pathID) (protocol.ConnectionID, bool) { return connIDs[id], true },
 		func(id pathID) {},
+		3,
 		utils.DefaultLogger,
 	)
 	now := monotime.Now()
@@ -185,6 +187,7 @@ func TestPathManagerNATRebinding(t *testing.T) {
 	pm := newPathManager(
 		func(id pathID) (protocol.ConnectionID, bool) { return connIDs[id], true },
 		func(id pathID) { retiredConnIDs = append(retiredConnIDs, connIDs[id]) },
+		3,
 		utils.DefaultLogger,
 	)
 
@@ -207,6 +210,7 @@ func TestPathManagerNATRebinding(t *testing.T) {
 }
 
 func TestPathManagerLimits(t *testing.T) {
+	const maxPaths = 3
 	var connIDs []protocol.ConnectionID
 	for range 2*maxPaths + 2 {
 		b := make([]byte, 8)
@@ -217,6 +221,7 @@ func TestPathManagerLimits(t *testing.T) {
 	pm := newPathManager(
 		func(id pathID) (protocol.ConnectionID, bool) { return connIDs[id], true },
 		func(id pathID) { retiredConnIDs = append(retiredConnIDs, connIDs[id]) },
+		3,
 		utils.DefaultLogger,
 	)
 
@@ -284,73 +289,3 @@ type mockAddr struct {
 func (a *mockAddr) Network() string { return "mock" }
 func (a *mockAddr) String() string  { return a.str }
 
-func TestAddrsEqual(t *testing.T) {
-	tests := []struct {
-		name     string
-		addr1    net.Addr
-		addr2    net.Addr
-		expected bool
-	}{
-		{
-			name:     "nil addresses",
-			addr1:    nil,
-			addr2:    nil,
-			expected: false,
-		},
-		{
-			name:     "one nil address",
-			addr1:    &net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 1234},
-			addr2:    nil,
-			expected: false,
-		},
-		{
-			name:     "same IPv4 addresses",
-			addr1:    &net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 1234},
-			addr2:    &net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 1234},
-			expected: true,
-		},
-		{
-			name:     "different IPv4 addresses",
-			addr1:    &net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 1234},
-			addr2:    &net.UDPAddr{IP: net.IPv4(4, 3, 2, 1), Port: 1234},
-			expected: false,
-		},
-		{
-			name:     "different ports",
-			addr1:    &net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 1234},
-			addr2:    &net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 4321},
-			expected: false,
-		},
-		{
-			name:     "same IPv6 addresses",
-			addr1:    &net.UDPAddr{IP: net.ParseIP("2001:db8::1"), Port: 1234},
-			addr2:    &net.UDPAddr{IP: net.ParseIP("2001:db8::1"), Port: 1234},
-			expected: true,
-		},
-		{
-			name:     "different IPv6 addresses",
-			addr1:    &net.UDPAddr{IP: net.ParseIP("2001:db8::1"), Port: 1234},
-			addr2:    &net.UDPAddr{IP: net.ParseIP("2001:db8::2"), Port: 1234},
-			expected: false,
-		},
-		{
-			name:     "non-UDP addresses with same string representation",
-			addr1:    &mockAddr{str: "192.0.2.1:1234"},
-			addr2:    &mockAddr{str: "192.0.2.1:1234"},
-			expected: true,
-		},
-		{
-			name:     "non-UDP addresses with different string representation",
-			addr1:    &mockAddr{str: "192.0.2.1:1234"},
-			addr2:    &mockAddr{str: "192.0.2.2:1234"},
-			expected: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := addrsEqual(tt.addr1, tt.addr2)
-			require.Equal(t, tt.expected, result)
-		})
-	}
-}

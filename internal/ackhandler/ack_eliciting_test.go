@@ -3,7 +3,8 @@ package ackhandler
 import (
 	"testing"
 
-	"github.com/quic-go/quic-go/internal/wire"
+	"github.com/AeonDave/mp-quic-go/internal/protocol"
+	"github.com/AeonDave/mp-quic-go/internal/wire"
 	"github.com/stretchr/testify/require"
 )
 
@@ -71,4 +72,30 @@ func TestAckElicitingFrames(t *testing.T) {
 		require.Equal(t, expected, IsFrameAckEliciting(f))
 		require.Equal(t, expected, HasAckElicitingFrames([]Frame{{Frame: f}}))
 	}
+}
+
+type testAckElicitingFrame struct {
+	ackEliciting bool
+}
+
+func (f *testAckElicitingFrame) Append(b []byte, _ protocol.Version) ([]byte, error) {
+	return b, nil
+}
+
+func (f *testAckElicitingFrame) Length(protocol.Version) protocol.ByteCount {
+	return 0
+}
+
+func (f *testAckElicitingFrame) AckEliciting() bool {
+	return f.ackEliciting
+}
+
+func TestIsFrameAckElicitingCustomFrame(t *testing.T) {
+	frame := &testAckElicitingFrame{ackEliciting: false}
+	require.False(t, IsFrameAckEliciting(frame))
+	require.False(t, HasAckElicitingFrames([]Frame{{Frame: frame}}))
+
+	frame.ackEliciting = true
+	require.True(t, IsFrameAckEliciting(frame))
+	require.True(t, HasAckElicitingFrames([]Frame{{Frame: frame}}))
 }

@@ -36,7 +36,8 @@ func inspectWriteBuffer(c syscall.RawConn) (int, error) {
 }
 
 type packetInfo struct {
-	addr netip.Addr
+	addr    netip.Addr
+	ifIndex uint32
 }
 
 func (i *packetInfo) OOB() []byte { return nil }

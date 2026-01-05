@@ -5,14 +5,14 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/quic-go/quic-go/internal/congestion"
-	"github.com/quic-go/quic-go/internal/monotime"
-	"github.com/quic-go/quic-go/internal/protocol"
-	"github.com/quic-go/quic-go/internal/qerr"
-	"github.com/quic-go/quic-go/internal/utils"
-	"github.com/quic-go/quic-go/internal/wire"
-	"github.com/quic-go/quic-go/qlog"
-	"github.com/quic-go/quic-go/qlogwriter"
+	"github.com/AeonDave/mp-quic-go/internal/congestion"
+	"github.com/AeonDave/mp-quic-go/internal/monotime"
+	"github.com/AeonDave/mp-quic-go/internal/protocol"
+	"github.com/AeonDave/mp-quic-go/internal/qerr"
+	"github.com/AeonDave/mp-quic-go/internal/utils"
+	"github.com/AeonDave/mp-quic-go/internal/wire"
+	"github.com/AeonDave/mp-quic-go/qlog"
+	"github.com/AeonDave/mp-quic-go/qlogwriter"
 )
 
 const (
@@ -67,8 +67,8 @@ type alarmTimer struct {
 type sentPacketHandler struct {
 	initialPackets   *packetNumberSpace
 	handshakePackets *packetNumberSpace
-	appDataPackets   *packetNumberSpace
-	lostPackets      lostPacketTracker // only for application-data packet number space
+	appDataPackets   map[protocol.PathID]*packetNumberSpace
+	lostPackets      map[protocol.PathID]*lostPacketTracker // only for application-data packet number space
 	// send time of the largest acknowledged packet, across all packet number spaces
 	largestAckedTime monotime.Time
 
@@ -93,6 +93,15 @@ type sentPacketHandler struct {
 	rttStats   *utils.RTTStats
 	connStats  *utils.ConnectionStats
 
+	// Per-path congestion control and RTT tracking for multipath
+	pathCongestionControllers map[protocol.PathID]congestion.SendAlgorithmWithDebugInfos
+	pathRTTStats              map[protocol.PathID]*utils.RTTStats
+	pathPacketNumberManager   *PathPacketNumberManager
+
+	// Factory for creating per-path congestion controllers
+	// If nil, creates Cubic controllers by default
+	ccFactory func(pathID protocol.PathID, rttStats *utils.RTTStats, initialMaxDatagramSize protocol.ByteCount) congestion.SendAlgorithmWithDebugInfos
+
 	// The number of times a PTO has been sent without receiving an ack.
 	ptoCount uint32
 	ptoMode  SendMode
@@ -111,9 +120,15 @@ type sentPacketHandler struct {
 	qlogger     qlogwriter.Recorder
 	lastMetrics qlog.MetricsUpdated
 	logger      utils.Logger
+
+	packetObserver PacketObserver
 }
 
 var _ SentPacketHandler = &sentPacketHandler{}
+
+func (h *sentPacketHandler) BytesInFlight() protocol.ByteCount {
+	return h.bytesInFlight
+}
 
 // clientAddressValidated indicates whether the address was validated beforehand by an address validation token.
 // If the address was validated, the amplification limit doesn't apply. It has no effect for a client.
@@ -129,7 +144,7 @@ func NewSentPacketHandler(
 	qlogger qlogwriter.Recorder,
 	logger utils.Logger,
 ) SentPacketHandler {
-	congestion := congestion.NewCubicSender(
+	cc := congestion.NewCubicSender(
 		congestion.DefaultClock{},
 		rttStats,
 		connStats,
@@ -143,21 +158,154 @@ func NewSentPacketHandler(
 		peerAddressValidated:           pers == protocol.PerspectiveClient || clientAddressValidated,
 		initialPackets:                 newPacketNumberSpace(initialPN, false),
 		handshakePackets:               newPacketNumberSpace(0, false),
-		appDataPackets:                 newPacketNumberSpace(0, true),
-		lostPackets:                    *newLostPacketTracker(64),
-		rttStats:                       rttStats,
-		connStats:                      connStats,
-		congestion:                     congestion,
-		ignorePacketsBelow:             ignorePacketsBelow,
-		perspective:                    pers,
-		qlogger:                        qlogger,
-		logger:                         logger,
+		appDataPackets: map[protocol.PathID]*packetNumberSpace{
+			protocol.InvalidPathID: newPacketNumberSpace(0, true),
+		},
+		lostPackets: map[protocol.PathID]*lostPacketTracker{
+			protocol.InvalidPathID: newLostPacketTracker(64),
+		},
+		rttStats:                  rttStats,
+		connStats:                 connStats,
+		congestion:                cc,
+		pathCongestionControllers: make(map[protocol.PathID]congestion.SendAlgorithmWithDebugInfos),
+		pathRTTStats:              make(map[protocol.PathID]*utils.RTTStats),
+		pathPacketNumberManager:   NewPathPacketNumberManager(),
+		ignorePacketsBelow:        ignorePacketsBelow,
+		perspective:               pers,
+		qlogger:                   qlogger,
+		logger:                    logger,
 	}
 	if enableECN {
 		h.enableECN = true
 		h.ecnTracker = newECNTracker(logger, qlogger)
 	}
 	return h
+}
+
+func (h *sentPacketHandler) SetPacketObserver(o PacketObserver) {
+	h.packetObserver = o
+}
+
+// SetCongestionControlFactory sets a custom factory for creating per-path congestion controllers.
+// This allows using OLIA or other multipath-aware congestion control algorithms.
+// The factory function receives the pathID, RTT stats, and initial max datagram size.
+func (h *sentPacketHandler) SetCongestionControlFactory(
+	factory func(pathID protocol.PathID, rttStats *utils.RTTStats, initialMaxDatagramSize protocol.ByteCount) congestion.SendAlgorithmWithDebugInfos,
+) {
+	h.ccFactory = factory
+}
+
+// getOrCreatePathCongestionControl returns the congestion controller for a path.
+// If pathID is invalid, returns the default controller (single-path mode).
+func (h *sentPacketHandler) getOrCreatePathCongestionControl(pathID protocol.PathID) congestion.SendAlgorithmWithDebugInfos {
+	if pathID == protocol.InvalidPathID {
+		return h.congestion
+	}
+
+	if cc, ok := h.pathCongestionControllers[pathID]; ok {
+		return cc
+	}
+
+	// Create new congestion controller for this path
+	var cc congestion.SendAlgorithmWithDebugInfos
+	rttStats := h.getOrCreatePathRTTStats(pathID)
+
+	if h.ccFactory != nil {
+		// Use custom factory (e.g., for OLIA)
+		cc = h.ccFactory(pathID, rttStats, protocol.InitialPacketSize)
+	} else {
+		// Default to Cubic
+		cc = congestion.NewCubicSender(
+			congestion.DefaultClock{},
+			rttStats,
+			h.connStats,
+			protocol.InitialPacketSize,
+			true, // use Reno
+			h.qlogger,
+		)
+	}
+
+	h.pathCongestionControllers[pathID] = cc
+	return cc
+}
+
+// getOrCreatePathRTTStats returns the RTT stats for a path.
+// If pathID is invalid, returns the default stats (single-path mode).
+func (h *sentPacketHandler) getOrCreatePathRTTStats(pathID protocol.PathID) *utils.RTTStats {
+	if pathID == protocol.InvalidPathID {
+		return h.rttStats
+	}
+
+	if stats, ok := h.pathRTTStats[pathID]; ok {
+		return stats
+	}
+
+	// Create new RTT stats for this path, inheriting MaxAckDelay from global stats
+	stats := utils.NewRTTStats()
+	stats.SetMaxAckDelay(h.rttStats.MaxAckDelay())
+	h.pathRTTStats[pathID] = stats
+	return stats
+}
+
+func (h *sentPacketHandler) GetPathRTTStats(pathID protocol.PathID) *utils.RTTStats {
+	return h.getOrCreatePathRTTStats(pathID)
+}
+
+func (h *sentPacketHandler) getAppDataPacketNumberSpace(pathID protocol.PathID) *packetNumberSpace {
+	if pnSpace, ok := h.appDataPackets[pathID]; ok {
+		return pnSpace
+	}
+	pnSpace := newPacketNumberSpace(0, true)
+	h.appDataPackets[pathID] = pnSpace
+	return pnSpace
+}
+
+func (h *sentPacketHandler) getLostPacketTracker(pathID protocol.PathID) *lostPacketTracker {
+	if tracker, ok := h.lostPackets[pathID]; ok {
+		return tracker
+	}
+	tracker := newLostPacketTracker(64)
+	h.lostPackets[pathID] = tracker
+	return tracker
+}
+
+func (h *sentPacketHandler) forEachAppDataSpace(fn func(pathID protocol.PathID, pnSpace *packetNumberSpace)) {
+	for pathID, pnSpace := range h.appDataPackets {
+		fn(pathID, pnSpace)
+	}
+}
+
+func (h *sentPacketHandler) hasOutstandingAppDataPackets() bool {
+	for _, pnSpace := range h.appDataPackets {
+		if pnSpace.history.HasOutstandingPackets() {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *sentPacketHandler) hasOutstandingAppDataPathProbes() bool {
+	for _, pnSpace := range h.appDataPackets {
+		if pnSpace.history.HasOutstandingPathProbes() {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *sentPacketHandler) SetPacketPathID(encLevel protocol.EncryptionLevel, pn protocol.PacketNumber, pathID protocol.PathID) {
+	pnSpace := h.getPacketNumberSpace(encLevel, pathID)
+	if pnSpace == nil {
+		return
+	}
+	p, ok := pnSpace.history.SetPathID(pn, pathID)
+	if !ok || p == nil {
+		return
+	}
+	if h.packetObserver != nil && !p.sentNotified {
+		p.sentNotified = true
+		h.packetObserver.OnPacketSent(newPacketEvent(pn, p, p.SendTime))
+	}
 }
 
 func (h *sentPacketHandler) removeFromBytesInFlight(p *packet) {
@@ -178,7 +326,7 @@ func (h *sentPacketHandler) DropPackets(encLevel protocol.EncryptionLevel, now m
 	}
 	// remove outstanding packets from bytes_in_flight
 	if encLevel == protocol.EncryptionInitial || encLevel == protocol.EncryptionHandshake {
-		pnSpace := h.getPacketNumberSpace(encLevel)
+		pnSpace := h.getPacketNumberSpace(encLevel, protocol.InvalidPathID)
 		// We might already have dropped this packet number space.
 		if pnSpace == nil {
 			return
@@ -202,13 +350,15 @@ func (h *sentPacketHandler) DropPackets(encLevel protocol.EncryptionLevel, now m
 		// and not when the client drops 0-RTT keys when the handshake completes.
 		// When 0-RTT is rejected, all application data sent so far becomes invalid.
 		// Delete the packets from the history and remove them from bytes_in_flight.
-		for pn, p := range h.appDataPackets.history.Packets() {
-			if p.EncryptionLevel != protocol.Encryption0RTT {
-				break
+		h.forEachAppDataSpace(func(_ protocol.PathID, pnSpace *packetNumberSpace) {
+			for pn, p := range pnSpace.history.Packets() {
+				if p.EncryptionLevel != protocol.Encryption0RTT {
+					break
+				}
+				h.removeFromBytesInFlight(p)
+				pnSpace.history.Remove(pn)
 			}
-			h.removeFromBytesInFlight(p)
-			h.appDataPackets.history.Remove(pn)
-		}
+		})
 	default:
 		panic(fmt.Sprintf("Cannot drop keys for encryption level %s", encLevel))
 	}
@@ -239,7 +389,10 @@ func (h *sentPacketHandler) ReceivedPacket(l protocol.EncryptionLevel, t monotim
 }
 
 func (h *sentPacketHandler) packetsInFlight() int {
-	packetsInFlight := h.appDataPackets.history.Len()
+	packetsInFlight := 0
+	h.forEachAppDataSpace(func(_ protocol.PathID, pnSpace *packetNumberSpace) {
+		packetsInFlight += pnSpace.history.Len()
+	})
 	if h.handshakePackets != nil {
 		packetsInFlight += h.handshakePackets.history.Len()
 	}
@@ -259,12 +412,13 @@ func (h *sentPacketHandler) SentPacket(
 	size protocol.ByteCount,
 	isPathMTUProbePacket bool,
 	isPathProbePacket bool,
+	pathID protocol.PathID,
 ) {
 	h.bytesSent += size
 	h.connStats.BytesSent.Add(uint64(size))
 	h.connStats.PacketsSent.Add(1)
 
-	pnSpace := h.getPacketNumberSpace(encLevel)
+	pnSpace := h.getPacketNumberSpace(encLevel, pathID)
 	if h.logger.Debug() && (pnSpace.history.HasOutstandingPackets() || pnSpace.history.HasOutstandingPathProbes()) {
 		for p := max(0, pnSpace.largestSent+1); p < pn; p++ {
 			h.logger.Debugf("Skipping packet number %d", p)
@@ -282,6 +436,7 @@ func (h *sentPacketHandler) SentPacket(
 	p.StreamFrames = streamFrames
 	p.IsPathMTUProbePacket = isPathMTUProbePacket
 	p.isPathProbePacket = isPathProbePacket
+	p.PathID = pathID
 	isAckEliciting := p.IsAckEliciting()
 
 	if isPathProbePacket {
@@ -297,7 +452,10 @@ func (h *sentPacketHandler) SentPacket(
 			h.numProbesToSend--
 		}
 	}
-	h.congestion.OnPacketSent(t, h.bytesInFlight, pn, size, isAckEliciting)
+
+	// Use per-path congestion controller when available
+	cc := h.getOrCreatePathCongestionControl(pathID)
+	cc.OnPacketSent(t, h.bytesInFlight, pn, size, isAckEliciting)
 
 	if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil {
 		h.ecnTracker.SentPacket(pn, ecn)
@@ -361,21 +519,21 @@ func (h *sentPacketHandler) qlogMetricsUpdated() {
 	}
 }
 
-func (h *sentPacketHandler) getPacketNumberSpace(encLevel protocol.EncryptionLevel) *packetNumberSpace {
+func (h *sentPacketHandler) getPacketNumberSpace(encLevel protocol.EncryptionLevel, pathID protocol.PathID) *packetNumberSpace {
 	switch encLevel {
 	case protocol.EncryptionInitial:
 		return h.initialPackets
 	case protocol.EncryptionHandshake:
 		return h.handshakePackets
 	case protocol.Encryption0RTT, protocol.Encryption1RTT:
-		return h.appDataPackets
+		return h.getAppDataPacketNumberSpace(pathID)
 	default:
 		panic("invalid packet number space")
 	}
 }
 
-func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.EncryptionLevel, rcvTime monotime.Time) (bool /* contained 1-RTT packet */, error) {
-	pnSpace := h.getPacketNumberSpace(encLevel)
+func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.EncryptionLevel, rcvTime monotime.Time, pathID protocol.PathID) (bool /* contained 1-RTT packet */, error) {
+	pnSpace := h.getPacketNumberSpace(encLevel, pathID)
 
 	largestAcked := ack.LargestAcked()
 	if largestAcked > pnSpace.largestSent {
@@ -395,7 +553,7 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 	}
 
 	priorInFlight := h.bytesInFlight
-	ackedPackets, hasAckEliciting, err := h.detectAndRemoveAckedPackets(ack, encLevel)
+	ackedPackets, hasAckEliciting, err := h.detectAndRemoveAckedPackets(ack, encLevel, pathID)
 	if err != nil || len(ackedPackets) == 0 {
 		return false, err
 	}
@@ -410,13 +568,26 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 				ackDelay = min(ack.DelayTime, h.rttStats.MaxAckDelay())
 			}
 			if h.largestAckedTime.IsZero() || !p.SendTime.Before(h.largestAckedTime) {
-				h.rttStats.UpdateRTT(rcvTime.Sub(p.SendTime), ackDelay)
+				rtt := rcvTime.Sub(p.SendTime)
+
+				// Update per-path RTT stats
+				pathRTT := h.getOrCreatePathRTTStats(p.PathID)
+				pathRTT.UpdateRTT(rtt, ackDelay)
+
+				// Update global RTT only if it's a different instance
+				if pathRTT != h.rttStats {
+					h.rttStats.UpdateRTT(rtt, ackDelay)
+				}
+
 				if h.logger.Debug() {
 					h.logger.Debugf("\tupdated RTT: %s (σ: %s)", h.rttStats.SmoothedRTT(), h.rttStats.MeanDeviation())
 				}
 				h.largestAckedTime = p.SendTime
 			}
-			h.congestion.MaybeExitSlowStart()
+
+			// Call MaybeExitSlowStart on per-path CC
+			cc := h.getOrCreatePathCongestionControl(p.PathID)
+			cc.MaybeExitSlowStart()
 		}
 	}
 
@@ -424,20 +595,38 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 	if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil && largestAcked > pnSpace.largestAcked {
 		congested := h.ecnTracker.HandleNewlyAcked(ackedPackets, int64(ack.ECT0), int64(ack.ECT1), int64(ack.ECNCE))
 		if congested {
-			h.congestion.OnCongestionEvent(largestAcked, 0, priorInFlight)
+			// Group packets by path for congestion events
+			pathPackets := make(map[protocol.PathID][]packetWithPacketNumber)
+			for _, p := range ackedPackets {
+				pathPackets[p.PathID] = append(pathPackets[p.PathID], p)
+			}
+
+			// Send congestion event to each path's CC
+			for pathID := range pathPackets {
+				cc := h.getOrCreatePathCongestionControl(pathID)
+				cc.OnCongestionEvent(largestAcked, 0, priorInFlight)
+			}
 		}
 	}
 
 	pnSpace.largestAcked = max(pnSpace.largestAcked, largestAcked)
+	if encLevel == protocol.Encryption0RTT || encLevel == protocol.Encryption1RTT {
+		h.pathPacketNumberManager.SetHighestAcked(pathID, encLevel, pnSpace.largestAcked)
+	}
 
-	h.detectLostPackets(rcvTime, encLevel)
+	h.detectLostPackets(rcvTime, encLevel, pathID)
 	if encLevel == protocol.Encryption1RTT {
 		h.detectLostPathProbes(rcvTime)
 	}
 	var acked1RTTPacket bool
 	for _, p := range ackedPackets {
+		if h.packetObserver != nil {
+			h.packetObserver.OnPacketAcked(newPacketEvent(p.PacketNumber, p.packet, rcvTime))
+		}
 		if p.includedInBytesInFlight && !p.declaredLost {
-			h.congestion.OnPacketAcked(p.PacketNumber, p.Length, priorInFlight, rcvTime)
+			// Route OnPacketAcked to per-path CC
+			cc := h.getOrCreatePathCongestionControl(p.PathID)
+			cc.OnPacketAcked(p.PacketNumber, p.Length, priorInFlight, rcvTime)
 		}
 		if p.EncryptionLevel == protocol.Encryption1RTT {
 			acked1RTTPacket = true
@@ -453,9 +642,10 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 		h.detectSpuriousLosses(
 			ack,
 			rcvTime.Add(-min(ack.DelayTime, h.rttStats.MaxAckDelay())),
+			pathID,
 		)
 		// clean up lost packet history
-		h.lostPackets.DeleteBefore(rcvTime.Add(-3 * h.rttStats.PTO(false)))
+		h.getLostPacketTracker(pathID).DeleteBefore(rcvTime.Add(-3 * h.rttStats.PTO(false)))
 	}
 
 	// After this point, we must not use ackedPackets any longer!
@@ -481,12 +671,14 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 	return acked1RTTPacket, nil
 }
 
-func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime monotime.Time) {
+func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime monotime.Time, pathID protocol.PathID) {
 	var maxPacketReordering protocol.PacketNumber
 	var maxTimeReordering time.Duration
 	ackRangeIdx := len(ack.AckRanges) - 1
 	var spuriousLosses []protocol.PacketNumber
-	for pn, sendTime := range h.lostPackets.All() {
+	lostPackets := h.getLostPacketTracker(pathID)
+	pnSpace := h.getAppDataPacketNumberSpace(pathID)
+	for pn, sendTime := range lostPackets.All() {
 		ackRange := ack.AckRanges[ackRangeIdx]
 		for pn > ackRange.Largest {
 			// this should never happen, since detectSpuriousLosses is only called for ACKs that increase the largest acked
@@ -500,7 +692,7 @@ func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime mon
 			continue
 		}
 		if pn <= ackRange.Largest {
-			packetReordering := h.appDataPackets.history.Difference(ack.LargestAcked(), pn)
+			packetReordering := pnSpace.history.Difference(ack.LargestAcked(), pn)
 			timeReordering := ackTime.Sub(sendTime)
 			maxPacketReordering = max(maxPacketReordering, packetReordering)
 			maxTimeReordering = max(maxTimeReordering, timeReordering)
@@ -517,7 +709,7 @@ func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime mon
 		}
 	}
 	for _, pn := range spuriousLosses {
-		h.lostPackets.Delete(pn)
+		lostPackets.Delete(pn)
 	}
 }
 
@@ -525,12 +717,13 @@ func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime mon
 func (h *sentPacketHandler) detectAndRemoveAckedPackets(
 	ack *wire.AckFrame,
 	encLevel protocol.EncryptionLevel,
+	pathID protocol.PathID,
 ) (_ []packetWithPacketNumber, hasAckEliciting bool, _ error) {
 	if len(h.ackedPackets) > 0 {
 		return nil, false, errors.New("ackhandler BUG: ackedPackets slice not empty")
 	}
 
-	pnSpace := h.getPacketNumberSpace(encLevel)
+	pnSpace := h.getPacketNumberSpace(encLevel, pathID)
 
 	if encLevel == protocol.Encryption1RTT {
 		for p := range pnSpace.history.SkippedPackets() {
@@ -614,23 +807,32 @@ func (h *sentPacketHandler) detectAndRemoveAckedPackets(
 	return h.ackedPackets, hasAckEliciting, nil
 }
 
-func (h *sentPacketHandler) getLossTimeAndSpace() (monotime.Time, protocol.EncryptionLevel) {
+func (h *sentPacketHandler) getLossTimeAndSpace() (monotime.Time, protocol.EncryptionLevel, protocol.PathID) {
 	var encLevel protocol.EncryptionLevel
 	var lossTime monotime.Time
+	var pathID protocol.PathID
 
 	if h.initialPackets != nil {
 		lossTime = h.initialPackets.lossTime
 		encLevel = protocol.EncryptionInitial
+		pathID = protocol.InvalidPathID
 	}
 	if h.handshakePackets != nil && (lossTime.IsZero() || (!h.handshakePackets.lossTime.IsZero() && h.handshakePackets.lossTime.Before(lossTime))) {
 		lossTime = h.handshakePackets.lossTime
 		encLevel = protocol.EncryptionHandshake
+		pathID = protocol.InvalidPathID
 	}
-	if lossTime.IsZero() || (!h.appDataPackets.lossTime.IsZero() && h.appDataPackets.lossTime.Before(lossTime)) {
-		lossTime = h.appDataPackets.lossTime
-		encLevel = protocol.Encryption1RTT
-	}
-	return lossTime, encLevel
+	h.forEachAppDataSpace(func(appPathID protocol.PathID, pnSpace *packetNumberSpace) {
+		if pnSpace.lossTime.IsZero() {
+			return
+		}
+		if lossTime.IsZero() || pnSpace.lossTime.Before(lossTime) {
+			lossTime = pnSpace.lossTime
+			encLevel = protocol.Encryption1RTT
+			pathID = appPathID
+		}
+	})
+	return lossTime, encLevel, pathID
 }
 
 func (h *sentPacketHandler) getScaledPTO(includeMaxAckDelay bool) time.Duration {
@@ -642,7 +844,7 @@ func (h *sentPacketHandler) getScaledPTO(includeMaxAckDelay bool) time.Duration 
 }
 
 // same logic as getLossTimeAndSpace, but for lastAckElicitingPacketTime instead of lossTime
-func (h *sentPacketHandler) getPTOTimeAndSpace(now monotime.Time) (pto monotime.Time, encLevel protocol.EncryptionLevel) {
+func (h *sentPacketHandler) getPTOTimeAndSpace(now monotime.Time) (pto monotime.Time, encLevel protocol.EncryptionLevel, pathID protocol.PathID) {
 	// We only send application data probe packets once the handshake is confirmed,
 	// because before that, we don't have the keys to decrypt ACKs sent in 1-RTT packets.
 	if !h.handshakeConfirmed && !h.hasOutstandingCryptoPackets() {
@@ -651,14 +853,15 @@ func (h *sentPacketHandler) getPTOTimeAndSpace(now monotime.Time) (pto monotime.
 		}
 		t := now.Add(h.getScaledPTO(false))
 		if h.initialPackets != nil {
-			return t, protocol.EncryptionInitial
+			return t, protocol.EncryptionInitial, protocol.InvalidPathID
 		}
-		return t, protocol.EncryptionHandshake
+		return t, protocol.EncryptionHandshake, protocol.InvalidPathID
 	}
 
 	if h.initialPackets != nil && h.initialPackets.history.HasOutstandingPackets() &&
 		!h.initialPackets.lastAckElicitingPacketTime.IsZero() {
 		encLevel = protocol.EncryptionInitial
+		pathID = protocol.InvalidPathID
 		if t := h.initialPackets.lastAckElicitingPacketTime; !t.IsZero() {
 			pto = t.Add(h.getScaledPTO(false))
 		}
@@ -669,17 +872,23 @@ func (h *sentPacketHandler) getPTOTimeAndSpace(now monotime.Time) (pto monotime.
 		if pto.IsZero() || (!t.IsZero() && t.Before(pto)) {
 			pto = t
 			encLevel = protocol.EncryptionHandshake
+			pathID = protocol.InvalidPathID
 		}
 	}
-	if h.handshakeConfirmed && h.appDataPackets.history.HasOutstandingPackets() &&
-		!h.appDataPackets.lastAckElicitingPacketTime.IsZero() {
-		t := h.appDataPackets.lastAckElicitingPacketTime.Add(h.getScaledPTO(true))
-		if pto.IsZero() || (!t.IsZero() && t.Before(pto)) {
-			pto = t
-			encLevel = protocol.Encryption1RTT
-		}
+	if h.handshakeConfirmed {
+		h.forEachAppDataSpace(func(appPathID protocol.PathID, pnSpace *packetNumberSpace) {
+			if !pnSpace.history.HasOutstandingPackets() || pnSpace.lastAckElicitingPacketTime.IsZero() {
+				return
+			}
+			t := pnSpace.lastAckElicitingPacketTime.Add(h.getScaledPTO(true))
+			if pto.IsZero() || (!t.IsZero() && t.Before(pto)) {
+				pto = t
+				encLevel = protocol.Encryption1RTT
+				pathID = appPathID
+			}
+		})
 	}
-	return pto, encLevel
+	return pto, encLevel, pathID
 }
 
 func (h *sentPacketHandler) hasOutstandingCryptoPackets() bool {
@@ -720,7 +929,7 @@ func (h *sentPacketHandler) setLossDetectionTimer(now monotime.Time) {
 func (h *sentPacketHandler) lossDetectionTime(now monotime.Time) alarmTimer {
 	// cancel the alarm if no packets are outstanding
 	if h.peerCompletedAddressValidation && !h.hasOutstandingCryptoPackets() &&
-		!h.appDataPackets.history.HasOutstandingPackets() && !h.appDataPackets.history.HasOutstandingPathProbes() {
+		!h.hasOutstandingAppDataPackets() && !h.hasOutstandingAppDataPathProbes() {
 		return alarmTimer{}
 	}
 
@@ -730,14 +939,17 @@ func (h *sentPacketHandler) lossDetectionTime(now monotime.Time) alarmTimer {
 	}
 
 	var pathProbeLossTime monotime.Time
-	if h.appDataPackets.history.HasOutstandingPathProbes() {
-		if _, p := h.appDataPackets.history.FirstOutstandingPathProbe(); p != nil {
-			pathProbeLossTime = p.SendTime.Add(pathProbePacketLossTimeout)
+	h.forEachAppDataSpace(func(_ protocol.PathID, pnSpace *packetNumberSpace) {
+		if _, p := pnSpace.history.FirstOutstandingPathProbe(); p != nil {
+			lossTime := p.SendTime.Add(pathProbePacketLossTimeout)
+			if pathProbeLossTime.IsZero() || lossTime.Before(pathProbeLossTime) {
+				pathProbeLossTime = lossTime
+			}
 		}
-	}
+	})
 
 	// early retransmit timer or time loss detection
-	lossTime, encLevel := h.getLossTimeAndSpace()
+	lossTime, encLevel, _ := h.getLossTimeAndSpace()
 	if !lossTime.IsZero() && (pathProbeLossTime.IsZero() || lossTime.Before(pathProbeLossTime)) {
 		return alarmTimer{
 			Time:            lossTime,
@@ -745,7 +957,7 @@ func (h *sentPacketHandler) lossDetectionTime(now monotime.Time) alarmTimer {
 			EncryptionLevel: encLevel,
 		}
 	}
-	ptoTime, encLevel := h.getPTOTimeAndSpace(now)
+	ptoTime, encLevel, _ := h.getPTOTimeAndSpace(now)
 	if !ptoTime.IsZero() && (pathProbeLossTime.IsZero() || ptoTime.Before(pathProbeLossTime)) {
 		return alarmTimer{
 			Time:            ptoTime,
@@ -764,27 +976,32 @@ func (h *sentPacketHandler) lossDetectionTime(now monotime.Time) alarmTimer {
 }
 
 func (h *sentPacketHandler) detectLostPathProbes(now monotime.Time) {
-	if !h.appDataPackets.history.HasOutstandingPathProbes() {
-		return
-	}
 	lossTime := now.Add(-pathProbePacketLossTimeout)
-	// RemovePathProbe cannot be called while iterating.
-	var lostPathProbes []packetWithPacketNumber
-	for pn, p := range h.appDataPackets.history.PathProbes() {
-		if !p.SendTime.After(lossTime) {
-			lostPathProbes = append(lostPathProbes, packetWithPacketNumber{PacketNumber: pn, packet: p})
+	h.forEachAppDataSpace(func(_ protocol.PathID, pnSpace *packetNumberSpace) {
+		if !pnSpace.history.HasOutstandingPathProbes() {
+			return
 		}
-	}
-	for _, p := range lostPathProbes {
-		for _, f := range p.Frames {
-			f.Handler.OnLost(f.Frame)
+		// RemovePathProbe cannot be called while iterating.
+		var lostPathProbes []packetWithPacketNumber
+		for pn, p := range pnSpace.history.PathProbes() {
+			if !p.SendTime.After(lossTime) {
+				lostPathProbes = append(lostPathProbes, packetWithPacketNumber{PacketNumber: pn, packet: p})
+			}
 		}
-		h.appDataPackets.history.RemovePathProbe(p.PacketNumber)
-	}
+		for _, p := range lostPathProbes {
+			if h.packetObserver != nil {
+				h.packetObserver.OnPacketLost(newPacketEvent(p.PacketNumber, p.packet, now))
+			}
+			for _, f := range p.Frames {
+				f.Handler.OnLost(f.Frame)
+			}
+			pnSpace.history.RemovePathProbe(p.PacketNumber)
+		}
+	})
 }
 
-func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protocol.EncryptionLevel) {
-	pnSpace := h.getPacketNumberSpace(encLevel)
+func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protocol.EncryptionLevel, pathID protocol.PathID) {
+	pnSpace := h.getPacketNumberSpace(encLevel, pathID)
 	pnSpace.lossTime = 0
 
 	maxRTT := float64(max(h.rttStats.LatestRTT(), h.rttStats.SmoothedRTT()))
@@ -845,15 +1062,21 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 		}
 		if packetLost {
 			if encLevel == protocol.Encryption0RTT || encLevel == protocol.Encryption1RTT {
-				h.lostPackets.Add(pn, p.SendTime)
+				h.getLostPacketTracker(p.PathID).Add(pn, p.SendTime)
 			}
 			pnSpace.history.DeclareLost(pn)
+			if h.packetObserver != nil {
+				h.packetObserver.OnPacketLost(newPacketEvent(pn, p, now))
+			}
+
 			if !p.isPathProbePacket && p.IsAckEliciting() {
 				// the bytes in flight need to be reduced no matter if the frames in this packet will be retransmitted
 				h.removeFromBytesInFlight(p)
 				h.queueFramesForRetransmission(p)
 				if !p.IsPathMTUProbePacket {
-					h.congestion.OnCongestionEvent(pn, p.Length, priorInFlight)
+					// Route congestion event to per-path CC
+					cc := h.getOrCreatePathCongestionControl(p.PathID)
+					cc.OnCongestionEvent(pn, p.Length, priorInFlight)
 				}
 				if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil {
 					h.ecnTracker.LostPacket(pn)
@@ -870,7 +1093,7 @@ func (h *sentPacketHandler) OnLossDetectionTimeout(now monotime.Time) error {
 		h.detectLostPathProbes(now)
 	}
 
-	earliestLossTime, encLevel := h.getLossTimeAndSpace()
+	earliestLossTime, encLevel, lossPathID := h.getLossTimeAndSpace()
 	if !earliestLossTime.IsZero() {
 		if h.logger.Debug() {
 			h.logger.Debugf("Loss detection alarm fired in loss timer mode. Loss time: %s", earliestLossTime)
@@ -883,7 +1106,7 @@ func (h *sentPacketHandler) OnLossDetectionTimeout(now monotime.Time) error {
 			})
 		}
 		// Early retransmit or time loss detection
-		h.detectLostPackets(now, encLevel)
+		h.detectLostPackets(now, encLevel, lossPathID)
 		return nil
 	}
 
@@ -905,11 +1128,11 @@ func (h *sentPacketHandler) OnLossDetectionTimeout(now monotime.Time) error {
 		return nil
 	}
 
-	ptoTime, encLevel := h.getPTOTimeAndSpace(now)
+	ptoTime, encLevel, ptoPathID := h.getPTOTimeAndSpace(now)
 	if ptoTime.IsZero() {
 		return nil
 	}
-	ps := h.getPacketNumberSpace(encLevel)
+	ps := h.getPacketNumberSpace(encLevel, ptoPathID)
 	if !ps.history.HasOutstandingPackets() && !ps.history.HasOutstandingPathProbes() && !h.peerCompletedAddressValidation {
 		return nil
 	}
@@ -933,9 +1156,12 @@ func (h *sentPacketHandler) OnLossDetectionTimeout(now monotime.Time) error {
 	case protocol.EncryptionHandshake:
 		h.ptoMode = SendPTOHandshake
 	case protocol.Encryption1RTT:
-		// skip a packet number in order to elicit an immediate ACK
-		pn := h.PopPacketNumber(protocol.Encryption1RTT)
-		h.getPacketNumberSpace(protocol.Encryption1RTT).history.SkippedPacket(pn)
+		// Skip a packet number in order to elicit an immediate ACK when sending the PTO probe.
+		pn := h.PopPacketNumber(ptoPathID, protocol.Encryption1RTT)
+		ps.history.SkippedPacket(pn)
+		if h.logger.Debug() {
+			h.logger.Debugf("Skipping packet number %d", pn)
+		}
 		h.ptoMode = SendPTOAppData
 	default:
 		return fmt.Errorf("PTO timer in unexpected encryption level: %s", encLevel)
@@ -957,28 +1183,46 @@ func (h *sentPacketHandler) ECNMode(isShortHeaderPacket bool) protocol.ECN {
 	return h.ecnTracker.Mode()
 }
 
-func (h *sentPacketHandler) PeekPacketNumber(encLevel protocol.EncryptionLevel) (protocol.PacketNumber, protocol.PacketNumberLen) {
-	pnSpace := h.getPacketNumberSpace(encLevel)
-	pn := pnSpace.pns.Peek()
-	// See section 17.1 of RFC 9000.
+func (h *sentPacketHandler) PeekPacketNumber(pathID protocol.PathID, encLevel protocol.EncryptionLevel) (protocol.PacketNumber, protocol.PacketNumberLen) {
+	pnSpace := h.getPacketNumberSpace(encLevel, pathID)
+	if encLevel == protocol.EncryptionInitial || encLevel == protocol.EncryptionHandshake {
+		pn := pnSpace.pns.Peek()
+		// See section 17.1 of RFC 9000.
+		return pn, protocol.PacketNumberLengthForHeader(pn, pnSpace.largestAcked)
+	}
+	pn, _ := h.pathPacketNumberManager.PeekPacketNumber(pathID, encLevel)
 	return pn, protocol.PacketNumberLengthForHeader(pn, pnSpace.largestAcked)
 }
 
-func (h *sentPacketHandler) PopPacketNumber(encLevel protocol.EncryptionLevel) protocol.PacketNumber {
-	pnSpace := h.getPacketNumberSpace(encLevel)
-	skipped, pn := pnSpace.pns.Pop()
-	if skipped {
-		skippedPN := pn - 1
-		pnSpace.history.SkippedPacket(skippedPN)
-		if h.logger.Debug() {
-			h.logger.Debugf("Skipping packet number %d", skippedPN)
+func (h *sentPacketHandler) PopPacketNumber(pathID protocol.PathID, encLevel protocol.EncryptionLevel) protocol.PacketNumber {
+	pnSpace := h.getPacketNumberSpace(encLevel, pathID)
+	if encLevel == protocol.EncryptionInitial || encLevel == protocol.EncryptionHandshake {
+		skipped, pn := pnSpace.pns.Pop()
+		if skipped {
+			h.markSkippedPacket(pnSpace, pn-1)
 		}
+		return pn
+	}
+
+	skipped, pn := h.pathPacketNumberManager.PopPacketNumberWithSkip(pathID, encLevel)
+	if skipped {
+		h.markSkippedPacket(pnSpace, pn-1)
 	}
 	return pn
 }
 
+func (h *sentPacketHandler) markSkippedPacket(pnSpace *packetNumberSpace, pn protocol.PacketNumber) {
+	pnSpace.history.SkippedPacket(pn)
+	if h.logger.Debug() {
+		h.logger.Debugf("Skipping packet number %d", pn)
+	}
+}
+
 func (h *sentPacketHandler) SendMode(now monotime.Time) SendMode {
-	numTrackedPackets := h.appDataPackets.history.Len()
+	numTrackedPackets := 0
+	h.forEachAppDataSpace(func(_ protocol.PathID, pnSpace *packetNumberSpace) {
+		numTrackedPackets += pnSpace.history.Len()
+	})
 	if h.initialPackets != nil {
 		numTrackedPackets += h.initialPackets.history.Len()
 	}
@@ -1038,7 +1282,33 @@ func (h *sentPacketHandler) isAmplificationLimited() bool {
 }
 
 func (h *sentPacketHandler) QueueProbePacket(encLevel protocol.EncryptionLevel) bool {
-	pnSpace := h.getPacketNumberSpace(encLevel)
+	if encLevel == protocol.Encryption0RTT || encLevel == protocol.Encryption1RTT {
+		var selectedSpace *packetNumberSpace
+		var selectedPacket *packet
+		var selectedPN protocol.PacketNumber
+		h.forEachAppDataSpace(func(_ protocol.PathID, pnSpace *packetNumberSpace) {
+			pn, p := pnSpace.history.FirstOutstanding()
+			if p == nil {
+				return
+			}
+			if selectedPacket == nil || p.SendTime.Before(selectedPacket.SendTime) {
+				selectedSpace = pnSpace
+				selectedPacket = p
+				selectedPN = pn
+			}
+		})
+		if selectedPacket == nil {
+			return false
+		}
+		h.queueFramesForRetransmission(selectedPacket)
+		// TODO: don't declare the packet lost here.
+		// Keep track of acknowledged frames instead.
+		h.removeFromBytesInFlight(selectedPacket)
+		selectedSpace.history.DeclareLost(selectedPN)
+		return true
+	}
+
+	pnSpace := h.getPacketNumberSpace(encLevel, protocol.InvalidPathID)
 	pn, p := pnSpace.history.FirstOutstanding()
 	if p == nil {
 		return false
@@ -1082,11 +1352,13 @@ func (h *sentPacketHandler) ResetForRetry(now monotime.Time) {
 	}
 	// All application data packets sent at this point are 0-RTT packets.
 	// In the case of a Retry, we can assume that the server dropped all of them.
-	for _, p := range h.appDataPackets.history.Packets() {
-		if !p.declaredLost && p.IsAckEliciting() {
-			h.queueFramesForRetransmission(p)
+	h.forEachAppDataSpace(func(_ protocol.PathID, pnSpace *packetNumberSpace) {
+		for _, p := range pnSpace.history.Packets() {
+			if !p.declaredLost && p.IsAckEliciting() {
+				h.queueFramesForRetransmission(p)
+			}
 		}
-	}
+	})
 
 	// Only use the Retry to estimate the RTT if we didn't send any retransmission for the Initial.
 	// Otherwise, we don't know which Initial the Retry was sent in response to.
@@ -1101,7 +1373,12 @@ func (h *sentPacketHandler) ResetForRetry(now monotime.Time) {
 		}
 	}
 	h.initialPackets = newPacketNumberSpace(h.initialPackets.pns.Peek(), false)
-	h.appDataPackets = newPacketNumberSpace(h.appDataPackets.pns.Peek(), true)
+	h.appDataPackets = map[protocol.PathID]*packetNumberSpace{
+		protocol.InvalidPathID: newPacketNumberSpace(0, true),
+	}
+	h.lostPackets = map[protocol.PathID]*lostPacketTracker{
+		protocol.InvalidPathID: newLostPacketTracker(64),
+	}
 	oldAlarm := h.alarm
 	h.alarm = alarmTimer{}
 	if h.qlogger != nil {
@@ -1117,18 +1394,20 @@ func (h *sentPacketHandler) ResetForRetry(now monotime.Time) {
 
 func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSize protocol.ByteCount) {
 	h.rttStats.ResetForPathMigration()
-	for pn, p := range h.appDataPackets.history.Packets() {
-		h.appDataPackets.history.DeclareLost(pn)
-		if !p.isPathProbePacket {
-			h.removeFromBytesInFlight(p)
-			if p.IsAckEliciting() {
-				h.queueFramesForRetransmission(p)
+	h.forEachAppDataSpace(func(_ protocol.PathID, pnSpace *packetNumberSpace) {
+		for pn, p := range pnSpace.history.Packets() {
+			pnSpace.history.DeclareLost(pn)
+			if !p.isPathProbePacket {
+				h.removeFromBytesInFlight(p)
+				if p.IsAckEliciting() {
+					h.queueFramesForRetransmission(p)
+				}
 			}
 		}
-	}
-	for pn := range h.appDataPackets.history.PathProbes() {
-		h.appDataPackets.history.RemovePathProbe(pn)
-	}
+		for pn := range pnSpace.history.PathProbes() {
+			pnSpace.history.RemovePathProbe(pn)
+		}
+	})
 	h.congestion = congestion.NewCubicSender(
 		congestion.DefaultClock{},
 		h.rttStats,

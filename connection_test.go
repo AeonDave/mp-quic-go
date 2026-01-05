@@ -13,20 +13,20 @@ import (
 	"testing"
 	"time"
 
-	"github.com/quic-go/quic-go/internal/ackhandler"
-	"github.com/quic-go/quic-go/internal/flowcontrol"
-	"github.com/quic-go/quic-go/internal/handshake"
-	"github.com/quic-go/quic-go/internal/mocks"
-	mockackhandler "github.com/quic-go/quic-go/internal/mocks/ackhandler"
-	"github.com/quic-go/quic-go/internal/monotime"
-	"github.com/quic-go/quic-go/internal/protocol"
-	"github.com/quic-go/quic-go/internal/qerr"
-	"github.com/quic-go/quic-go/internal/synctest"
-	"github.com/quic-go/quic-go/internal/utils"
-	"github.com/quic-go/quic-go/internal/wire"
-	"github.com/quic-go/quic-go/qlog"
-	"github.com/quic-go/quic-go/qlogwriter"
-	"github.com/quic-go/quic-go/testutils/events"
+	"github.com/AeonDave/mp-quic-go/internal/ackhandler"
+	"github.com/AeonDave/mp-quic-go/internal/flowcontrol"
+	"github.com/AeonDave/mp-quic-go/internal/handshake"
+	"github.com/AeonDave/mp-quic-go/internal/mocks"
+	mockackhandler "github.com/AeonDave/mp-quic-go/internal/mocks/ackhandler"
+	"github.com/AeonDave/mp-quic-go/internal/monotime"
+	"github.com/AeonDave/mp-quic-go/internal/protocol"
+	"github.com/AeonDave/mp-quic-go/internal/qerr"
+	"github.com/AeonDave/mp-quic-go/internal/synctest"
+	"github.com/AeonDave/mp-quic-go/internal/utils"
+	"github.com/AeonDave/mp-quic-go/internal/wire"
+	"github.com/AeonDave/mp-quic-go/qlog"
+	"github.com/AeonDave/mp-quic-go/qlogwriter"
+	"github.com/AeonDave/mp-quic-go/testutils/events"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -231,7 +231,7 @@ func TestConnectionHandleStreamRelatedFrames(t *testing.T) {
 			tc := newServerTestConnection(t, gomock.NewController(t), nil, false)
 			data, err := test.frame.Append(nil, protocol.Version1)
 			require.NoError(t, err)
-			_, _, _, err = tc.conn.handleFrames(data, connID, protocol.Encryption1RTT, nil, monotime.Now())
+			_, _, _, err = tc.conn.handleFrames(data, connID, protocol.Encryption1RTT, nil, monotime.Now(), protocol.InvalidPathID)
 			require.ErrorIs(t, err, &qerr.TransportError{ErrorCode: qerr.StreamStateError})
 		})
 	}
@@ -965,7 +965,7 @@ func TestConnectionIdleTimeoutDuringHandshake(t *testing.T) {
 			false,
 			connectionOptTracer(&eventRecorder),
 		)
-		tc.packer.EXPECT().PackCoalescedPacket(false, gomock.Any(), gomock.Any(), protocol.Version1).AnyTimes()
+		tc.packer.EXPECT().PackCoalescedPacket(false, gomock.Any(), gomock.Any(), protocol.Version1, gomock.Any()).AnyTimes()
 		tc.connRunner.EXPECT().Remove(gomock.Any()).AnyTimes()
 		start := monotime.Now()
 		errChan := make(chan error, 1)
@@ -1004,7 +1004,7 @@ func TestConnectionHandshakeIdleTimeout(t *testing.T) {
 			connectionOptTracer(&eventRecorder),
 			func(c *Conn) { c.creationTime = monotime.Now().Add(-20 * time.Second) },
 		)
-		tc.packer.EXPECT().PackCoalescedPacket(false, gomock.Any(), gomock.Any(), protocol.Version1).AnyTimes()
+		tc.packer.EXPECT().PackCoalescedPacket(false, gomock.Any(), gomock.Any(), protocol.Version1, gomock.Any()).AnyTimes()
 		tc.connRunner.EXPECT().Remove(gomock.Any()).AnyTimes()
 		errChan := make(chan error, 1)
 		go func() { errChan <- tc.conn.run() }()
@@ -1265,7 +1265,7 @@ func TestConnectionHandshakeServer(t *testing.T) {
 		cs.EXPECT().SetHandshakeConfirmed(),
 		cs.EXPECT().GetSessionTicket().Return([]byte("session ticket"), nil),
 	)
-	tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(shortHeaderPacket{}, errNothingToPack).AnyTimes()
+	tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(shortHeaderPacket{}, errNothingToPack).AnyTimes()
 
 	errChan := make(chan error, 1)
 	go func() { errChan <- tc.conn.run() }()
@@ -1353,8 +1353,8 @@ func testConnectionHandshakeClient(t *testing.T, usePreferredAddress bool) {
 	gomock.InOrder(
 		cs.EXPECT().StartHandshake(gomock.Any()),
 		cs.EXPECT().NextEvent().Return(handshake.Event{Kind: handshake.EventNoEvent}),
-		tc.packer.EXPECT().PackCoalescedPacket(false, gomock.Any(), gomock.Any(), protocol.Version1).DoAndReturn(
-			func(b bool, bc protocol.ByteCount, t monotime.Time, v protocol.Version) (*coalescedPacket, error) {
+		tc.packer.EXPECT().PackCoalescedPacket(false, gomock.Any(), gomock.Any(), protocol.Version1, gomock.Any()).DoAndReturn(
+			func(b bool, bc protocol.ByteCount, t monotime.Time, v protocol.Version, _ protocol.PathID) (*coalescedPacket, error) {
 				close(packedFirstPacket)
 				return &coalescedPacket{buffer: getPacketBuffer(), longHdrPackets: []*longHeaderPacket{{header: hdr}}}, nil
 			},
@@ -1370,7 +1370,7 @@ func testConnectionHandshakeClient(t *testing.T, usePreferredAddress bool) {
 		cs.EXPECT().NextEvent().Return(handshake.Event{Kind: handshake.EventHandshakeComplete}),
 		cs.EXPECT().NextEvent().Return(handshake.Event{Kind: handshake.EventNoEvent}),
 	)
-	tc.packer.EXPECT().PackCoalescedPacket(false, gomock.Any(), gomock.Any(), protocol.Version1).Return(nil, nil).AnyTimes()
+	tc.packer.EXPECT().PackCoalescedPacket(false, gomock.Any(), gomock.Any(), protocol.Version1, gomock.Any()).Return(nil, nil).AnyTimes()
 
 	errChan := make(chan error, 1)
 	go func() { errChan <- tc.conn.run() }()
@@ -1398,21 +1398,21 @@ func testConnectionHandshakeClient(t *testing.T, usePreferredAddress bool) {
 	data, err = (&wire.HandshakeDoneFrame{}).Append(nil, protocol.Version1)
 	require.NoError(t, err)
 	done := make(chan struct{})
-	tc.packer.EXPECT().PackCoalescedPacket(false, gomock.Any(), gomock.Any(), protocol.Version1).Return(nil, nil).AnyTimes()
+	tc.packer.EXPECT().PackCoalescedPacket(false, gomock.Any(), gomock.Any(), protocol.Version1, gomock.Any()).Return(nil, nil).AnyTimes()
 	gomock.InOrder(
 		unpacker.EXPECT().UnpackLongHeader(gomock.Any(), gomock.Any()).Return(
 			&unpackedPacket{hdr: hdr, encryptionLevel: protocol.Encryption1RTT, data: data}, nil,
 		),
 		cs.EXPECT().DiscardInitialKeys(),
 		cs.EXPECT().SetHandshakeConfirmed(),
-		tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-			func(buf *packetBuffer, _ protocol.ByteCount, _ monotime.Time, _ protocol.Version) (shortHeaderPacket, error) {
+		tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+			func(buf *packetBuffer, _ protocol.ByteCount, _ monotime.Time, _ protocol.Version, _ protocol.PathID) (shortHeaderPacket, error) {
 				close(done)
 				return shortHeaderPacket{}, errNothingToPack
 			},
 		),
 	)
-	tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(shortHeaderPacket{}, errNothingToPack).AnyTimes()
+	tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(shortHeaderPacket{}, errNothingToPack).AnyTimes()
 	p = getLongHeaderPacket(t, tc.remoteAddr, hdr, nil)
 	tc.conn.handlePacket(receivedPacket{data: p.data, buffer: p.buffer, rcvTime: monotime.Now()})
 
@@ -1478,8 +1478,8 @@ func TestConnection0RTTTransportParameters(t *testing.T) {
 		cs.EXPECT().StartHandshake(gomock.Any()),
 		cs.EXPECT().NextEvent().Return(handshake.Event{Kind: handshake.EventRestoredTransportParameters, TransportParameters: restored}),
 		cs.EXPECT().NextEvent().Return(handshake.Event{Kind: handshake.EventNoEvent}),
-		tc.packer.EXPECT().PackCoalescedPacket(false, gomock.Any(), gomock.Any(), protocol.Version1).DoAndReturn(
-			func(b bool, bc protocol.ByteCount, t monotime.Time, v protocol.Version) (*coalescedPacket, error) {
+		tc.packer.EXPECT().PackCoalescedPacket(false, gomock.Any(), gomock.Any(), protocol.Version1, gomock.Any()).DoAndReturn(
+			func(b bool, bc protocol.ByteCount, t monotime.Time, v protocol.Version, _ protocol.PathID) (*coalescedPacket, error) {
 				close(packedFirstPacket)
 				return &coalescedPacket{buffer: getPacketBuffer(), longHdrPackets: []*longHeaderPacket{{header: hdr}}}, nil
 			},
@@ -1496,7 +1496,7 @@ func TestConnection0RTTTransportParameters(t *testing.T) {
 		// cs.EXPECT().NextEvent().Return(handshake.Event{Kind: handshake.EventNoEvent}),
 		cs.EXPECT().Close(),
 	)
-	tc.packer.EXPECT().PackCoalescedPacket(false, gomock.Any(), gomock.Any(), protocol.Version1).Return(nil, nil).AnyTimes()
+	tc.packer.EXPECT().PackCoalescedPacket(false, gomock.Any(), gomock.Any(), protocol.Version1, gomock.Any()).Return(nil, nil).AnyTimes()
 	tc.packer.EXPECT().PackConnectionClose(gomock.Any(), gomock.Any(), protocol.Version1).Return(&coalescedPacket{buffer: getPacketBuffer()}, nil)
 	tc.connRunner.EXPECT().ReplaceWithClosed(gomock.Any(), gomock.Any(), gomock.Any())
 
@@ -1555,8 +1555,8 @@ func testConnectionReceivePrioritization(t *testing.T, handshakeComplete bool, n
 	).Times(numPackets)
 	switch handshakeComplete {
 	case false:
-		tc.packer.EXPECT().PackCoalescedPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-			func(b bool, bc protocol.ByteCount, t monotime.Time, v protocol.Version) (*coalescedPacket, error) {
+		tc.packer.EXPECT().PackCoalescedPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+			func(b bool, bc protocol.ByteCount, t monotime.Time, v protocol.Version, _ protocol.PathID) (*coalescedPacket, error) {
 				events = append(events, "pack")
 				if testDone {
 					close(done)
@@ -1565,8 +1565,8 @@ func testConnectionReceivePrioritization(t *testing.T, handshakeComplete bool, n
 			},
 		).AnyTimes()
 	case true:
-		tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-			func(b *packetBuffer, bc protocol.ByteCount, t monotime.Time, v protocol.Version) (shortHeaderPacket, error) {
+		tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+			func(b *packetBuffer, bc protocol.ByteCount, t monotime.Time, v protocol.Version, _ protocol.PathID) (shortHeaderPacket, error) {
 				events = append(events, "pack")
 				if testDone {
 					close(done)
@@ -1682,7 +1682,7 @@ func TestConnectionPacketBuffering(t *testing.T) {
 		hdr3 := hdr1
 		hdr3.PacketNumber = 3
 		hdrs["packet3"] = &hdr3
-		tc.packer.EXPECT().PackCoalescedPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+		tc.packer.EXPECT().PackCoalescedPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
 		cs.EXPECT().NextEvent().Return(handshake.Event{Kind: handshake.EventReceivedReadKeys})
 		cs.EXPECT().NextEvent().Return(handshake.Event{Kind: handshake.EventNoEvent})
 
@@ -1805,15 +1805,15 @@ func TestConnectionPacketPacing(t *testing.T) {
 		gomock.InOrder(
 			// 1. allow 2 packets to be sent
 			sph.EXPECT().SendMode(gomock.Any()).Return(ackhandler.SendAny),
-			sph.EXPECT().SentPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()),
+			sph.EXPECT().SentPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()),
 			sph.EXPECT().SendMode(gomock.Any()).Return(ackhandler.SendAny),
-			sph.EXPECT().SentPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()),
+			sph.EXPECT().SentPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()),
 			sph.EXPECT().SendMode(gomock.Any()).Return(ackhandler.SendPacingLimited),
 			// 2. become pacing limited for 25ms
 			sph.EXPECT().TimeUntilSend().DoAndReturn(func() monotime.Time { return monotime.Now().Add(step) }),
 			// 3. send another packet
 			sph.EXPECT().SendMode(gomock.Any()).Return(ackhandler.SendAny),
-			sph.EXPECT().SentPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()),
+			sph.EXPECT().SentPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()),
 			sph.EXPECT().SendMode(gomock.Any()).Return(ackhandler.SendPacingLimited),
 			// 4. become pacing limited for 25ms...
 			sph.EXPECT().TimeUntilSend().DoAndReturn(func() monotime.Time { return monotime.Now().Add(step) }),
@@ -1822,19 +1822,19 @@ func TestConnectionPacketPacing(t *testing.T) {
 			sph.EXPECT().SendMode(gomock.Any()).Return(ackhandler.SendPacingLimited),
 			// 5. stop the test by becoming pacing limited forever
 			sph.EXPECT().TimeUntilSend().Return(monotime.Now().Add(time.Hour)),
-			sph.EXPECT().SentPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()),
+			sph.EXPECT().SentPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()),
 		)
 		sph.EXPECT().ECNMode(gomock.Any()).AnyTimes()
 		for i := range 3 {
-			tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), Version1).DoAndReturn(
-				func(buf *packetBuffer, _ protocol.ByteCount, _ monotime.Time, _ protocol.Version) (shortHeaderPacket, error) {
+			tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), Version1, gomock.Any()).DoAndReturn(
+				func(buf *packetBuffer, _ protocol.ByteCount, _ monotime.Time, _ protocol.Version, _ protocol.PathID) (shortHeaderPacket, error) {
 					buf.Data = append(buf.Data, []byte("packet"+strconv.Itoa(i+1))...)
 					return shortHeaderPacket{PacketNumber: protocol.PacketNumber(i + 1)}, nil
 				},
 			)
 		}
-		tc.packer.EXPECT().PackAckOnlyPacket(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-			func(_ protocol.ByteCount, _ monotime.Time, _ protocol.Version) (shortHeaderPacket, *packetBuffer, error) {
+		tc.packer.EXPECT().PackAckOnlyPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+			func(_ protocol.ByteCount, _ monotime.Time, _ protocol.Version, _ protocol.PathID) (shortHeaderPacket, *packetBuffer, error) {
 				buf := getPacketBuffer()
 				buf.Data = []byte("ack")
 				return shortHeaderPacket{PacketNumber: 1}, buf, nil
@@ -1901,7 +1901,7 @@ func TestConnectionPacketPacing(t *testing.T) {
 }
 
 // When the send queue blocks, we need to reset the pacing timer, otherwise the run loop might busy-loop.
-// See https://github.com/quic-go/quic-go/pull/4943 for more details.
+// See https://github.com/AeonDave/mp-quic-go/pull/4943 for more details.
 func TestConnectionPacingAndSendQueue(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		mockCtrl := gomock.NewController(t)
@@ -1929,7 +1929,7 @@ func TestConnectionPacingAndSendQueue(t *testing.T) {
 		sph.EXPECT().SendMode(gomock.Any()).Return(ackhandler.SendPacingLimited).AnyTimes()
 		sph.EXPECT().TimeUntilSend().Return(pacingDeadline).AnyTimes()
 		sph.EXPECT().ECNMode(gomock.Any()).Return(protocol.ECNNon).AnyTimes()
-		tc.packer.EXPECT().PackAckOnlyPacket(gomock.Any(), gomock.Any(), gomock.Any()).Return(
+		tc.packer.EXPECT().PackAckOnlyPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(
 			shortHeaderPacket{}, nil, errNothingToPack,
 		)
 
@@ -1977,17 +1977,17 @@ func TestConnectionIdleTimeout(t *testing.T) {
 
 		sph.EXPECT().GetLossDetectionTimeout().AnyTimes()
 		sph.EXPECT().SendMode(gomock.Any()).Return(ackhandler.SendAny).AnyTimes()
-		sph.EXPECT().SentPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any())
+		sph.EXPECT().SentPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any())
 		sph.EXPECT().ECNMode(gomock.Any()).AnyTimes()
 		var lastSendTime monotime.Time
-		tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-			func(buf *packetBuffer, _ protocol.ByteCount, _ monotime.Time, _ protocol.Version) (shortHeaderPacket, error) {
+		tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+			func(buf *packetBuffer, _ protocol.ByteCount, _ monotime.Time, _ protocol.Version, _ protocol.PathID) (shortHeaderPacket, error) {
 				buf.Data = append(buf.Data, []byte("foobar")...)
 				lastSendTime = monotime.Now()
 				return shortHeaderPacket{Frames: []ackhandler.Frame{{Frame: &wire.PingFrame{}}}, Length: 6}, nil
 			},
 		)
-		tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(shortHeaderPacket{}, errNothingToPack)
+		tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(shortHeaderPacket{}, errNothingToPack)
 		tc.sendConn.EXPECT().Write(gomock.Any(), gomock.Any(), gomock.Any())
 		tc.connRunner.EXPECT().Remove(gomock.Any()).AnyTimes()
 
@@ -2059,13 +2059,13 @@ func testConnectionKeepAlive(t *testing.T, enable, expectKeepAlive bool) {
 				return protocol.PacketNumber(1), protocol.PacketNumberLen1, protocol.KeyPhaseZero, []byte{0} /* PADDING */, nil
 			},
 		)
-		tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(shortHeaderPacket{}, errNothingToPack)
+		tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(shortHeaderPacket{}, errNothingToPack)
 
 		switch expectKeepAlive {
 		case true:
 			// record the time of the keep-alive is sent
-			tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-				func(buffer *packetBuffer, count protocol.ByteCount, t monotime.Time, version protocol.Version) (shortHeaderPacket, error) {
+			tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+				func(buffer *packetBuffer, count protocol.ByteCount, t monotime.Time, version protocol.Version, _ protocol.PathID) (shortHeaderPacket, error) {
 					packTime = monotime.Now()
 					close(done)
 					return shortHeaderPacket{}, errNothingToPack
@@ -2120,39 +2120,39 @@ func TestConnectionACKTimer(t *testing.T) {
 
 		sph.EXPECT().GetLossDetectionTimeout().AnyTimes()
 		sph.EXPECT().SendMode(gomock.Any()).Return(ackhandler.SendAny).AnyTimes()
-		sph.EXPECT().SentPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+		sph.EXPECT().SentPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
 		sph.EXPECT().ECNMode(gomock.Any()).AnyTimes()
 		tc.sendConn.EXPECT().Write(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
 
 		// Set initial alarm timeout far in the future
-		_ = tc.receivedPacketHandler().ReceivedPacket(1, protocol.ECNNon, protocol.Encryption1RTT, monotime.Now().Add(time.Hour), true)
+		_ = tc.receivedPacketHandler().ReceivedPacket(1, protocol.ECNNon, protocol.Encryption1RTT, monotime.Now().Add(time.Hour), true, protocol.InvalidPathID)
 
 		var times []monotime.Time
 		done := make(chan struct{}, 5)
 		var calls []any
 
 		for range 2 {
-			calls = append(calls, tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-				func(buf *packetBuffer, _ protocol.ByteCount, _ monotime.Time, _ protocol.Version) (shortHeaderPacket, error) {
+			calls = append(calls, tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+				func(buf *packetBuffer, _ protocol.ByteCount, _ monotime.Time, _ protocol.Version, _ protocol.PathID) (shortHeaderPacket, error) {
 					buf.Data = append(buf.Data, []byte("foobar")...)
 					times = append(times, monotime.Now())
 					rph := tc.receivedPacketHandler()
 					if len(times) == 1 {
 						// After first packet is sent, set alarm timeout for the next iteration
 						// Get the ACK frame to reset state, then receive a new packet to set alarm
-						_ = rph.GetAckFrame(protocol.Encryption1RTT, monotime.Now(), false)
+						_ = rph.GetAckFrame(protocol.Encryption1RTT, monotime.Now(), false, protocol.InvalidPathID)
 						alarmRcvTime := monotime.Now().Add(alarmTimeout - protocol.MaxAckDelay)
-						_ = rph.ReceivedPacket(2, protocol.ECNNon, protocol.Encryption1RTT, alarmRcvTime, true)
+						_ = rph.ReceivedPacket(2, protocol.ECNNon, protocol.Encryption1RTT, alarmRcvTime, true, protocol.InvalidPathID)
 					} else {
 						// After second packet is sent, set alarm timeout far in the future
-						_ = rph.GetAckFrame(protocol.Encryption1RTT, monotime.Now(), false)
-						_ = rph.ReceivedPacket(3, protocol.ECNNon, protocol.Encryption1RTT, monotime.Now().Add(time.Hour), true)
+						_ = rph.GetAckFrame(protocol.Encryption1RTT, monotime.Now(), false, protocol.InvalidPathID)
+						_ = rph.ReceivedPacket(3, protocol.ECNNon, protocol.Encryption1RTT, monotime.Now().Add(time.Hour), true, protocol.InvalidPathID)
 					}
 					return shortHeaderPacket{Frames: []ackhandler.Frame{{Frame: &wire.PingFrame{}}}, Length: 6}, nil
 				},
 			))
-			calls = append(calls, tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-				func(*packetBuffer, protocol.ByteCount, monotime.Time, protocol.Version) (shortHeaderPacket, error) {
+			calls = append(calls, tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+				func(_ *packetBuffer, _ protocol.ByteCount, _ monotime.Time, _ protocol.Version, _ protocol.PathID) (shortHeaderPacket, error) {
 					done <- struct{}{}
 					return shortHeaderPacket{}, errNothingToPack
 				},
@@ -2206,7 +2206,7 @@ func TestConnectionGSOBatch(t *testing.T) {
 		// allow packets to be sent
 		sph.EXPECT().SendMode(gomock.Any()).Return(ackhandler.SendAny).AnyTimes()
 		sph.EXPECT().TimeUntilSend().AnyTimes()
-		sph.EXPECT().SentPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+		sph.EXPECT().SentPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
 		sph.EXPECT().GetLossDetectionTimeout().AnyTimes()
 		sph.EXPECT().ECNMode(gomock.Any()).Return(protocol.ECT1).AnyTimes()
 
@@ -2216,15 +2216,15 @@ func TestConnectionGSOBatch(t *testing.T) {
 			data := bytes.Repeat([]byte{byte(i)}, int(maxPacketSize))
 			expectedData = append(expectedData, data...)
 
-			tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-				func(buffer *packetBuffer, count protocol.ByteCount, t monotime.Time, version protocol.Version) (shortHeaderPacket, error) {
+			tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+				func(buffer *packetBuffer, count protocol.ByteCount, t monotime.Time, version protocol.Version, _ protocol.PathID) (shortHeaderPacket, error) {
 					buffer.Data = append(buffer.Data, data...)
 					return shortHeaderPacket{PacketNumber: protocol.PacketNumber(i)}, nil
 				},
 			)
 		}
 		done := make(chan struct{})
-		tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(shortHeaderPacket{}, errNothingToPack)
+		tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(shortHeaderPacket{}, errNothingToPack)
 		tc.sendConn.EXPECT().Write(expectedData, uint16(maxPacketSize), protocol.ECT1).DoAndReturn(
 			func([]byte, uint16, protocol.ECN) error { close(done); return nil },
 		)
@@ -2272,7 +2272,7 @@ func TestConnectionGSOBatchPacketSize(t *testing.T) {
 		// allow packets to be sent
 		sph.EXPECT().SendMode(gomock.Any()).Return(ackhandler.SendAny).AnyTimes()
 		sph.EXPECT().TimeUntilSend().AnyTimes()
-		sph.EXPECT().SentPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+		sph.EXPECT().SentPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
 		sph.EXPECT().GetLossDetectionTimeout().AnyTimes()
 		sph.EXPECT().ECNMode(gomock.Any()).Return(protocol.ECT1).AnyTimes()
 
@@ -2288,8 +2288,8 @@ func TestConnectionGSOBatchPacketSize(t *testing.T) {
 			}
 			expectedData = append(expectedData, data...)
 
-			calls = append(calls, tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-				func(buffer *packetBuffer, count protocol.ByteCount, t monotime.Time, version protocol.Version) (shortHeaderPacket, error) {
+			calls = append(calls, tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+				func(buffer *packetBuffer, count protocol.ByteCount, t monotime.Time, version protocol.Version, _ protocol.PathID) (shortHeaderPacket, error) {
 					buffer.Data = append(buffer.Data, data...)
 					return shortHeaderPacket{PacketNumber: protocol.PacketNumber(10 + i)}, nil
 				},
@@ -2298,15 +2298,15 @@ func TestConnectionGSOBatchPacketSize(t *testing.T) {
 		// The smaller (fourth) packet concluded this GSO batch, but the send loop will immediately start composing the next batch.
 		// We therefore send a "foobar", so we can check that we're actually generating two GSO batches.
 		calls = append(calls,
-			tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-				func(buffer *packetBuffer, count protocol.ByteCount, t monotime.Time, version protocol.Version) (shortHeaderPacket, error) {
+			tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+				func(buffer *packetBuffer, count protocol.ByteCount, t monotime.Time, version protocol.Version, _ protocol.PathID) (shortHeaderPacket, error) {
 					buffer.Data = append(buffer.Data, []byte("foobar")...)
 					return shortHeaderPacket{PacketNumber: protocol.PacketNumber(14)}, nil
 				},
 			),
 		)
 		calls = append(calls,
-			tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(shortHeaderPacket{}, errNothingToPack),
+			tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(shortHeaderPacket{}, errNothingToPack),
 		)
 		gomock.InOrder(calls...)
 
@@ -2360,7 +2360,7 @@ func TestConnectionGSOBatchECN(t *testing.T) {
 		ecnMode := protocol.ECT1
 		sph.EXPECT().SendMode(gomock.Any()).Return(ackhandler.SendAny).AnyTimes()
 		sph.EXPECT().TimeUntilSend().AnyTimes()
-		sph.EXPECT().SentPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+		sph.EXPECT().SentPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
 		sph.EXPECT().GetLossDetectionTimeout().AnyTimes()
 		sph.EXPECT().ECNMode(gomock.Any()).DoAndReturn(func(bool) protocol.ECN { return ecnMode }).AnyTimes()
 
@@ -2372,8 +2372,8 @@ func TestConnectionGSOBatchECN(t *testing.T) {
 			data := bytes.Repeat([]byte{byte(i)}, int(maxPacketSize))
 			expectedData = append(expectedData, data...)
 
-			calls = append(calls, tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-				func(buffer *packetBuffer, count protocol.ByteCount, t monotime.Time, version protocol.Version) (shortHeaderPacket, error) {
+			calls = append(calls, tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+				func(buffer *packetBuffer, count protocol.ByteCount, t monotime.Time, version protocol.Version, _ protocol.PathID) (shortHeaderPacket, error) {
 					buffer.Data = append(buffer.Data, data...)
 					if i == 2 {
 						ecnMode = protocol.ECNCE
@@ -2385,15 +2385,15 @@ func TestConnectionGSOBatchECN(t *testing.T) {
 		// The smaller (fourth) packet concluded this GSO batch, but the send loop will immediately start composing the next batch.
 		// We therefore send a "foobar", so we can check that we're actually generating two GSO batches.
 		calls = append(calls,
-			tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-				func(buffer *packetBuffer, count protocol.ByteCount, t monotime.Time, version protocol.Version) (shortHeaderPacket, error) {
+			tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+				func(buffer *packetBuffer, count protocol.ByteCount, t monotime.Time, version protocol.Version, _ protocol.PathID) (shortHeaderPacket, error) {
 					buffer.Data = append(buffer.Data, []byte("foobar")...)
 					return shortHeaderPacket{PacketNumber: protocol.PacketNumber(24)}, nil
 				},
 			),
 		)
 		calls = append(calls,
-			tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(shortHeaderPacket{}, errNothingToPack),
+			tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(shortHeaderPacket{}, errNothingToPack),
 		)
 		gomock.InOrder(calls...)
 
@@ -2469,10 +2469,10 @@ func testConnectionPTOProbePackets(t *testing.T, encLevel protocol.EncryptionLev
 		sph.EXPECT().SendMode(gomock.Any()).Return(ackhandler.SendNone)
 		sph.EXPECT().ECNMode(gomock.Any())
 		sph.EXPECT().QueueProbePacket(encLevel).Return(false)
-		sph.EXPECT().SentPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any())
+		sph.EXPECT().SentPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any())
 
-		tc.packer.EXPECT().PackPTOProbePacket(encLevel, gomock.Any(), true, gomock.Any(), protocol.Version1).DoAndReturn(
-			func(protocol.EncryptionLevel, protocol.ByteCount, bool, monotime.Time, protocol.Version) (*coalescedPacket, error) {
+		tc.packer.EXPECT().PackPTOProbePacket(encLevel, gomock.Any(), true, gomock.Any(), protocol.Version1, gomock.Any()).DoAndReturn(
+			func(protocol.EncryptionLevel, protocol.ByteCount, bool, monotime.Time, protocol.Version, protocol.PathID) (*coalescedPacket, error) {
 				return &coalescedPacket{
 					buffer:         getPacketBuffer(),
 					shortHdrPacket: &shortHeaderPacket{PacketNumber: 1},
@@ -2526,11 +2526,11 @@ func TestConnectionCongestionControl(t *testing.T) {
 		sph.EXPECT().ECNMode(true).AnyTimes()
 		sph.EXPECT().SendMode(gomock.Any()).Return(ackhandler.SendAny).Times(2)
 		sph.EXPECT().SendMode(gomock.Any()).Return(ackhandler.SendAck).MaxTimes(1)
-		sph.EXPECT().SentPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(2)
+		sph.EXPECT().SentPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(2)
 		// Since we're already sending out packets, we don't expect any calls to PackAckOnlyPacket
 		for i := range 2 {
-			tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-				func(buffer *packetBuffer, count protocol.ByteCount, t monotime.Time, version protocol.Version) (shortHeaderPacket, error) {
+			tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+				func(buffer *packetBuffer, count protocol.ByteCount, t monotime.Time, version protocol.Version, _ protocol.PathID) (shortHeaderPacket, error) {
 					buffer.Data = append(buffer.Data, []byte("foobar")...)
 					return shortHeaderPacket{PacketNumber: protocol.PacketNumber(i)}, nil
 				},
@@ -2558,8 +2558,8 @@ func TestConnectionCongestionControl(t *testing.T) {
 		// Now that we're congestion limited, we can only send an ack-only packet
 		done2 := make(chan struct{})
 		sph.EXPECT().SendMode(gomock.Any()).Return(ackhandler.SendAck)
-		tc.packer.EXPECT().PackAckOnlyPacket(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-			func(protocol.ByteCount, monotime.Time, protocol.Version) (shortHeaderPacket, *packetBuffer, error) {
+		tc.packer.EXPECT().PackAckOnlyPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+			func(_ protocol.ByteCount, _ monotime.Time, _ protocol.Version, _ protocol.PathID) (shortHeaderPacket, *packetBuffer, error) {
 				close(done2)
 				return shortHeaderPacket{}, nil, errNothingToPack
 			},
@@ -2630,10 +2630,10 @@ func testConnectionSendQueue(t *testing.T, enableGSO bool) {
 			},
 		)
 		sph.EXPECT().GetLossDetectionTimeout().AnyTimes()
-		sph.EXPECT().SentPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any())
+		sph.EXPECT().SentPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any())
 		sph.EXPECT().SendMode(gomock.Any()).Return(ackhandler.SendAny).AnyTimes()
 		sph.EXPECT().ECNMode(gomock.Any()).AnyTimes()
-		tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(
+		tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(
 			shortHeaderPacket{PacketNumber: protocol.PacketNumber(1)}, nil,
 		)
 		sender.EXPECT().Send(gomock.Any(), gomock.Any(), gomock.Any())
@@ -2654,8 +2654,8 @@ func testConnectionSendQueue(t *testing.T, enableGSO bool) {
 		// now make room in the send queue
 		sender.EXPECT().WouldBlock().AnyTimes()
 		unblocked := make(chan struct{})
-		tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-			func(*packetBuffer, protocol.ByteCount, monotime.Time, protocol.Version) (shortHeaderPacket, error) {
+		tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+			func(_ *packetBuffer, _ protocol.ByteCount, _ monotime.Time, _ protocol.Version, _ protocol.PathID) (shortHeaderPacket, error) {
 				close(unblocked)
 				return shortHeaderPacket{}, errNothingToPack
 			},
@@ -2705,7 +2705,7 @@ func TestConnectionVersionNegotiation(t *testing.T) {
 		var eventRecorder events.Recorder
 		tc := newClientTestConnection(t, mockCtrl, nil, false, connectionOptTracer(&eventRecorder))
 
-		tc.packer.EXPECT().PackCoalescedPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+		tc.packer.EXPECT().PackCoalescedPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
 		tc.connRunner.EXPECT().Remove(gomock.Any())
 
 		errChan := make(chan error, 1)
@@ -2761,7 +2761,7 @@ func TestConnectionVersionNegotiationNoMatch(t *testing.T) {
 			connectionOptTracer(&eventRecorder),
 		)
 
-		tc.packer.EXPECT().PackCoalescedPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+		tc.packer.EXPECT().PackCoalescedPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
 		tc.connRunner.EXPECT().Remove(gomock.Any())
 
 		errChan := make(chan error, 1)
@@ -3033,7 +3033,7 @@ func testConnectionConnectionIDChanges(t *testing.T, sendRetry bool) {
 		newConnID := protocol.ParseConnectionID(b[:11])
 		newConnID2 := protocol.ParseConnectionID(b[11:20])
 
-		tc.packer.EXPECT().PackCoalescedPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+		tc.packer.EXPECT().PackCoalescedPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
 
 		errChan := make(chan error, 1)
 		go func() { errChan <- tc.conn.run() }()
@@ -3242,8 +3242,8 @@ func testConnectionPathValidation(t *testing.T, isNATRebinding bool) {
 			unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any()).Return(
 				protocol.PacketNumber(10), protocol.PacketNumberLen2, protocol.KeyPhaseZero, payload, nil,
 			),
-			tc.packer.EXPECT().PackPathProbePacket(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-				func(_ protocol.ConnectionID, frames []ackhandler.Frame, _ protocol.Version) (shortHeaderPacket, *packetBuffer, error) {
+			tc.packer.EXPECT().PackPathProbePacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+				func(_ protocol.ConnectionID, frames []ackhandler.Frame, _ protocol.Version, _ protocol.PathID) (shortHeaderPacket, *packetBuffer, error) {
 					pathChallenge = frames[0].Frame.(*wire.PathChallengeFrame)
 					return shortHeaderPacket{IsPathProbePacket: true}, getPacketBuffer(), nil
 				},
@@ -3251,7 +3251,7 @@ func testConnectionPathValidation(t *testing.T, isNATRebinding bool) {
 			tc.sendConn.EXPECT().WriteTo(gomock.Any(), newRemoteAddr).DoAndReturn(
 				func([]byte, net.Addr) error { close(probeSent); return nil },
 			),
-			tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(
+			tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(
 				shortHeaderPacket{}, errNothingToPack,
 			),
 		)
@@ -3290,7 +3290,7 @@ func testConnectionPathValidation(t *testing.T, isNATRebinding bool) {
 			)
 		}
 		calls = append(calls,
-			tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(
+			tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(
 				shortHeaderPacket{}, errNothingToPack,
 			).MaxTimes(1),
 		)
@@ -3329,7 +3329,7 @@ func testConnectionPathValidation(t *testing.T, isNATRebinding bool) {
 				tc.sendConn.EXPECT().ChangeRemoteAddr(newRemoteAddr, gomock.Any()).Do(
 					func(net.Addr, packetInfo) { close(migrated) },
 				),
-				tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(
+				tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(
 					shortHeaderPacket{}, errNothingToPack,
 				).MaxTimes(1),
 			)
@@ -3403,12 +3403,12 @@ func testConnectionMigration(t *testing.T, enabled bool) {
 	require.NoError(t, err)
 	require.NotNil(t, path)
 
-	tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(
+	tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(
 		shortHeaderPacket{}, errNothingToPack,
 	).AnyTimes()
 	packedProbe := make(chan struct{})
-	tc.packer.EXPECT().PackPathProbePacket(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-		func(protocol.ConnectionID, []ackhandler.Frame, protocol.Version) (shortHeaderPacket, *packetBuffer, error) {
+	tc.packer.EXPECT().PackPathProbePacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ protocol.ConnectionID, _ []ackhandler.Frame, _ protocol.Version, _ protocol.PathID) (shortHeaderPacket, *packetBuffer, error) {
 			defer close(packedProbe)
 			return shortHeaderPacket{IsPathProbePacket: true}, getPacketBuffer(), nil
 		},
@@ -3466,7 +3466,7 @@ func testConnectionDatagrams(t *testing.T, enabled bool) {
 	require.NoError(t, err)
 	data, err = (&wire.DatagramFrame{Data: []byte("bar")}).Append(data, protocol.Version1)
 	require.NoError(t, err)
-	_, _, _, err = tc.conn.handleFrames(data, protocol.ConnectionID{}, protocol.Encryption1RTT, nil, monotime.Now())
+	_, _, _, err = tc.conn.handleFrames(data, protocol.ConnectionID{}, protocol.Encryption1RTT, nil, monotime.Now(), protocol.InvalidPathID)
 
 	if !enabled {
 		require.ErrorIs(t, err, &qerr.TransportError{ErrorCode: qerr.FrameEncodingError, FrameType: uint64(wire.FrameTypeDatagramWithLength)})
@@ -3483,3 +3483,4 @@ func testConnectionDatagrams(t *testing.T, enabled bool) {
 	require.NoError(t, err)
 	require.Equal(t, []byte("bar"), d)
 }
+
