@@ -299,6 +299,18 @@ func (m *MultiSocketManager) ReadPacket() (receivedPacket, error) {
 }
 
 func (m *MultiSocketManager) WritePacket(b []byte, addr net.Addr, packetInfoOOB []byte, gsoSize uint16, ecn protocol.ECN) (int, error) {
+	// If no explicit packet info is provided, try to derive it from the destination address.
+	// This is important for multipath: the MultiSocketManager selects the socket to send from
+	// based on the packetInfo.addr.
+	if len(packetInfoOOB) == 0 {
+		if udp, ok := addr.(*net.UDPAddr); ok {
+			var info packetInfo
+			if parsed, ok := netip.AddrFromSlice(udp.IP); ok {
+				info.addr = parsed.Unmap()
+				packetInfoOOB = info.OOB()
+			}
+		}
+	}
 	return m.baseRawConn.WritePacket(b, addr, packetInfoOOB, gsoSize, ecn)
 }
 
@@ -365,7 +377,9 @@ func (m *MultiSocketManager) ReadFrom(b []byte) (n int, addr net.Addr, err error
 }
 
 func (m *MultiSocketManager) WriteTo(b []byte, addr net.Addr) (int, error) {
-	return m.baseConn.WriteTo(b, addr)
+	// Prefer going through WritePacket so we can apply the same destination-based
+	// packetInfo selection logic (important for multipath / multi-socket setups).
+	return m.WritePacket(b, addr, nil, 0, protocol.ECNUnsupported)
 }
 
 func (m *MultiSocketManager) SetDeadline(t time.Time) error {

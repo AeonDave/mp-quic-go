@@ -552,25 +552,52 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 		//
 		// Try to find an application-data packet number space that could have sent
 		// this packet number, and process the ACK there. If we can't find one,
-		// ignore the ACK instead of failing the entire connection.
+		// only ignore it if we're in multipath mode (multiple paths exist).
 		if encLevel == protocol.Encryption0RTT || encLevel == protocol.Encryption1RTT {
 			var altPathID protocol.PathID
 			var altSpace *packetNumberSpace
+			var fallbackPathID protocol.PathID
+			var fallbackSpace *packetNumberSpace
 			for pid, ps := range h.appDataPackets {
-				if ps != nil && largestAcked <= ps.largestSent {
-					altPathID = pid
-					altSpace = ps
-					break
+				if ps == nil {
+					continue
 				}
+				if largestAcked > ps.largestSent {
+					continue
+				}
+				if idx, ok := ps.history.getIndex(largestAcked); ok {
+					if p := ps.history.packets[idx]; p != nil {
+						altPathID = pid
+						altSpace = ps
+						break
+					}
+					// Track a fallback path with the correct range in case the packet was already removed (e.g., declared lost).
+					if fallbackSpace == nil {
+						fallbackPathID = pid
+						fallbackSpace = ps
+					}
+				}
+			}
+			if altSpace == nil && fallbackSpace != nil {
+				altPathID = fallbackPathID
+				altSpace = fallbackSpace
 			}
 			if altSpace != nil {
 				pathID = altPathID
 				pnSpace = altSpace
 			} else {
-				if h.logger.Debug() {
-					h.logger.Debugf("ignoring ACK for unsent packet (enc=%s path=%d largestAcked=%d largestSent=%d)", encLevel, pathID, largestAcked, pnSpace.largestSent)
+				// Only ignore the ACK if we have multiple paths (multipath mode)
+				// In single-path mode, this is a protocol violation
+				if len(h.appDataPackets) > 1 {
+					if h.logger.Debug() {
+						h.logger.Debugf("ignoring ACK for unsent packet (enc=%s path=%d largestAcked=%d largestSent=%d)", encLevel, pathID, largestAcked, pnSpace.largestSent)
+					}
+					return false, nil
 				}
-				return false, nil
+				return false, &qerr.TransportError{
+					ErrorCode:    qerr.ProtocolViolation,
+					ErrorMessage: "received ACK for an unsent packet",
+				}
 			}
 		} else {
 			return false, &qerr.TransportError{

@@ -2588,7 +2588,13 @@ func (c *Conn) sendPackets(now monotime.Time) error {
 				c.logger.Debugf("sending path probe packet from %s", c.LocalAddr())
 				c.logShortHeaderPacket(probe, protocol.ECNNon, buf.Len())
 				c.registerPackedShortHeaderPacket(probe, protocol.ECNNon, now)
-				tr.WriteTo(buf.Data, c.conn.RemoteAddr())
+				// Use the new transport's underlying connection to send this probing packet.
+				// Sending via Transport.WriteTo is essential, since that method attaches the
+				// correct per-path ConnectionID via OOB / socket options when multipath is enabled.
+				if _, err := tr.WriteTo(buf.Data, c.conn.RemoteAddr()); err != nil {
+					buf.Release()
+					return err
+				}
 				// There's (likely) more data to send. Loop around again.
 				c.scheduleSending()
 				return nil

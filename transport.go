@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -434,7 +435,18 @@ func (t *Transport) WriteTo(b []byte, addr net.Addr) (int, error) {
 	if err := t.init(false); err != nil {
 		return 0, err
 	}
-	return t.conn.WritePacket(b, addr, nil, 0, protocol.ECNUnsupported)
+	// When using a MultiSocketManager as the underlying rawConn (mp-quic-go multipath),
+	// the remote address may require per-destination ancillary data (e.g. per-path
+	// Connection ID selection) to be attached.
+	// The MultiSocketManager builds that OOB data from the destination address,
+	// so we pass it through here.
+	var info packetInfo
+	if a, ok := addr.(*net.UDPAddr); ok {
+		if parsed, ok := netip.AddrFromSlice(a.IP); ok {
+			info.addr = parsed.Unmap()
+		}
+	}
+	return t.conn.WritePacket(b, addr, info.OOB(), 0, protocol.ECNUnsupported)
 }
 
 func (t *Transport) runSendQueue() {
