@@ -546,9 +546,37 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 
 	largestAcked := ack.LargestAcked()
 	if largestAcked > pnSpace.largestSent {
-		return false, &qerr.TransportError{
-			ErrorCode:    qerr.ProtocolViolation,
-			ErrorMessage: "received ACK for an unsent packet",
+		// MP-QUIC: an ACK can be received on a different path than the one that carried
+		// the acked packet. If the pathID mapping is off, we can falsely think this ACK
+		// refers to an unsent packet.
+		//
+		// Try to find an application-data packet number space that could have sent
+		// this packet number, and process the ACK there. If we can't find one,
+		// ignore the ACK instead of failing the entire connection.
+		if encLevel == protocol.Encryption0RTT || encLevel == protocol.Encryption1RTT {
+			var altPathID protocol.PathID
+			var altSpace *packetNumberSpace
+			for pid, ps := range h.appDataPackets {
+				if ps != nil && largestAcked <= ps.largestSent {
+					altPathID = pid
+					altSpace = ps
+					break
+				}
+			}
+			if altSpace != nil {
+				pathID = altPathID
+				pnSpace = altSpace
+			} else {
+				if h.logger.Debug() {
+					h.logger.Debugf("ignoring ACK for unsent packet (enc=%s path=%d largestAcked=%d largestSent=%d)", encLevel, pathID, largestAcked, pnSpace.largestSent)
+				}
+				return false, nil
+			}
+		} else {
+			return false, &qerr.TransportError{
+				ErrorCode:    qerr.ProtocolViolation,
+				ErrorMessage: "received ACK for an unsent packet",
+			}
 		}
 	}
 
