@@ -255,6 +255,15 @@ func (h *sentPacketHandler) getAppDataPacketNumberSpace(pathID protocol.PathID) 
 	if pnSpace, ok := h.appDataPackets[pathID]; ok {
 		return pnSpace
 	}
+	// If pathID is InvalidPathID and we have sent packets on other paths,
+	// fall back to the first path with sent packets to avoid ACK mismatch.
+	if pathID == protocol.InvalidPathID {
+		for pid, pnSpace := range h.appDataPackets {
+			if pid != protocol.InvalidPathID && pnSpace.largestSent != protocol.InvalidPacketNumber {
+				return pnSpace
+			}
+		}
+	}
 	pnSpace := newPacketNumberSpace(0, true)
 	h.appDataPackets[pathID] = pnSpace
 	return pnSpace
@@ -356,7 +365,7 @@ func (h *sentPacketHandler) DropPackets(encLevel protocol.EncryptionLevel, now m
 					break
 				}
 				h.removeFromBytesInFlight(p)
-				pnSpace.history.Remove(pn)
+				_ = pnSpace.history.Remove(pn)
 			}
 		})
 	default:
