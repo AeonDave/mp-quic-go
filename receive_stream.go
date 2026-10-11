@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/AeonDave/mp-quic-go/internal/ackhandler"
-	"github.com/AeonDave/mp-quic-go/internal/flowcontrol"
 	"github.com/AeonDave/mp-quic-go/internal/monotime"
 	"github.com/AeonDave/mp-quic-go/internal/protocol"
 	"github.com/AeonDave/mp-quic-go/internal/qerr"
@@ -22,8 +21,9 @@ type ReceiveStream struct {
 
 	sender streamSender
 
-	frameQueue  *frameSorter
-	finalOffset protocol.ByteCount
+	frameQueue               *frameSorter
+	finalOffset              protocol.ByteCount
+	receiveFinalSizeCallback func(int64)
 
 	currentFrame       []byte
 	currentFrameDone   func()
@@ -45,11 +45,18 @@ type ReceiveStream struct {
 	readPos      protocol.ByteCount
 	reliableSize protocol.ByteCount
 
+	// Set when the first RESET_STREAM or RESET_STREAM_AT frame is received,
+	// even if the stream was cancelled locally before.
+	receivedReset  bool
+	resetErrorCode qerr.StreamErrorCode
+	// set when a RESET_STREAM_AT frame with a reliable size larger than 0 was received
+	receivedResetStreamAt bool
+
 	readChan chan struct{}
 	readOnce chan struct{} // cap: 1, to protect against concurrent use of Read
 	deadline monotime.Time
 
-	flowController flowcontrol.StreamFlowController
+	flowController *streamFlowController
 }
 
 var (
@@ -60,7 +67,7 @@ var (
 func newReceiveStream(
 	streamID protocol.StreamID,
 	sender streamSender,
-	flowController flowcontrol.StreamFlowController,
+	flowController *streamFlowController,
 ) *ReceiveStream {
 	return &ReceiveStream{
 		streamID:       streamID,
@@ -74,8 +81,37 @@ func newReceiveStream(
 }
 
 // StreamID returns the stream ID.
-func (s *ReceiveStream) StreamID() protocol.StreamID {
+func (s *ReceiveStream) StreamID() StreamID {
 	return s.streamID
+}
+
+// SetReceiveFinalSizeCallback sets a callback that is called when the receive stream's final size is known.
+// The final size is learned from a FIN or RESET_STREAM frame.
+// Most applications don't need this. It is mainly useful for protocol layers
+// that need exact stream final sizes, such as WebTransport flow control accounting.
+// If the final size is already known, the callback is called before this method returns.
+// When the final size is learned later, the callback is called from the connection's event loop and must not block.
+// The callback is not called if the connection is closed before the final size is known.
+// Setting a nil callback removes it if the final size is not yet known.
+func (s *ReceiveStream) SetReceiveFinalSizeCallback(callback func(int64)) {
+	s.mutex.Lock()
+	size := s.finalOffset
+
+	// final size is already known
+	if size != protocol.MaxByteCount {
+		s.mutex.Unlock()
+		if callback != nil {
+			callback(int64(size))
+		}
+		return
+	}
+
+	if s.closeForShutdownErr != nil {
+		s.mutex.Unlock()
+		return
+	}
+	s.receiveFinalSizeCallback = callback
+	s.mutex.Unlock()
 }
 
 // Read reads data from the stream.
@@ -240,9 +276,9 @@ func (s *ReceiveStream) isRemoteCancellationEffective() bool {
 
 // Peek fills b with stream data, without consuming the stream data.
 // It blocks until len(b) bytes are available, or an error occurs.
-// It respects the stream deadline set by SetReadDeadline.
+// It respects the stream deadline set by [ReceiveStream.SetReadDeadline].
 // If the stream ends before len(b) bytes are available,
-// it returns the number of bytes peeked along with io.EOF.
+// it returns the number of bytes peeked along with [io.EOF].
 func (s *ReceiveStream) Peek(b []byte) (int, error) {
 	if len(b) == 0 {
 		return 0, nil
@@ -366,8 +402,8 @@ func (s *ReceiveStream) dequeueNextFrame() {
 
 // CancelRead aborts receiving on this stream.
 // It instructs the peer to stop transmitting stream data.
-// Read will unblock immediately, and future Read calls will fail.
-// When called multiple times or after reading the io.EOF it is a no-op.
+// [ReceiveStream.Read] will unblock immediately, and future calls to it will fail.
+// When called multiple times or after [ReceiveStream.Read] returns [io.EOF], it is a no-op.
 func (s *ReceiveStream) CancelRead(errorCode StreamErrorCode) {
 	s.mutex.Lock()
 	queuedNewControlFrame := s.cancelReadImpl(errorCode)
@@ -404,16 +440,23 @@ func (s *ReceiveStream) handleStreamFrame(frame *wire.StreamFrame, now monotime.
 	s.mutex.Lock()
 	err := s.handleStreamFrameImpl(frame, now)
 	completed := s.isNewlyCompleted()
+	size, callback := s.takeReceiveFinalSizeCallback()
 	s.mutex.Unlock()
 
 	if completed {
 		s.flowController.Abandon()
 		s.sender.onStreamCompleted(s.streamID)
 	}
+	if callback != nil {
+		callback(size)
+	}
 	return err
 }
 
 func (s *ReceiveStream) handleStreamFrameImpl(frame *wire.StreamFrame, now monotime.Time) error {
+	if s.closeForShutdownErr != nil {
+		return nil
+	}
 	maxOffset := frame.Offset + frame.DataLen()
 	if err := s.flowController.UpdateHighestReceived(maxOffset, frame.Fin, now); err != nil {
 		return err
@@ -435,10 +478,14 @@ func (s *ReceiveStream) handleResetStreamFrame(frame *wire.ResetStreamFrame, now
 	s.mutex.Lock()
 	err := s.handleResetStreamFrameImpl(frame, now)
 	completed := s.isNewlyCompleted()
+	size, callback := s.takeReceiveFinalSizeCallback()
 	s.mutex.Unlock()
 
 	if completed {
 		s.sender.onStreamCompleted(s.streamID)
+	}
+	if callback != nil {
+		callback(size)
 	}
 	return err
 }
@@ -452,9 +499,27 @@ func (s *ReceiveStream) handleResetStreamFrameImpl(frame *wire.ResetStreamFrame,
 	}
 	s.finalOffset = frame.FinalSize
 
-	// senders are allowed to reduce the reliable size, but frames might have been reordered
-	if (!s.cancelledRemotely && s.reliableSize == 0) || frame.ReliableSize < s.reliableSize {
+	if !s.receivedReset {
+		s.receivedReset = true
+		s.resetErrorCode = frame.ErrorCode
 		s.reliableSize = frame.ReliableSize
+	} else {
+		// When using RESET_STREAM_AT, the error code must not change in subsequent RESET_STREAM_AT and
+		// RESET_STREAM frames (section 5.2 of draft-ietf-quic-reliable-stream-reset-11).
+		// RFC 9000 doesn't impose this requirement on RESET_STREAM frames.
+		isResetStreamAt := frame.IsResetStreamAt || frame.ReliableSize > 0
+		if frame.ErrorCode != s.resetErrorCode && (s.receivedResetStreamAt || isResetStreamAt) {
+			return &qerr.TransportError{
+				ErrorCode:    qerr.StreamStateError,
+				ErrorMessage: fmt.Sprintf("error code of stream %d changed from %d to %d", s.streamID, s.resetErrorCode, frame.ErrorCode),
+			}
+		}
+		// Senders are allowed to reduce the reliable size, but frames might have been reordered.
+		// Increases are ignored (section 5.2 of draft-ietf-quic-reliable-stream-reset-11).
+		s.reliableSize = min(s.reliableSize, frame.ReliableSize)
+	}
+	if frame.IsResetStreamAt || frame.ReliableSize > 0 {
+		s.receivedResetStreamAt = true
 	}
 	if s.readPos >= s.reliableSize {
 		// calling Abandon multiple times is a no-op
@@ -473,6 +538,15 @@ func (s *ReceiveStream) handleResetStreamFrameImpl(frame *wire.ResetStreamFrame,
 	s.cancelErr = &StreamError{StreamID: s.streamID, ErrorCode: frame.ErrorCode, Remote: true}
 	s.signalRead()
 	return nil
+}
+
+func (s *ReceiveStream) takeReceiveFinalSizeCallback() (int64, func(int64)) {
+	if s.finalOffset == protocol.MaxByteCount {
+		return 0, nil
+	}
+	callback := s.receiveFinalSizeCallback
+	s.receiveFinalSizeCallback = nil
+	return int64(s.finalOffset), callback
 }
 
 func (s *ReceiveStream) getControlFrame(now monotime.Time) (_ ackhandler.Frame, ok, hasMore bool) {
@@ -498,9 +572,9 @@ func (s *ReceiveStream) getControlFrame(now monotime.Time) (_ ackhandler.Frame, 
 	}, true, false
 }
 
-// SetReadDeadline sets the deadline for future Read calls and
-// any currently-blocked Read call.
-// A zero value for t means Read will not time out.
+// SetReadDeadline sets the deadline for future [ReceiveStream.Read] calls and
+// any currently blocked call.
+// A zero value for t means [ReceiveStream.Read] will not time out.
 func (s *ReceiveStream) SetReadDeadline(t time.Time) error {
 	s.mutex.Lock()
 	s.deadline = monotime.FromTime(t)
@@ -515,6 +589,7 @@ func (s *ReceiveStream) SetReadDeadline(t time.Time) error {
 func (s *ReceiveStream) closeForShutdown(err error) {
 	s.mutex.Lock()
 	s.closeForShutdownErr = err
+	s.receiveFinalSizeCallback = nil
 	s.mutex.Unlock()
 	s.signalRead()
 }

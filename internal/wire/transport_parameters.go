@@ -44,15 +44,87 @@ const (
 	activeConnectionIDLimitParameterID         transportParameterID = 0xe
 	initialSourceConnectionIDParameterID       transportParameterID = 0xf
 	retrySourceConnectionIDParameterID         transportParameterID = 0x10
+	// RFC 9368
+	versionInformationParameterID transportParameterID = 0x11
 	// RFC 9221
 	maxDatagramFrameSizeParameterID transportParameterID = 0x20
-	// Multipath QUIC (private use for mp-quic-go)
-	enableMultipathParameterID transportParameterID = 0x1f0f9c0d2a
-	// https://datatracker.ietf.org/doc/draft-ietf-quic-reliable-stream-reset/06/
-	resetStreamAtParameterID transportParameterID = 0x17f7586d2cb571
+	// RFC 9287
+	greaseQUICBitParameterID transportParameterID = 0x2ab2
+	// https://datatracker.ietf.org/doc/draft-ietf-quic-multipath/21/
+	initialMaxPathIDParameterID transportParameterID = 0x3e
+	// https://datatracker.ietf.org/doc/draft-ietf-quic-reliable-stream-reset/11/
+	// The value is registered permanently by IANA. It is used since draft-09.
+	resetStreamAtParameterID transportParameterID = 0x1d
+	// https://datatracker.ietf.org/doc/draft-ietf-quic-reliable-stream-reset/07/
+	// The provisional value used up to draft-08. The RESET_STREAM_AT frame (0x24) is the same in all drafts.
+	// When removing support for this codepoint, increment transportParameterMarshalingVersion
+	// to prevent 0-RTT resumption with tickets that remember it.
+	legacyResetStreamAtParameterID transportParameterID = 0x17f7586d2cb571
 	// https://datatracker.ietf.org/doc/draft-ietf-quic-ack-frequency/11/
 	minAckDelayParameterID transportParameterID = 0xff04de1b
+	// The add_address transport parameter of the address advertisement extension of this module (ADD_ADDRESS).
+	// It is not registered with IANA. The value is outside of the ranges of registered transport parameters,
+	// and not a reserved value (31 * N + 27). It is the same value as the frame type of the ADD_ADDRESS frame.
+	addAddressParameterID transportParameterID = 0x1f0f9c0d40
+	// https://datatracker.ietf.org/doc/draft-ietf-quic-address-discovery/01/
+	addressDiscoveryParameterID transportParameterID = 0x9f81a176
 )
+
+// AddressDiscoveryMode is the value of the address_discovery transport parameter of QUIC Address Discovery
+// (draft-ietf-quic-address-discovery-01).
+type AddressDiscoveryMode uint8
+
+const (
+	// AddressDiscoveryUnsupported means that the transport parameter is not sent.
+	AddressDiscoveryUnsupported AddressDiscoveryMode = iota
+	// AddressDiscoveryProvide (value 0): the endpoint provides address observations to the peer,
+	// but doesn't want to receive any.
+	AddressDiscoveryProvide
+	// AddressDiscoveryReceive (value 1): the endpoint wants to receive address observations,
+	// but doesn't provide any.
+	AddressDiscoveryReceive
+	// AddressDiscoveryProvideAndReceive (value 2): the endpoint wants to receive address observations,
+	// and provides them to the peer.
+	AddressDiscoveryProvideAndReceive
+)
+
+// Provides says if the endpoint is willing to provide address observations.
+func (m AddressDiscoveryMode) Provides() bool {
+	return m == AddressDiscoveryProvide || m == AddressDiscoveryProvideAndReceive
+}
+
+// Receives says if the endpoint wants to receive address observations.
+func (m AddressDiscoveryMode) Receives() bool {
+	return m == AddressDiscoveryReceive || m == AddressDiscoveryProvideAndReceive
+}
+
+func (m AddressDiscoveryMode) String() string {
+	switch m {
+	case AddressDiscoveryUnsupported:
+		return "unsupported"
+	case AddressDiscoveryProvide:
+		return "provide"
+	case AddressDiscoveryReceive:
+		return "receive"
+	case AddressDiscoveryProvideAndReceive:
+		return "provide and receive"
+	default:
+		return fmt.Sprintf("AddressDiscoveryMode(%d)", uint8(m))
+	}
+}
+
+// VersionInformation is the value of the version_information transport parameter,
+// see section 3 of RFC 9368.
+type VersionInformation struct {
+	ChosenVersion protocol.Version
+	// AvailableVersions are the versions that the client's first flight is compatible with (when sent by the client),
+	// or the Fully Deployed Versions of the server (when sent by the server).
+	AvailableVersions []protocol.Version
+}
+
+func (v *VersionInformation) String() string {
+	return fmt.Sprintf("{ChosenVersion: %s, AvailableVersions: %s}", v.ChosenVersion, v.AvailableVersions)
+}
 
 // PreferredAddress is the value encoding in the preferred_address transport parameter
 type PreferredAddress struct {
@@ -90,9 +162,30 @@ type TransportParameters struct {
 	ActiveConnectionIDLimit uint64
 
 	MaxDatagramFrameSize protocol.ByteCount // RFC 9221
-	EnableMultipath      bool               // Multipath QUIC (mp-quic-go private use)
-	EnableResetStreamAt  bool               // https://datatracker.ietf.org/doc/draft-ietf-quic-reliable-stream-reset/06/
+	EnableResetStreamAt  bool               // https://datatracker.ietf.org/doc/draft-ietf-quic-reliable-stream-reset/11/
 	MinAckDelay          *time.Duration
+
+	// The initial_max_path_id of the multipath extension (draft-ietf-quic-multipath).
+	// It is only sent if HasInitialMaxPathID is set.
+	// The received value is not validated: values larger than protocol.MaxPathID are invalid.
+	InitialMaxPathID    protocol.PathID
+	HasInitialMaxPathID bool
+
+	// EnableAddAddress is the add_address transport parameter of the address advertisement extension (ADD_ADDRESS).
+	// The extension is only used if IETF Multipath QUIC is used as well.
+	EnableAddAddress bool
+
+	// AddressDiscovery is the address_discovery transport parameter of QUIC Address Discovery
+	// (draft-ietf-quic-address-discovery-01). It is not sent if it is AddressDiscoveryUnsupported.
+	AddressDiscovery AddressDiscoveryMode
+
+	// VersionInformation is the version_information transport parameter (RFC 9368).
+	// It is not sent if it is nil.
+	VersionInformation *VersionInformation
+
+	// GreaseQUICBit is the grease_quic_bit transport parameter (RFC 9287).
+	// The sender accepts packets with the QUIC Bit set to 0.
+	GreaseQUICBit bool
 }
 
 // Unmarshal the transport parameters
@@ -149,7 +242,8 @@ func (p *TransportParameters) unmarshal(b []byte, sentBy protocol.Perspective, f
 			maxDatagramFrameSizeParameterID,
 			ackDelayExponentParameterID,
 			activeConnectionIDLimitParameterID,
-			minAckDelayParameterID:
+			minAckDelayParameterID,
+			addressDiscoveryParameterID:
 			if err := p.readNumericTransportParameter(b, paramID, int(paramLen)); err != nil {
 				return err
 			}
@@ -208,17 +302,55 @@ func (p *TransportParameters) unmarshal(b []byte, sentBy protocol.Perspective, f
 			connID := protocol.ParseConnectionID(b[:paramLen])
 			b = b[paramLen:]
 			p.RetrySourceConnectionID = &connID
-		case resetStreamAtParameterID:
+		case resetStreamAtParameterID, legacyResetStreamAtParameterID:
 			if paramLen != 0 {
 				return fmt.Errorf("wrong length for reset_stream_at: %d (expected empty)", paramLen)
 			}
 			p.EnableResetStreamAt = true
-		case enableMultipathParameterID:
-			if paramLen != 0 {
-				return fmt.Errorf("wrong length for enable_multipath: %d (expected empty)", paramLen)
+		case greaseQUICBitParameterID:
+			// The extension only applies to the current connection, so it is never saved in a session ticket.
+			if fromSessionTicket {
+				return errors.New("grease_quic_bit in session ticket")
 			}
-			p.EnableMultipath = true
+			if paramLen != 0 {
+				return fmt.Errorf("wrong length for grease_quic_bit: %d (expected empty)", paramLen)
+			}
+			p.GreaseQUICBit = true
+		case initialMaxPathIDParameterID:
+			// This parameter must not be remembered for 0-RTT (section 2.1 of draft-ietf-quic-multipath),
+			// so it is never saved in a session ticket.
+			if fromSessionTicket {
+				return errors.New("initial_max_path_id in session ticket")
+			}
+			if err := p.readNumericTransportParameter(b, paramID, int(paramLen)); err != nil {
+				return err
+			}
+			b = b[paramLen:]
+		case versionInformationParameterID:
+			// The Version Information is specific to a connection, and never saved in a session ticket.
+			if fromSessionTicket {
+				return errors.New("version_information in session ticket")
+			}
+			if err := p.readVersionInformation(b[:paramLen], sentBy); err != nil {
+				return err
+			}
+			b = b[paramLen:]
+		case addAddressParameterID:
+			// Like initial_max_path_id, this parameter is never saved in a session ticket:
+			// the extension is only used together with IETF Multipath QUIC.
+			if fromSessionTicket {
+				return errors.New("add_address in session ticket")
+			}
+			if paramLen != 0 {
+				return fmt.Errorf("wrong length for add_address: %d (expected empty)", paramLen)
+			}
+			p.EnableAddAddress = true
 		default:
+			if fromSessionTicket {
+				// A ticket might contain a parameter for an extension supported by an older
+				// version of this endpoint. If we can't parse it, don't resume with it.
+				return fmt.Errorf("unknown transport parameter %#x in session ticket", paramID)
+			}
 			b = b[paramLen:]
 		}
 	}
@@ -240,13 +372,8 @@ func (p *TransportParameters) unmarshal(b []byte, sentBy protocol.Perspective, f
 	}
 
 	// check that every transport parameter was sent at most once
-	slices.SortFunc(parameterIDs, func(a, b transportParameterID) int {
-		if a < b {
-			return -1
-		}
-		return 1
-	})
-	for i := 0; i < len(parameterIDs)-1; i++ {
+	slices.Sort(parameterIDs)
+	for i := range len(parameterIDs) - 1 {
 		if parameterIDs[i] == parameterIDs[i+1] {
 			return fmt.Errorf("received duplicate transport parameter %#x", parameterIDs[i])
 		}
@@ -291,6 +418,33 @@ func (p *TransportParameters) readPreferredAddress(b []byte, expectedLen int) er
 		return fmt.Errorf("expected preferred_address to be %d long, read %d bytes", expectedLen, bytesRead)
 	}
 	p.PreferredAddress = pa
+	return nil
+}
+
+// readVersionInformation reads the version_information transport parameter.
+// Section 4 of RFC 9368 defines which values are parsing failures.
+func (p *TransportParameters) readVersionInformation(b []byte, sentBy protocol.Perspective) error {
+	if len(b) < 4 || len(b)%4 != 0 {
+		return fmt.Errorf("invalid length for version_information: %d", len(b))
+	}
+	vi := &VersionInformation{ChosenVersion: protocol.Version(binary.BigEndian.Uint32(b))}
+	if vi.ChosenVersion == 0 {
+		return errors.New("version_information: Chosen Version is 0")
+	}
+	b = b[4:]
+	vi.AvailableVersions = make([]protocol.Version, 0, len(b)/4)
+	for len(b) > 0 {
+		v := protocol.Version(binary.BigEndian.Uint32(b))
+		if v == 0 {
+			return errors.New("version_information: Available Version is 0")
+		}
+		vi.AvailableVersions = append(vi.AvailableVersions, v)
+		b = b[4:]
+	}
+	if sentBy == protocol.PerspectiveClient && !slices.Contains(vi.AvailableVersions, vi.ChosenVersion) {
+		return fmt.Errorf("version_information: Chosen Version %s not contained in Available Versions %s", vi.ChosenVersion, vi.AvailableVersions)
+	}
+	p.VersionInformation = vi
 	return nil
 }
 
@@ -352,6 +506,16 @@ func (p *TransportParameters) readNumericTransportParameter(b []byte, paramID tr
 			mad = math.MaxInt64
 		}
 		p.MinAckDelay = &mad
+	case initialMaxPathIDParameterID:
+		p.InitialMaxPathID = protocol.PathID(val)
+		p.HasInitialMaxPathID = true
+	case addressDiscoveryParameterID:
+		// Section 3 of draft-ietf-quic-address-discovery-01:
+		// Any other value than 0, 1 and 2 is a TRANSPORT_PARAMETER_ERROR.
+		if val > 2 {
+			return fmt.Errorf("invalid value for address_discovery: %d", val)
+		}
+		p.AddressDiscovery = AddressDiscoveryMode(val + 1)
 	default:
 		return fmt.Errorf("TransportParameter BUG: transport parameter %d not found", paramID)
 	}
@@ -458,14 +622,40 @@ func (p *TransportParameters) Marshal(pers protocol.Perspective) []byte {
 	if p.MaxDatagramFrameSize != protocol.InvalidByteCount {
 		b = p.marshalVarintParam(b, maxDatagramFrameSizeParameterID, uint64(p.MaxDatagramFrameSize))
 	}
-	// Multipath QUIC (mp-quic-go private use)
-	if p.EnableMultipath {
-		b = quicvarint.Append(b, uint64(enableMultipathParameterID))
+	// version_information
+	if p.VersionInformation != nil {
+		b = quicvarint.Append(b, uint64(versionInformationParameterID))
+		b = quicvarint.Append(b, uint64(4*(1+len(p.VersionInformation.AvailableVersions))))
+		b = binary.BigEndian.AppendUint32(b, uint32(p.VersionInformation.ChosenVersion))
+		for _, v := range p.VersionInformation.AvailableVersions {
+			b = binary.BigEndian.AppendUint32(b, uint32(v))
+		}
+	}
+	// Multipath QUIC (draft-ietf-quic-multipath)
+	if p.HasInitialMaxPathID {
+		b = p.marshalVarintParam(b, initialMaxPathIDParameterID, uint64(p.InitialMaxPathID))
+	}
+	// address advertisement (ADD_ADDRESS)
+	if p.EnableAddAddress {
+		b = quicvarint.Append(b, uint64(addAddressParameterID))
 		b = quicvarint.Append(b, 0)
 	}
-	// QUIC Stream Resets with Partial Delivery
+	// QUIC Address Discovery
+	if p.AddressDiscovery != AddressDiscoveryUnsupported {
+		b = p.marshalVarintParam(b, addressDiscoveryParameterID, uint64(p.AddressDiscovery-1))
+	}
+	// Greasing the QUIC Bit
+	if p.GreaseQUICBit {
+		b = quicvarint.Append(b, uint64(greaseQUICBitParameterID))
+		b = quicvarint.Append(b, 0)
+	}
+	// QUIC Stream Resets with Partial Delivery.
+	// Both code points are sent, the final one first, so that peers implementing an earlier draft enable the
+	// extension as well. Receiving either one of them enables it.
 	if p.EnableResetStreamAt {
 		b = quicvarint.Append(b, uint64(resetStreamAtParameterID))
+		b = quicvarint.Append(b, 0)
+		b = quicvarint.Append(b, uint64(legacyResetStreamAtParameterID))
 		b = quicvarint.Append(b, 0)
 	}
 	if p.MinAckDelay != nil {
@@ -518,16 +708,18 @@ func (p *TransportParameters) MarshalForSessionTicket(b []byte) []byte {
 	if p.MaxDatagramFrameSize != protocol.InvalidByteCount {
 		b = p.marshalVarintParam(b, maxDatagramFrameSizeParameterID, uint64(p.MaxDatagramFrameSize))
 	}
-	// enable_multipath
-	if p.EnableMultipath {
-		b = quicvarint.Append(b, uint64(enableMultipathParameterID))
-		b = quicvarint.Append(b, 0)
-	}
 	// reset_stream_at
 	if p.EnableResetStreamAt {
 		b = quicvarint.Append(b, uint64(resetStreamAtParameterID))
 		b = quicvarint.Append(b, 0)
 	}
+	// address_discovery is remembered (section 3 of draft-ietf-quic-address-discovery-01)
+	if p.AddressDiscovery != AddressDiscoveryUnsupported {
+		b = p.marshalVarintParam(b, addressDiscoveryParameterID, uint64(p.AddressDiscovery-1))
+	}
+	// initial_max_path_id must not be remembered (section 2.1 of draft-ietf-quic-multipath),
+	// and neither are add_address, version_information and grease_quic_bit (a server must not set the QUIC Bit
+	// to 0 based on a previous connection, section 3.1 of RFC 9287)
 	return b
 }
 
@@ -548,7 +740,12 @@ func (p *TransportParameters) ValidFor0RTT(saved *TransportParameters) bool {
 	if saved.MaxDatagramFrameSize != protocol.InvalidByteCount && (p.MaxDatagramFrameSize == protocol.InvalidByteCount || p.MaxDatagramFrameSize < saved.MaxDatagramFrameSize) {
 		return false
 	}
-	if saved.EnableMultipath && !p.EnableMultipath {
+	if saved.EnableResetStreamAt && !p.EnableResetStreamAt {
+		return false
+	}
+	// Section 3 of draft-ietf-quic-address-discovery-01: if 0-RTT is accepted,
+	// the server must not disable the extension or change the value.
+	if p.AddressDiscovery != saved.AddressDiscovery {
 		return false
 	}
 	return p.InitialMaxStreamDataBidiLocal >= saved.InitialMaxStreamDataBidiLocal &&
@@ -566,7 +763,11 @@ func (p *TransportParameters) ValidForUpdate(saved *TransportParameters) bool {
 	if saved.MaxDatagramFrameSize != protocol.InvalidByteCount && (p.MaxDatagramFrameSize == protocol.InvalidByteCount || p.MaxDatagramFrameSize < saved.MaxDatagramFrameSize) {
 		return false
 	}
-	if saved.EnableMultipath && !p.EnableMultipath {
+	if saved.EnableResetStreamAt && !p.EnableResetStreamAt {
+		return false
+	}
+	// section 3 of draft-ietf-quic-address-discovery-01
+	if p.AddressDiscovery != saved.AddressDiscovery {
 		return false
 	}
 	return p.ActiveConnectionIDLimit >= saved.ActiveConnectionIDLimit &&
@@ -596,13 +797,29 @@ func (p *TransportParameters) String() string {
 		logString += ", MaxDatagramFrameSize: %d"
 		logParams = append(logParams, p.MaxDatagramFrameSize)
 	}
-	logString += ", EnableMultipath: %t"
-	logParams = append(logParams, p.EnableMultipath)
 	logString += ", EnableResetStreamAt: %t"
 	logParams = append(logParams, p.EnableResetStreamAt)
 	if p.MinAckDelay != nil {
 		logString += ", MinAckDelay: %s"
 		logParams = append(logParams, *p.MinAckDelay)
+	}
+	if p.HasInitialMaxPathID {
+		logString += ", InitialMaxPathID: %d"
+		logParams = append(logParams, p.InitialMaxPathID)
+	}
+	if p.EnableAddAddress {
+		logString += ", EnableAddAddress: true"
+	}
+	if p.AddressDiscovery != AddressDiscoveryUnsupported {
+		logString += ", AddressDiscovery: %s"
+		logParams = append(logParams, p.AddressDiscovery)
+	}
+	if p.VersionInformation != nil {
+		logString += ", VersionInformation: %s"
+		logParams = append(logParams, p.VersionInformation)
+	}
+	if p.GreaseQUICBit {
+		logString += ", GreaseQUICBit: true"
 	}
 	logString += "}"
 	return fmt.Sprintf(logString, logParams...)

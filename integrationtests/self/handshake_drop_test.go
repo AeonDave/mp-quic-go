@@ -8,17 +8,15 @@ import (
 	"io"
 	mrand "math/rand/v2"
 	"net"
-	"runtime"
 	"slices"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
-	"github.com/AeonDave/mp-quic-go"
+	quic "github.com/AeonDave/mp-quic-go"
 	"github.com/AeonDave/mp-quic-go/internal/protocol"
-	"github.com/AeonDave/mp-quic-go/internal/synctest"
 	"github.com/AeonDave/mp-quic-go/qlog"
 	"github.com/AeonDave/mp-quic-go/testutils/events"
 	"github.com/AeonDave/mp-quic-go/testutils/simnet"
@@ -167,11 +165,14 @@ func dropCallbackDropNthPacket(dir direction, ns ...int) func(direction, simnet.
 	}
 }
 
-func dropCallbackDropOneThird(_ direction) func(direction, simnet.Packet) bool {
+func dropCallbackDropOneThird(dir direction) func(direction, simnet.Packet) bool {
 	const maxSequentiallyDropped = 10
 	var mx sync.Mutex
 	var toClient, toServer int
 	return func(d direction, p simnet.Packet) bool {
+		if d != dir && dir != directionBoth {
+			return false
+		}
 		drop := mrand.IntN(3) == 0
 
 		mx.Lock()
@@ -308,13 +309,11 @@ func TestHandshakeWithPacketLoss(t *testing.T) {
 								defer ln.Close()
 
 								conn := test.fn(t, ln, clientConn, clientConf, timeout, data)
-								if !strings.HasPrefix(runtime.Version(), "go1.24") {
-									curveID := getCurveID(conn.ConnectionState().TLS)
-									if conf.postQuantum {
-										require.Equal(t, tls.X25519MLKEM768, curveID)
-									} else {
-										require.Equal(t, tls.CurveP384, curveID)
-									}
+								curveID := getCurveID(conn.ConnectionState().TLS)
+								if conf.postQuantum {
+									require.Equal(t, tls.X25519MLKEM768, curveID)
+								} else {
+									require.Equal(t, tls.CurveP384, curveID)
 								}
 
 								if pattern != dropPatternDropOneThirdOfPackets {
@@ -391,15 +390,15 @@ func TestHandshakePacketBuffering(t *testing.T) {
 		buffered := clientEventRecorder.Events(qlog.PacketBuffered{})
 		t.Logf("buffered packets: %d", len(buffered))
 		require.NotEmpty(t, buffered)
-		receivedPackets := make(map[qlog.DatagramID][]qlog.PacketType)
+		receivedPackets := make(map[qlog.DatagramPayloadChecksum][]qlog.PacketType)
 		for _, ev := range clientEventRecorder.Events(qlog.PacketReceived{}) {
-			id := ev.(qlog.PacketReceived).DatagramID
-			receivedPackets[id] = append(receivedPackets[id], ev.(qlog.PacketReceived).Header.PacketType)
+			checksum := ev.(qlog.PacketReceived).DatagramPayloadChecksum
+			receivedPackets[checksum] = append(receivedPackets[checksum], ev.(qlog.PacketReceived).Header.PacketType)
 		}
 		for _, ev := range buffered {
-			id := ev.(qlog.PacketBuffered).DatagramID
-			require.Contains(t, receivedPackets, id)
-			require.Contains(t, receivedPackets[id], qlog.PacketTypeHandshake)
+			checksum := ev.(qlog.PacketBuffered).DatagramPayloadChecksum
+			require.Contains(t, receivedPackets, checksum)
+			require.Contains(t, receivedPackets[checksum], qlog.PacketTypeHandshake)
 		}
 
 		sconn, err := ln.Accept(context.Background())

@@ -6,20 +6,24 @@ import (
 	"io"
 	"sync"
 
-	"github.com/AeonDave/mp-quic-go"
+	quic "github.com/AeonDave/mp-quic-go"
 )
 
 // Settingser allows waiting for and retrieving the peer's HTTP/3 settings.
 type Settingser interface {
 	// ReceivedSettings returns a channel that is closed once the peer's SETTINGS frame was received.
-	// Settings can be obtained from the Settings method after the channel was closed.
+	// The settings can be obtained from [Settingser.Settings] after the channel is closed.
 	ReceivedSettings() <-chan struct{}
 	// Settings returns the settings received on this connection.
-	// It is only valid to call this function after the channel returned by ReceivedSettings was closed.
+	// It is only valid to call this method after the channel returned by [Settingser.ReceivedSettings] is closed.
 	Settings() *Settings
 }
 
 var errTooMuchData = errors.New("peer sent too much data")
+
+// errTooLittleData is returned when the stream ends before the length given by the Content-Length header field
+// (section 4.1.2 of RFC 9114).
+var errTooLittleData = errors.New("peer sent less data than indicated by the Content-Length")
 
 // The body is used in the requestBody (for a http.Request) and the responseBody (for a http.Response).
 type body struct {
@@ -68,7 +72,16 @@ func (r *body) Read(b []byte) (int, error) {
 	if err := r.checkContentLengthViolation(); err != nil {
 		return n, err
 	}
-	return n, maybeReplaceError(err)
+	// A message whose content is shorter than its Content-Length is malformed (section 4.1.2 of RFC 9114).
+	if err == io.EOF && r.hasContentLength && r.remainingContentLength > 0 {
+		if !r.violatedContentLength {
+			r.str.CancelRead(quic.StreamErrorCode(ErrCodeMessageError))
+			r.str.CancelWrite(quic.StreamErrorCode(ErrCodeMessageError))
+			r.violatedContentLength = true
+		}
+		return n, errTooLittleData
+	}
+	return n, err
 }
 
 func (r *body) Close() error {
@@ -118,7 +131,7 @@ func (r *hijackableBody) Read(b []byte) (int, error) {
 	if err != nil {
 		r.requestDone()
 	}
-	return n, maybeReplaceError(err)
+	return n, err
 }
 
 func (r *hijackableBody) requestDone() {

@@ -80,6 +80,47 @@ func ChooseSupportedVersion(ours, theirs []Version) (Version, bool) {
 	return 0, false
 }
 
+// IsCompatibleVersion says if a first flight of version from can be converted into a first flight of version to,
+// as defined in section 2.2 of RFC 9368.
+// Every version is compatible with itself. QUIC version 1 and QUIC version 2 are compatible with each other
+// (section 4 of RFC 9369). No other versions are compatible.
+func IsCompatibleVersion(from, to Version) bool {
+	if from == to {
+		return true
+	}
+	return (from == Version1 && to == Version2) || (from == Version2 && to == Version1)
+}
+
+// CompatibleVersions returns the versions that a first flight of the chosen version is compatible with,
+// in the order of ours. The chosen version is always included, even if it is not contained in ours.
+// It is used for the Available Versions field of the client's Version Information (section 3 of RFC 9368).
+func CompatibleVersions(ours []Version, chosen Version) []Version {
+	versions := make([]Version, 0, len(ours)+1)
+	if !slices.Contains(ours, chosen) {
+		versions = append(versions, chosen)
+	}
+	for _, v := range ours {
+		if IsCompatibleVersion(chosen, v) && !slices.Contains(versions, v) {
+			versions = append(versions, v)
+		}
+	}
+	return versions
+}
+
+// ChooseCompatibleVersion is used by the server to select the Negotiated Version of compatible version negotiation
+// (section 2.3 of RFC 9368).
+// It returns the first version of ours, the server's versions sorted by preference (descending),
+// that is contained in the client's Available Versions and that the client's Chosen Version is compatible with.
+// If there's no such version, it returns the client's Chosen Version.
+func ChooseCompatibleVersion(ours []Version, chosen Version, available []Version) Version {
+	for _, v := range ours {
+		if IsCompatibleVersion(chosen, v) && slices.Contains(available, v) {
+			return v
+		}
+	}
+	return chosen
+}
+
 var (
 	versionNegotiationMx   sync.Mutex
 	versionNegotiationRand mrand.Rand

@@ -186,3 +186,77 @@ func TestLogNewTokenFrame(t *testing.T) {
 	}, true)
 	require.Contains(t, buf.String(), "\t-> &wire.NewTokenFrame{Token: 0xdeadbeef")
 }
+
+func TestLogPathAckFrame(t *testing.T) {
+	buf := &bytes.Buffer{}
+	logger := setupLogTest(t, buf)
+	LogFrame(logger, &AckFrame{
+		AckRanges: []AckRange{{Smallest: 42, Largest: 1337}},
+		DelayTime: time.Millisecond,
+		PathID:    7,
+		HasPathID: true,
+	}, false)
+	require.Contains(t, buf.String(), "\t<- &wire.AckFrame{PathID: 7, LargestAcked: 1337, LowestAcked: 42, DelayTime: 1ms}\n")
+
+	buf.Reset()
+	LogFrame(logger, &AckFrame{
+		AckRanges: []AckRange{{Smallest: 5, Largest: 8}, {Smallest: 2, Largest: 3}},
+		DelayTime: 12 * time.Millisecond,
+		ECT0:      1,
+		ECT1:      2,
+		ECNCE:     3,
+		HasPathID: true,
+	}, true)
+	require.Contains(t, buf.String(), "\t-> &wire.AckFrame{PathID: 0, LargestAcked: 8, LowestAcked: 2, AckRanges: {{Largest: 8, Smallest: 5}, {Largest: 3, Smallest: 2}}, DelayTime: 12ms, ECT0: 1, ECT1: 2, CE: 3}\n")
+}
+
+func TestLogMultipathFrames(t *testing.T) {
+	for _, tc := range []struct {
+		frame    Frame
+		expected string
+	}{
+		{
+			frame:    &PathAbandonFrame{PathID: 3, ErrorCode: 0x3e76},
+			expected: "\t<- &wire.PathAbandonFrame{PathID: 3, ErrorCode: 0x3e76}\n",
+		},
+		{
+			frame:    &PathStatusFrame{PathID: 1, SequenceNumber: 2, Backup: true},
+			expected: "\t<- &wire.PathStatusFrame{PathID: 1, SequenceNumber: 2, Status: backup}\n",
+		},
+		{
+			frame:    &PathStatusFrame{PathID: 1, SequenceNumber: 3},
+			expected: "\t<- &wire.PathStatusFrame{PathID: 1, SequenceNumber: 3, Status: available}\n",
+		},
+		{
+			frame: &PathNewConnectionIDFrame{
+				PathID:              2,
+				SequenceNumber:      42,
+				RetirePriorTo:       24,
+				ConnectionID:        protocol.ParseConnectionID([]byte{0xde, 0xad, 0xbe, 0xef}),
+				StatelessResetToken: protocol.StatelessResetToken{0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf, 0x10},
+			},
+			expected: "\t<- &wire.PathNewConnectionIDFrame{PathID: 2, SequenceNumber: 42, RetirePriorTo: 24, ConnectionID: deadbeef, StatelessResetToken: 0x0102030405060708090a0b0c0d0e0f10}\n",
+		},
+		{
+			frame:    &PathRetireConnectionIDFrame{PathID: 2, SequenceNumber: 42},
+			expected: "\t<- &wire.PathRetireConnectionIDFrame{PathID: 2, SequenceNumber: 42}\n",
+		},
+		{
+			frame:    &MaxPathIDFrame{MaximumPathID: 10},
+			expected: "\t<- &wire.MaxPathIDFrame{MaximumPathID: 10}\n",
+		},
+		{
+			frame:    &PathsBlockedFrame{MaximumPathID: 10},
+			expected: "\t<- &wire.PathsBlockedFrame{MaximumPathID: 10}\n",
+		},
+		{
+			frame:    &PathCIDsBlockedFrame{PathID: 4, NextSequenceNumber: 5},
+			expected: "\t<- &wire.PathCIDsBlockedFrame{PathID: 4, NextSequenceNumber: 5}\n",
+		},
+	} {
+		buf := &bytes.Buffer{}
+		logger := setupLogTest(t, buf)
+		LogFrame(logger, tc.frame, false)
+		require.Contains(t, buf.String(), tc.expected)
+	}
+}

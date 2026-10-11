@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"fmt"
 	"io"
 	mrand "math/rand/v2"
 	"net/http"
@@ -11,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AeonDave/mp-quic-go"
+	quic "github.com/AeonDave/mp-quic-go"
 	"github.com/AeonDave/mp-quic-go/http3/qlog"
 	"github.com/AeonDave/mp-quic-go/qlogwriter"
 	"github.com/AeonDave/mp-quic-go/quicvarint"
@@ -39,7 +40,9 @@ func testClientSettings(t *testing.T, enableDatagrams bool, other map[uint64]uin
 
 	var eventRecorder events.Recorder
 	clientConn, serverConn := newConnPair(t, withClientRecorder(&eventRecorder))
-	tr.NewClientConn(clientConn)
+	cc := tr.NewClientConn(clientConn)
+	require.Equal(t, clientConn.LocalAddr(), cc.LocalAddr())
+	require.Equal(t, clientConn.RemoteAddr(), cc.RemoteAddr())
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -60,7 +63,7 @@ func testClientSettings(t *testing.T, enableDatagrams bool, other map[uint64]uin
 
 	var datagramValue *bool
 	if enableDatagrams {
-		datagramValue = pointer(true)
+		datagramValue = new(true)
 	}
 	require.Equal(t,
 		[]qlogwriter.Event{
@@ -117,6 +120,65 @@ func TestClientRequest(t *testing.T) {
 		rsp := testClientRequest(t, true, http.MethodHead, encodeResponse(t, http.StatusOK))
 		require.Equal(t, http.StatusOK, rsp.StatusCode)
 	})
+}
+
+// Responses to HEAD requests and 304 responses have no content, even if they have a Content-Length header
+// (section 8.6 of RFC 9110).
+func TestClientResponseWithoutContent(t *testing.T) {
+	for _, tc := range []struct {
+		method string
+		status int
+	}{
+		{method: http.MethodHead, status: http.StatusOK},
+		{method: http.MethodGet, status: http.StatusNotModified},
+	} {
+		t.Run(fmt.Sprintf("%s %d", tc.method, tc.status), func(t *testing.T) {
+			clientConn, serverConn := newConnPair(t)
+			req, err := http.NewRequest(tc.method, "http://quic-go.net", nil)
+			require.NoError(t, err)
+
+			errChan := make(chan error, 1)
+			go func() {
+				rsp, err := (&Transport{}).NewClientConn(clientConn).RoundTrip(req)
+				if err != nil {
+					errChan <- err
+					return
+				}
+				body, err := io.ReadAll(rsp.Body)
+				if err == nil && len(body) > 0 {
+					err = fmt.Errorf("unexpected body: %q", body)
+				}
+				errChan <- err
+			}()
+
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			str, err := serverConn.AcceptStream(ctx)
+			require.NoError(t, err)
+			str.SetReadDeadline(time.Now().Add(time.Second))
+			decodeHeader(t, str)
+
+			mockCtrl := gomock.NewController(t)
+			buf := &bytes.Buffer{}
+			rstr := NewMockDatagramStream(mockCtrl)
+			rstr.EXPECT().StreamID().Return(quic.StreamID(42)).AnyTimes()
+			rstr.EXPECT().Write(gomock.Any()).Do(buf.Write).AnyTimes()
+			rw := newResponseWriter(newStream(rstr, nil, nil, func(io.Reader, *headersFrame) error { return nil }, nil), nil, false, nil)
+			rw.Header().Set("Content-Length", "100")
+			rw.WriteHeader(tc.status)
+			rw.Flush()
+			_, err = str.Write(buf.Bytes())
+			require.NoError(t, err)
+			require.NoError(t, str.Close())
+
+			select {
+			case err := <-errChan:
+				require.NoError(t, err)
+			case <-time.After(time.Second):
+				t.Fatal("timeout")
+			}
+		})
+	}
 }
 
 func testClientRequest(t *testing.T, use0RTT bool, method string, rspBytes []byte) *http.Response {
@@ -463,13 +525,20 @@ func TestClientGzip(t *testing.T) {
 	gzippedFoobar := buf.Bytes()
 
 	t.Run("gzipped", func(t *testing.T) {
-		testClientGzip(t, gzippedFoobar, []byte("foobar"), false, true)
+		testClientGzip(t, gzippedFoobar, []byte("foobar"), false, true, http.MethodGet, http.StatusOK)
 	})
 	t.Run("not gzipped", func(t *testing.T) {
-		testClientGzip(t, []byte("foobar"), []byte("foobar"), false, false)
+		testClientGzip(t, []byte("foobar"), []byte("foobar"), false, false, http.MethodGet, http.StatusOK)
 	})
 	t.Run("disable compression", func(t *testing.T) {
-		testClientGzip(t, gzippedFoobar, gzippedFoobar, true, true)
+		testClientGzip(t, gzippedFoobar, gzippedFoobar, true, true, http.MethodGet, http.StatusOK)
+	})
+	t.Run("successful CONNECT", func(t *testing.T) {
+		rsp := testClientGzip(t, gzippedFoobar, gzippedFoobar, false, true, http.MethodConnect, http.StatusOK)
+		require.Equal(t, "gzip", rsp.Header.Get("Content-Encoding"))
+	})
+	t.Run("failed CONNECT", func(t *testing.T) {
+		testClientGzip(t, gzippedFoobar, []byte("foobar"), false, true, http.MethodConnect, http.StatusBadRequest)
 	})
 }
 
@@ -478,13 +547,15 @@ func testClientGzip(t *testing.T,
 	expectedRsp []byte,
 	transportDisableCompression bool,
 	responseAddContentEncoding bool,
-) {
+	method string,
+	status int,
+) *http.Response {
 	var rspBuf bytes.Buffer
 	rstr := NewMockDatagramStream(gomock.NewController(t))
 	rstr.EXPECT().StreamID().Return(quic.StreamID(42)).AnyTimes()
 	rstr.EXPECT().Write(gomock.Any()).Do(rspBuf.Write).AnyTimes()
 	rw := newResponseWriter(newStream(rstr, nil, nil, func(io.Reader, *headersFrame) error { return nil }, nil), nil, false, nil)
-	rw.WriteHeader(http.StatusOK)
+	rw.WriteHeader(status)
 	if responseAddContentEncoding {
 		rw.header.Add("Content-Encoding", "gzip")
 	}
@@ -500,7 +571,7 @@ func testClientGzip(t *testing.T,
 	resultChan := make(chan result)
 	go func() {
 		cc := (&Transport{DisableCompression: transportDisableCompression}).NewClientConn(clientConn)
-		rsp, err := cc.RoundTrip(httptest.NewRequest(http.MethodGet, "http://quic-go.net", nil))
+		rsp, err := cc.RoundTrip(httptest.NewRequest(method, "http://quic-go.net", nil))
 		resultChan <- result{rsp: rsp, err: err}
 	}()
 
@@ -531,10 +602,11 @@ func testClientGzip(t *testing.T,
 		t.Fatal("timeout")
 	}
 
-	require.Equal(t, http.StatusOK, rsp.StatusCode)
+	require.Equal(t, status, rsp.StatusCode)
 	body, err := io.ReadAll(rsp.Body)
 	require.NoError(t, err)
 	require.Equal(t, expectedRsp, body)
+	return rsp
 }
 
 func TestClientRequestCancellation(t *testing.T) {
@@ -615,16 +687,7 @@ func testClientConnGoAway(t *testing.T, withStream bool) {
 		case <-time.After(scaleDuration(10 * time.Millisecond)):
 		}
 
-		// the stream ID in the GOAWAY frame is 8, so it's possible to open stream 4
-		str2, err := cc.OpenRequestStream(context.Background())
-		require.NoError(t, err)
-		str2.Close()
-		str2.CancelRead(1337)
-
-		// it's not possible to open stream 8
-		_, err = cc.OpenRequestStream(context.Background())
-		require.ErrorIs(t, err, errGoAway)
-
+		// GOAWAY allows the request that was already open to finish.
 		str.Close()
 		str.CancelRead(1337)
 	}
@@ -652,8 +715,8 @@ func testClientConnGoAway(t *testing.T, withStream bool) {
 	)
 }
 
-func TestClientConnGoConcurrent(t *testing.T) {
-	clientConn, serverConn := newConnPair(t, withServerBidiStreamLimit(1)) // allows streams 0
+func TestClientConnGoAwayConcurrent(t *testing.T) {
+	clientConn, serverConn := newConnPair(t, withServerBidiStreamLimit(2)) // allows streams 0 and 4
 
 	cc := (&Transport{}).NewClientConn(clientConn)
 
@@ -671,8 +734,24 @@ func TestClientConnGoConcurrent(t *testing.T) {
 	case <-time.After(scaleDuration(10 * time.Millisecond)):
 	}
 
-	// of these 2 OpenStreamSync calls, one will succeed, the other one will block
-	errChan := make(chan error, 3)
+	// Consume both streams the server allows, but keep their receive sides open.
+	for range 2 {
+		str, err := cc.OpenRequestStream(context.Background())
+		require.NoError(t, err)
+		require.NoError(t, str.Close())
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	sstr0, err := serverConn.AcceptStream(ctx)
+	require.NoError(t, err)
+	require.Equal(t, quic.StreamID(0), sstr0.StreamID())
+	sstr4, err := serverConn.AcceptStream(ctx)
+	require.NoError(t, err)
+	require.Equal(t, quic.StreamID(4), sstr4.StreamID())
+
+	// Both of these calls will block in OpenStreamSync.
+	errChan := make(chan error, 2)
 	for range 2 {
 		go func() {
 			str, err := cc.OpenRequestStream(context.Background())
@@ -683,56 +762,89 @@ func TestClientConnGoConcurrent(t *testing.T) {
 		}()
 	}
 
-	// wait until all Goroutines have started
-	time.Sleep(scaleDuration(10 * time.Millisecond))
-
-	select {
-	case err := <-errChan:
-		require.NoError(t, err)
-	case <-time.After(time.Second):
-		t.Fatal("timeout")
-	}
-	// the second stream is still blocked
 	select {
 	case <-errChan:
-		t.Fatal("second OpenStreamSync should have blocked")
+		t.Fatal("OpenStreamSync calls should have blocked")
 	case <-time.After(scaleDuration(10 * time.Millisecond)):
 	}
 
-	// send the GOAWAY frame
-	b = (&goAwayFrame{StreamID: 4}).Append(nil)
+	// Send a GOAWAY with a stream ID higher than the next stream ID.
+	b = (&goAwayFrame{StreamID: 12}).Append(nil)
 	_, err = controlStr.Write(b)
 	require.NoError(t, err)
 
-	// accepting and closing the stream allows the client to open another stream
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	sstr, err := serverConn.AcceptStream(ctx)
-	require.NoError(t, err)
-	sstr.Close()
-	sstr.CancelRead(1337)
-
-	// The second stream is opened by the client,
-	// and immediately closed with a H3_REQUEST_CANCELED error.
-	select {
-	case err := <-errChan:
-		require.ErrorIs(t, err, errGoAway)
-	case <-time.After(scaleDuration(10 * time.Millisecond)):
-		t.Fatal("timeout")
+	// The GOAWAY stream ID only applies to requests already in flight. Even though
+	// stream 8 would be below the limit, no new request stream may be opened.
+	for range 2 {
+		select {
+		case err := <-errChan:
+			require.ErrorIs(t, err, errGoAway)
+		case <-time.After(time.Second):
+			t.Fatal("timeout")
+		}
 	}
 
-	sstr, err = serverConn.AcceptStream(ctx)
-	require.NoError(t, err)
-	_, err = sstr.Read([]byte{0})
-	require.ErrorIs(t, err, &quic.StreamError{StreamID: 4, ErrorCode: quic.StreamErrorCode(ErrCodeRequestCanceled), Remote: true})
+	// The streams opened before GOAWAY are not canceled.
+	buf := make([]byte, 1)
+	_, err = sstr0.Read(buf)
+	require.ErrorIs(t, err, io.EOF)
+	_, err = sstr4.Read(buf)
+	require.ErrorIs(t, err, io.EOF)
+
+	// Complete stream 0 to free stream credit, while stream 4 keeps the connection alive.
+	require.NoError(t, sstr0.Close())
+
+	// Calls made after receiving GOAWAY fail even when stream credit is available.
+	openCtx, openCancel := context.WithTimeout(context.Background(), time.Second)
+	defer openCancel()
+	_, err = cc.OpenRequestStream(openCtx)
+	require.ErrorIs(t, err, errGoAway)
+
+	// In particular, the client didn't open and cancel stream 8 behind the caller's back.
+	noStreamCtx, noStreamCancel := context.WithTimeout(context.Background(), scaleDuration(10*time.Millisecond))
+	defer noStreamCancel()
+	_, err = serverConn.AcceptStream(noStreamCtx)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+
+	require.NoError(t, sstr4.Close())
 }
 
 func TestClientConnGoAwayFailures(t *testing.T) {
 	t.Run("invalid frame", func(t *testing.T) {
 		b := (&settingsFrame{}).Append(nil)
-		// 1337 is invalid value for the Extended CONNECT setting
-		b = (&settingsFrame{Other: map[uint64]uint64{settingExtendedConnect: 1337}}).Append(b)
+		// a GOAWAY frame with a payload that is longer than the stream ID
+		b = quicvarint.Append(b, 0x7)
+		b = quicvarint.Append(b, 2)
+		b = append(b, 0, 0)
 		testClientConnGoAwayFailures(t, b, nil, ErrCodeFrameError)
+	})
+
+	t.Run("second SETTINGS", func(t *testing.T) {
+		b := (&settingsFrame{}).Append(nil)
+		b = (&settingsFrame{}).Append(b)
+		testClientConnGoAwayFailures(t, b, nil, ErrCodeFrameUnexpected)
+	})
+
+	// section 7.2.7 of RFC 9114
+	t.Run("MAX_PUSH_ID", func(t *testing.T) {
+		b := (&settingsFrame{}).Append(nil)
+		b = (&maxPushIDFrame{PushID: 1}).Append(b)
+		testClientConnGoAwayFailures(t, b, nil, ErrCodeFrameUnexpected)
+	})
+
+	// The client never sends MAX_PUSH_ID, so the push ID is larger than the maximum push ID,
+	// see section 7.2.3 of RFC 9114.
+	t.Run("CANCEL_PUSH", func(t *testing.T) {
+		b := (&settingsFrame{}).Append(nil)
+		b = (&cancelPushFrame{PushID: 0}).Append(b)
+		testClientConnGoAwayFailures(t, b, nil, ErrCodeIDError)
+	})
+
+	// section 7.2.5 of RFC 9114: PUSH_PROMISE frames are sent on request streams
+	t.Run("PUSH_PROMISE", func(t *testing.T) {
+		b := (&settingsFrame{}).Append(nil)
+		b = appendPushPromiseFrame(b, 0)
+		testClientConnGoAwayFailures(t, b, nil, ErrCodeFrameUnexpected)
 	})
 
 	t.Run("not a GOAWAY", func(t *testing.T) {
@@ -874,4 +986,248 @@ func TestRawClientConnHandleUnidirectionalStream(t *testing.T) {
 		t.Fatal("timeout waiting for settings")
 	}
 	require.NotNil(t, cc.Settings())
+}
+
+// Malformed responses MUST be treated as a stream error, see section 4.1.2 of RFC 9114.
+// This also applies to malformed trailers.
+func TestClientResponseTrailerValidation(t *testing.T) {
+	for _, tt := range trailerValidationTests(t) {
+		t.Run(tt.name, func(t *testing.T) {
+			clientConn, serverConn := newConnPair(t)
+			cc := (&Transport{MaxResponseHeaderBytes: tt.maxHeaderBytes}).NewClientConn(clientConn)
+			errChan := make(chan error, 1)
+			go func() {
+				rsp, err := cc.RoundTrip(httptest.NewRequest(http.MethodGet, "http://quic-go.net", nil))
+				if err != nil {
+					errChan <- err
+					return
+				}
+				_, err = io.ReadAll(rsp.Body)
+				errChan <- err
+			}()
+
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			str, err := serverConn.AcceptStream(ctx)
+			require.NoError(t, err)
+			rsp := encodeResponse(t, http.StatusOK)
+			rsp = append(rsp, (&dataFrame{Length: 6}).Append(nil)...)
+			rsp = append(rsp, []byte("foobar")...)
+			_, err = str.Write(append(rsp, tt.trailer...))
+			require.NoError(t, err)
+
+			select {
+			case err := <-errChan:
+				require.Error(t, err)
+			case <-time.After(time.Second):
+				t.Fatal("timeout")
+			}
+			expectStreamWriteReset(t, str, quic.StreamErrorCode(tt.errCode))
+			// The client closes the stream after sending the request,
+			// so we need to wait for the RESET_STREAM frame to be received.
+			time.Sleep(scaleDuration(10 * time.Millisecond))
+			expectStreamReadReset(t, str, quic.StreamErrorCode(tt.errCode))
+		})
+	}
+}
+
+// testClientResponseConnError sends the response, and expects the client to close the connection.
+// The response body is read if the client receives the response headers.
+func testClientResponseConnError(t *testing.T, rsp []byte, errCode ErrCode) (body []byte, trailer http.Header) {
+	t.Helper()
+	return testClientResponseConnErrorForRequest(t, httptest.NewRequest(http.MethodGet, "http://quic-go.net", nil), rsp, errCode)
+}
+
+func testClientResponseConnErrorForRequest(t *testing.T, req *http.Request, rsp []byte, errCode ErrCode) (body []byte, trailer http.Header) {
+	t.Helper()
+
+	clientConn, serverConn := newConnPair(t)
+	cc := (&Transport{}).NewClientConn(clientConn)
+	type result struct {
+		body    []byte
+		trailer http.Header
+		err     error
+	}
+	resultChan := make(chan result, 1)
+	go func() {
+		rsp, err := cc.RoundTrip(req)
+		if err != nil {
+			resultChan <- result{err: err}
+			return
+		}
+		body, err := io.ReadAll(rsp.Body)
+		resultChan <- result{body: body, trailer: rsp.Trailer, err: err}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	str, err := serverConn.AcceptStream(ctx)
+	require.NoError(t, err)
+	_, err = str.Write(rsp)
+	require.NoError(t, err)
+
+	var res result
+	select {
+	case res = <-resultChan:
+		require.Error(t, res.err)
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+	expectConnClosedByPeer(t, serverConn, errCode)
+	return res.body, res.trailer
+}
+
+// Some QPACK decoding errors MUST be treated as a connection error,
+// see sections 2.2.3, 3.1 and 4.5.1.1 of RFC 9204.
+func TestClientResponseHeadersQPACKConnectionError(t *testing.T) {
+	for _, tt := range qpackConnectionErrorTests {
+		t.Run(tt.name, func(t *testing.T) {
+			testClientResponseConnError(t, encodeHeadersFrame(tt.fieldSection), ErrCodeQPACKDecompressionFailed)
+		})
+	}
+}
+
+func TestClientResponseTrailersQPACKConnectionError(t *testing.T) {
+	for _, tt := range qpackConnectionErrorTests {
+		t.Run(tt.name, func(t *testing.T) {
+			rsp := encodeResponse(t, http.StatusOK)
+			rsp = append(rsp, getDataFrame([]byte("foobar"))...)
+			rsp = append(rsp, encodeHeadersFrame(tt.fieldSection)...)
+			body, _ := testClientResponseConnError(t, rsp, ErrCodeQPACKDecompressionFailed)
+			require.Equal(t, []byte("foobar"), body)
+		})
+	}
+}
+
+// Once the CONNECT method has completed, only DATA frames are allowed on the stream.
+// Receipt of a HEADERS frame MUST be treated as a connection error of type H3_FRAME_UNEXPECTED,
+// see section 4.4 of RFC 9114.
+func TestClientHeadersOnConnectStream(t *testing.T) {
+	req, err := http.NewRequest(http.MethodConnect, "https://quic-go.net:443", nil)
+	require.NoError(t, err)
+	rsp := encodeResponse(t, http.StatusOK)
+	rsp = append(rsp, getDataFrame([]byte("foobar"))...)
+	rsp = append(rsp, encodeTrailerFrame(t, qpack.HeaderField{Name: "foo", Value: "bar"})...)
+	body, trailer := testClientResponseConnErrorForRequest(t, req, rsp, ErrCodeFrameUnexpected)
+	require.Equal(t, []byte("foobar"), body)
+	require.Empty(t, trailer)
+}
+
+// A CONNECT request that failed is an ordinary request: the response can have trailers.
+func TestClientTrailersAfterFailedConnect(t *testing.T) {
+	clientConn, serverConn := newConnPair(t)
+	cc := (&Transport{}).NewClientConn(clientConn)
+	type result struct {
+		status  int
+		body    []byte
+		trailer http.Header
+		err     error
+	}
+	resultChan := make(chan result, 1)
+	go func() {
+		req, err := http.NewRequest(http.MethodConnect, "https://quic-go.net:443", nil)
+		if err != nil {
+			resultChan <- result{err: err}
+			return
+		}
+		rsp, err := cc.RoundTrip(req)
+		if err != nil {
+			resultChan <- result{err: err}
+			return
+		}
+		body, err := io.ReadAll(rsp.Body)
+		resultChan <- result{status: rsp.StatusCode, body: body, trailer: rsp.Trailer, err: err}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	str, err := serverConn.AcceptStream(ctx)
+	require.NoError(t, err)
+	rsp := encodeResponse(t, http.StatusForbidden)
+	rsp = append(rsp, getDataFrame([]byte("foobar"))...)
+	rsp = append(rsp, encodeTrailerFrame(t, qpack.HeaderField{Name: "foo", Value: "bar"})...)
+	_, err = str.Write(rsp)
+	require.NoError(t, err)
+	require.NoError(t, str.Close())
+
+	select {
+	case res := <-resultChan:
+		require.NoError(t, res.err)
+		require.Equal(t, http.StatusForbidden, res.status)
+		require.Equal(t, []byte("foobar"), res.body)
+		require.Equal(t, http.Header{"Foo": []string{"bar"}}, res.trailer)
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+}
+
+// A field section that doesn't reference the dynamic table can use any value for the Base,
+// see section 4.5.1.2 of RFC 9204.
+func TestClientResponseHeadersNonZeroBase(t *testing.T) {
+	fieldSection := encodeFieldSection(t, qpack.HeaderField{Name: ":status", Value: "418"})
+	require.Equal(t, []byte{0x00, 0x00}, fieldSection[:2])
+	fieldSection[1] = 0x05 // Sign 0, Delta Base 5
+	rsp := testClientRequest(t, false, http.MethodGet, encodeHeadersFrame(fieldSection))
+	require.Equal(t, http.StatusTeapot, rsp.StatusCode)
+}
+
+// A DATA or HEADERS frame after the trailing HEADERS frame MUST be treated
+// as a connection error of type H3_FRAME_UNEXPECTED, see section 4.1 of RFC 9114.
+func TestClientFramesAfterResponseTrailers(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		frame []byte
+	}{
+		{name: "DATA", frame: getDataFrame([]byte("foo"))},
+		{name: "HEADERS", frame: encodeTrailerFrame(t, qpack.HeaderField{Name: "bar", Value: "baz"})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rsp := encodeResponse(t, http.StatusOK)
+			rsp = append(rsp, getDataFrame([]byte("foobar"))...)
+			rsp = append(rsp, encodeTrailerFrame(t, qpack.HeaderField{Name: "foo", Value: "bar"})...)
+			rsp = append(rsp, tc.frame...)
+			body, trailer := testClientResponseConnError(t, rsp, ErrCodeFrameUnexpected)
+			require.Equal(t, []byte("foobar"), body)
+			require.Equal(t, http.Header{"Foo": []string{"bar"}}, trailer)
+		})
+	}
+}
+
+// appendPushPromiseFrame appends a PUSH_PROMISE frame with an empty field section.
+func appendPushPromiseFrame(b []byte, pushID uint64) []byte {
+	b = quicvarint.Append(b, 0x5)
+	b = quicvarint.Append(b, uint64(quicvarint.Len(pushID)+2))
+	b = quicvarint.Append(b, pushID)
+	return append(b, 0, 0) // field section prefix
+}
+
+// The client never sends MAX_PUSH_ID, so a PUSH_PROMISE frame is a connection error of type H3_ID_ERROR
+// (section 4.6 of RFC 9114). CANCEL_PUSH and MAX_PUSH_ID frames are only sent on the control stream
+// (sections 7.2.3 and 7.2.7 of RFC 9114).
+func TestClientPushFramesOnRequestStream(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		frame   []byte
+		errCode ErrCode
+	}{
+		{name: "PUSH_PROMISE", frame: appendPushPromiseFrame(nil, 0), errCode: ErrCodeIDError},
+		{name: "CANCEL_PUSH", frame: (&cancelPushFrame{PushID: 0}).Append(nil), errCode: ErrCodeFrameUnexpected},
+		{name: "MAX_PUSH_ID", frame: (&maxPushIDFrame{PushID: 0}).Append(nil), errCode: ErrCodeFrameUnexpected},
+		// A frame that is not allowed on the stream is unexpected, even if it is malformed.
+		{name: "CANCEL_PUSH without payload", frame: []byte{0x3, 0x0}, errCode: ErrCodeFrameUnexpected},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Run("before HEADERS", func(t *testing.T) {
+				testClientResponseConnError(t, append(tc.frame, encodeResponse(t, http.StatusOK)...), tc.errCode)
+			})
+			t.Run("in the body", func(t *testing.T) {
+				rsp := encodeResponse(t, http.StatusOK)
+				rsp = append(rsp, getDataFrame([]byte("foo"))...)
+				rsp = append(rsp, tc.frame...)
+				rsp = append(rsp, getDataFrame([]byte("bar"))...)
+				body, _ := testClientResponseConnError(t, rsp, tc.errCode)
+				require.Equal(t, []byte("foo"), body)
+			})
+		})
+	}
 }

@@ -8,11 +8,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/AeonDave/mp-quic-go"
+	quic "github.com/AeonDave/mp-quic-go"
 	"github.com/AeonDave/mp-quic-go/http3/qlog"
 	"github.com/AeonDave/mp-quic-go/qlogwriter"
 	"github.com/AeonDave/mp-quic-go/testutils/events"
@@ -40,7 +41,7 @@ func TestStreamReadDataFrames(t *testing.T) {
 	clientConn, _ := newConnPair(t, withClientRecorder(&eventRecorder))
 	str := newStream(
 		qstr,
-		newRawConn(clientConn, false, nil, nil, &eventRecorder, nil),
+		newRawConn(clientConn, false, nil, nopControlStrHandler, &eventRecorder, nil),
 		nil,
 		func(io.Reader, *headersFrame) error { return nil },
 		&eventRecorder,
@@ -108,7 +109,7 @@ func TestStreamInvalidFrame(t *testing.T) {
 
 	str := newStream(
 		qstr,
-		newRawConn(clientConn, false, nil, nil, nil, nil),
+		newRawConn(clientConn, false, nil, nopControlStrHandler, nil, nil),
 		nil,
 		func(io.Reader, *headersFrame) error { return nil },
 		nil,
@@ -125,6 +126,91 @@ func TestStreamInvalidFrame(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timeout")
 	}
+}
+
+// A stream that ends in the middle of a frame is a connection error of type H3_FRAME_ERROR
+// (section 7.1 of RFC 9114).
+func TestStreamTruncatedFrame(t *testing.T) {
+	t.Run("DATA frame", func(t *testing.T) {
+		b := (&dataFrame{Length: 6}).Append(nil)
+		testStreamTruncatedFrame(t, append(b, []byte("foo")...), "foo")
+	})
+	t.Run("frame header", func(t *testing.T) {
+		b := (&dataFrame{Length: 3}).Append(nil)
+		b = append(b, []byte("foo")...)
+		b = append(b, 0) // the type of the next frame, but no length
+		testStreamTruncatedFrame(t, b, "foo")
+	})
+	t.Run("trailers", func(t *testing.T) {
+		b := (&dataFrame{Length: 3}).Append(nil)
+		b = append(b, []byte("foo")...)
+		b = (&headersFrame{Length: 10}).Append(b)
+		testStreamTruncatedFrame(t, append(b, 1, 2, 3), "foo")
+	})
+}
+
+func testStreamTruncatedFrame(t *testing.T, data []byte, expected string) {
+	buf := bytes.NewBuffer(data)
+	mockCtrl := gomock.NewController(t)
+	qstr := NewMockDatagramStream(mockCtrl)
+	qstr.EXPECT().StreamID().Return(quic.StreamID(42)).AnyTimes()
+	qstr.EXPECT().Read(gomock.Any()).DoAndReturn(buf.Read).AnyTimes()
+	clientConn, serverConn := newConnPair(t)
+
+	str := newStream(
+		qstr,
+		newRawConn(clientConn, false, nil, nopControlStrHandler, nil, nil),
+		nil,
+		func(r io.Reader, hf *headersFrame) error {
+			_, err := io.ReadFull(r, make([]byte, hf.Length))
+			return err
+		},
+		nil,
+	)
+	b, err := io.ReadAll(str)
+	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+	require.Equal(t, expected, string(b))
+
+	select {
+	case <-serverConn.Context().Done():
+		var appErr *quic.ApplicationError
+		require.ErrorAs(t, context.Cause(serverConn.Context()), &appErr)
+		require.Equal(t, quic.ApplicationErrorCode(ErrCodeFrameError), appErr.ErrorCode)
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+}
+
+// If a write failed, the last frame might be incomplete, so the stream is reset instead of being closed
+// (section 7.1 of RFC 9114).
+func TestStreamCloseAfterFailedWrite(t *testing.T) {
+	t.Run("successful writes", func(t *testing.T) {
+		mockCtrl := gomock.NewController(t)
+		qstr := NewMockDatagramStream(mockCtrl)
+		qstr.EXPECT().StreamID().Return(quic.StreamID(42)).AnyTimes()
+		qstr.EXPECT().Write(gomock.Any()).DoAndReturn(func(b []byte) (int, error) { return len(b), nil }).Times(2)
+		qstr.EXPECT().Close()
+		str := newStream(qstr, nil, nil, func(io.Reader, *headersFrame) error { return nil }, nil)
+		_, err := str.Write([]byte("foobar"))
+		require.NoError(t, err)
+		require.NoError(t, str.Close())
+	})
+
+	t.Run("failed write", func(t *testing.T) {
+		mockCtrl := gomock.NewController(t)
+		qstr := NewMockDatagramStream(mockCtrl)
+		qstr.EXPECT().StreamID().Return(quic.StreamID(42)).AnyTimes()
+		gomock.InOrder(
+			qstr.EXPECT().Write(gomock.Any()).DoAndReturn(func(b []byte) (int, error) { return len(b), nil }),
+			qstr.EXPECT().Write(gomock.Any()).Return(3, os.ErrDeadlineExceeded),
+		)
+		qstr.EXPECT().CancelWrite(quic.StreamErrorCode(ErrCodeRequestCanceled))
+		str := newStream(qstr, nil, nil, func(io.Reader, *headersFrame) error { return nil }, nil)
+		n, err := str.Write([]byte("foobar"))
+		require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+		require.Equal(t, 3, n)
+		require.NoError(t, str.Close())
+	})
 }
 
 func TestStreamWrite(t *testing.T) {
@@ -175,6 +261,31 @@ func TestStreamWrite(t *testing.T) {
 	)
 }
 
+func TestStreamTryWriteAll(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	qstr := NewMockDatagramStream(mockCtrl)
+	qstr.EXPECT().StreamID().Return(quic.StreamID(42)).AnyTimes()
+	qstr.EXPECT().TryWriteAll(getDataFrame([]byte("foobar"))).Return(nil)
+	qstr.EXPECT().TryWriteAll(getDataFrame([]byte("blocked"))).Return(quic.ErrWouldBlock)
+
+	var eventRecorder events.Recorder
+	str := newStream(qstr, nil, nil, func(io.Reader, *headersFrame) error { return nil }, &eventRecorder)
+	require.NoError(t, str.TryWriteAll([]byte("foobar")))
+	require.ErrorIs(t, str.TryWriteAll([]byte("blocked")), quic.ErrWouldBlock)
+
+	frameLen, payloadLen := expectedFrameLength(t, &dataFrame{Length: 6})
+	require.Equal(t,
+		[]qlogwriter.Event{
+			qlog.FrameCreated{
+				StreamID: 42,
+				Raw:      qlog.RawInfo{Length: frameLen, PayloadLength: payloadLen},
+				Frame:    qlog.Frame{Frame: qlog.DataFrame{}},
+			},
+		},
+		eventRecorder.Events(qlog.FrameCreated{}),
+	)
+}
+
 func TestRequestStream(t *testing.T) {
 	mockCtrl := gomock.NewController(t)
 	qstr := NewMockDatagramStream(mockCtrl)
@@ -184,7 +295,7 @@ func TestRequestStream(t *testing.T) {
 	str := newRequestStream(
 		newStream(
 			qstr,
-			newRawConn(clientConn, false, nil, nil, nil, nil),
+			newRawConn(clientConn, false, nil, nopControlStrHandler, nil, nil),
 			&httptrace.ClientTrace{},
 			func(io.Reader, *headersFrame) error { return nil },
 			nil,
@@ -201,6 +312,10 @@ func TestRequestStream(t *testing.T) {
 	require.EqualError(t, err, "http3: invalid use of RequestStream.Read before ReadResponse")
 	_, err = str.Write([]byte{0})
 	require.EqualError(t, err, "http3: invalid use of RequestStream.Write before SendRequestHeader")
+	require.EqualError(t,
+		str.TryWriteAll([]byte{0}),
+		"http3: invalid use of RequestStream.TryWriteAll before SendRequestHeader",
+	)
 
 	// calling ReadResponse before SendRequestHeader is not valid
 	_, err = str.ReadResponse()
@@ -218,6 +333,8 @@ func TestRequestStream(t *testing.T) {
 	require.NoError(t, str.SendRequestHeader(req))
 	// duplicate calls are not allowed
 	require.EqualError(t, str.SendRequestHeader(req), "http3: invalid duplicate use of RequestStream.SendRequestHeader")
+	qstr.EXPECT().TryWriteAll(getDataFrame([]byte("request body"))).Return(nil)
+	require.NoError(t, str.TryWriteAll([]byte("request body")))
 
 	buf := bytes.NewBuffer(encodeResponse(t, http.StatusOK))
 	buf.Write((&dataFrame{Length: 6}).Append(nil))

@@ -105,7 +105,7 @@ func NewMultiSocketManager(cfg MultiSocketManagerConfig) (*MultiSocketManager, e
 		logger:          logger,
 	}
 
-	m.startReader(raw, m.baseConn.LocalAddr())
+	m.startReader(raw, m.baseConn.LocalAddr(), true)
 
 	if len(cfg.LocalAddrs) > 0 {
 		if err := m.SetLocalAddrs(cfg.LocalAddrs); err != nil {
@@ -157,10 +157,23 @@ func (m *MultiSocketManager) AddLocalAddr(ip net.IP) (*net.UDPAddr, error) {
 	}
 
 	m.mu.Lock()
+	select {
+	case <-m.closeCh:
+		m.mu.Unlock()
+		_ = conn.Close()
+		return nil, net.ErrClosed
+	default:
+	}
+	// Another call might have added a socket for the same address in the meantime.
+	if existing, exists := m.conns[key]; exists {
+		m.mu.Unlock()
+		_ = conn.Close()
+		return existing.localAddr, nil
+	}
 	m.conns[key] = socket
 	m.mu.Unlock()
 
-	m.startReader(raw, local)
+	m.startReader(raw, local, false)
 	return local, nil
 }
 
@@ -257,14 +270,32 @@ func (m *MultiSocketManager) refreshLoop(interval time.Duration) {
 	}
 }
 
-func (m *MultiSocketManager) startReader(conn rawConn, local net.Addr) {
+// startReader starts a goroutine reading packets from a socket.
+// Only errors on the base socket are returned from ReadPacket.
+// Errors on additional sockets (e.g. because the socket was removed) only stop reading from that socket:
+// returning them would close the Transport.
+func (m *MultiSocketManager) startReader(conn rawConn, local net.Addr, isBase bool) {
 	go func() {
 		for {
 			p, err := conn.ReadPacket()
 			if err != nil {
-				select {
-				case m.readErrs <- err:
-				default:
+				// Windows returns an error when receiving a UDP datagram that doesn't fit into the provided buffer.
+				if isRecvMsgSizeErr(err) {
+					continue
+				}
+				nerr, ok := err.(net.Error)
+				//nolint:staticcheck // SA1019: same handling as in Transport.listen
+				temporary := ok && nerr.Temporary() && !nerr.Timeout()
+				if isBase {
+					select {
+					case m.readErrs <- err:
+					default:
+					}
+				} else if !errors.Is(err, net.ErrClosed) {
+					m.logger.Debugf("multi-socket: error reading from %s: %s", local, err)
+				}
+				if temporary {
+					continue
 				}
 				return
 			}
@@ -299,18 +330,9 @@ func (m *MultiSocketManager) ReadPacket() (receivedPacket, error) {
 }
 
 func (m *MultiSocketManager) WritePacket(b []byte, addr net.Addr, packetInfoOOB []byte, gsoSize uint16, ecn protocol.ECN) (int, error) {
-	// If no explicit packet info is provided, try to derive it from the destination address.
-	// This is important for multipath: the MultiSocketManager selects the socket to send from
-	// based on the packetInfo.addr.
-	if len(packetInfoOOB) == 0 {
-		if udp, ok := addr.(*net.UDPAddr); ok {
-			var info packetInfo
-			if parsed, ok := netip.AddrFromSlice(udp.IP); ok {
-				info.addr = parsed.Unmap()
-				packetInfoOOB = info.OOB()
-			}
-		}
-	}
+	// The packet info OOB data selects the *local* (source) address.
+	// It must not be derived from the destination address: the kernel rejects
+	// a non-local source address. Use WritePacketWithInfo to send from a specific local address.
 	return m.baseRawConn.WritePacket(b, addr, packetInfoOOB, gsoSize, ecn)
 }
 
@@ -377,8 +399,6 @@ func (m *MultiSocketManager) ReadFrom(b []byte) (n int, addr net.Addr, err error
 }
 
 func (m *MultiSocketManager) WriteTo(b []byte, addr net.Addr) (int, error) {
-	// Prefer going through WritePacket so we can apply the same destination-based
-	// packetInfo selection logic (important for multipath / multi-socket setups).
 	return m.WritePacket(b, addr, nil, 0, protocol.ECNUnsupported)
 }
 

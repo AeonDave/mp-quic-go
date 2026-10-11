@@ -37,14 +37,18 @@ type packetUnpacker struct {
 	cs handshake.CryptoSetup
 
 	shortHdrConnIDLen int
+	// set if the grease_quic_bit transport parameter is sent (RFC 9287):
+	// short header packets with the QUIC Bit set to 0 are accepted
+	allowGreasedQUICBit bool
 }
 
 var _ unpacker = &packetUnpacker{}
 
-func newPacketUnpacker(cs handshake.CryptoSetup, shortHdrConnIDLen int) *packetUnpacker {
+func newPacketUnpacker(cs handshake.CryptoSetup, shortHdrConnIDLen int, allowGreasedQUICBit bool) *packetUnpacker {
 	return &packetUnpacker{
-		cs:                cs,
-		shortHdrConnIDLen: shortHdrConnIDLen,
+		cs:                  cs,
+		shortHdrConnIDLen:   shortHdrConnIDLen,
+		allowGreasedQUICBit: allowGreasedQUICBit,
 	}
 }
 
@@ -60,7 +64,7 @@ func (u *packetUnpacker) UnpackLongHeader(hdr *wire.Header, data []byte) (*unpac
 	switch hdr.Type {
 	case protocol.PacketTypeInitial:
 		encLevel = protocol.EncryptionInitial
-		opener, err := u.cs.GetInitialOpener()
+		opener, err := u.cs.GetInitialOpener(hdr.Version)
 		if err != nil {
 			return nil, err
 		}
@@ -106,12 +110,16 @@ func (u *packetUnpacker) UnpackLongHeader(hdr *wire.Header, data []byte) (*unpac
 	}, nil
 }
 
-func (u *packetUnpacker) UnpackShortHeader(rcvTime monotime.Time, data []byte) (protocol.PacketNumber, protocol.PacketNumberLen, protocol.KeyPhaseBit, []byte, error) {
+// UnpackShortHeader unpacks a 1-RTT packet.
+// With IETF Multipath QUIC, packet numbers are decoded in the packet number space of the path,
+// and the nonce contains the path ID (section 2.4 of draft-ietf-quic-multipath-21).
+// For path 0, this is the same as without IETF Multipath QUIC.
+func (u *packetUnpacker) UnpackShortHeader(rcvTime monotime.Time, data []byte, pathID protocol.PathID) (protocol.PacketNumber, protocol.PacketNumberLen, protocol.KeyPhaseBit, []byte, error) {
 	opener, err := u.cs.Get1RTTOpener()
 	if err != nil {
 		return 0, 0, 0, nil, err
 	}
-	pn, pnLen, kp, decrypted, err := u.unpackShortHeaderPacket(opener, rcvTime, data)
+	pn, pnLen, kp, decrypted, err := u.unpackShortHeaderPacket(opener, rcvTime, data, pathID)
 	if err != nil {
 		return 0, 0, 0, nil, err
 	}
@@ -144,7 +152,7 @@ func (u *packetUnpacker) unpackLongHeaderPacket(opener handshake.LongHeaderOpene
 	return extHdr, decrypted, nil
 }
 
-func (u *packetUnpacker) unpackShortHeaderPacket(opener handshake.ShortHeaderOpener, rcvTime monotime.Time, data []byte) (protocol.PacketNumber, protocol.PacketNumberLen, protocol.KeyPhaseBit, []byte, error) {
+func (u *packetUnpacker) unpackShortHeaderPacket(opener handshake.ShortHeaderOpener, rcvTime monotime.Time, data []byte, pathID protocol.PathID) (protocol.PacketNumber, protocol.PacketNumberLen, protocol.KeyPhaseBit, []byte, error) {
 	l, pn, pnLen, kp, parseErr := u.unpackShortHeader(opener, data)
 	// If the reserved bits are set incorrectly, we still need to continue unpacking.
 	// This avoids a timing side-channel, which otherwise might allow an attacker
@@ -152,8 +160,15 @@ func (u *packetUnpacker) unpackShortHeaderPacket(opener handshake.ShortHeaderOpe
 	if parseErr != nil && parseErr != wire.ErrInvalidReservedBits {
 		return 0, 0, 0, nil, &headerParseError{parseErr}
 	}
-	pn = opener.DecodePacketNumber(pn, pnLen)
-	decrypted, err := opener.Open(data[l:l], data[l:], rcvTime, pn, kp, data[:l])
+	var decrypted []byte
+	var err error
+	if pathID == 0 {
+		pn = opener.DecodePacketNumber(pn, pnLen)
+		decrypted, err = opener.Open(data[l:l], data[l:], rcvTime, pn, kp, data[:l])
+	} else {
+		pn = opener.DecodePacketNumberForPath(pathID, pn, pnLen)
+		decrypted, err = opener.OpenForPath(data[l:l], data[l:], rcvTime, pathID, pn, kp, data[:l])
+	}
 	if err != nil {
 		return 0, 0, 0, nil, err
 	}
@@ -174,7 +189,11 @@ func (u *packetUnpacker) unpackShortHeader(hd headerDecryptor, data []byte) (int
 		data[hdrLen:hdrLen+4],
 	)
 	// 3. parse the header (and learn the actual length of the packet number)
-	l, pn, pnLen, kp, parseErr := wire.ParseShortHeader(data, u.shortHdrConnIDLen)
+	parseShortHeader := wire.ParseShortHeader
+	if u.allowGreasedQUICBit {
+		parseShortHeader = wire.ParseShortHeaderWithGreasedQUICBit
+	}
+	l, pn, pnLen, kp, parseErr := parseShortHeader(data, u.shortHdrConnIDLen)
 	if parseErr != nil && parseErr != wire.ErrInvalidReservedBits {
 		return l, pn, pnLen, kp, parseErr
 	}

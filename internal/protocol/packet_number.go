@@ -7,6 +7,10 @@ type PacketNumber int64
 // In QUIC, 0 is a valid packet number.
 const InvalidPacketNumber PacketNumber = -1
 
+// MaxPacketNumber is the largest packet number (section 12.3 of RFC 9000).
+// When the next packet number reaches it, the connection is closed without sending any further packets.
+const MaxPacketNumber PacketNumber = 1<<62 - 1
+
 // PacketNumberLen is the length of the packet number in bytes
 type PacketNumberLen uint8
 

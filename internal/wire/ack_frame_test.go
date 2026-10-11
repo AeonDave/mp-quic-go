@@ -1,6 +1,8 @@
 package wire
 
 import (
+	"encoding/hex"
+	"fmt"
 	"io"
 	"math"
 	"slices"
@@ -115,7 +117,7 @@ func TestParseACKUseAckDelayExponent(t *testing.T) {
 	}
 	b, err := f.Append(nil, protocol.Version1)
 	require.NoError(t, err)
-	for i := uint8(0); i < 8; i++ {
+	for i := range uint8(8) {
 		typ, l, err := quicvarint.Parse(b)
 		require.NoError(t, err)
 		var frame AckFrame
@@ -152,7 +154,7 @@ func TestParseACKErrorOnEOF(t *testing.T) {
 	for i := range data {
 		var frame AckFrame
 		_, err := parseAckFrame(&frame, data[:i], FrameTypeAck, protocol.AckDelayExponent, protocol.Version1)
-		require.Equal(t, io.EOF, err)
+		require.ErrorIs(t, err, io.EOF)
 	}
 }
 
@@ -193,8 +195,160 @@ func TestParseACKECNErrorOnEOF(t *testing.T) {
 	for i := range data {
 		var frame AckFrame
 		_, err := parseAckFrame(&frame, data[:i], FrameTypeAckECN, protocol.AckDelayExponent, protocol.Version1)
-		require.Equal(t, io.EOF, err)
+		require.ErrorIs(t, err, io.EOF)
 	}
+}
+
+func TestParsePathACK(t *testing.T) {
+	data := encodeVarInt(1337)                // path ID
+	data = append(data, encodeVarInt(100)...) // largest acked
+	data = append(data, encodeVarInt(0)...)   // delay
+	data = append(data, encodeVarInt(1)...)   // num blocks
+	data = append(data, encodeVarInt(10)...)  // first ack block
+	data = append(data, encodeVarInt(8)...)   // gap
+	data = append(data, encodeVarInt(5)...)   // ack block
+	var frame AckFrame
+	n, err := parseAckFrame(&frame, data, FrameTypePathAck, protocol.AckDelayExponent, protocol.Version1)
+	require.NoError(t, err)
+	require.Equal(t, len(data), n)
+	require.True(t, frame.HasPathID)
+	require.Equal(t, protocol.PathID(1337), frame.PathID)
+	require.Equal(t, []AckRange{{Smallest: 90, Largest: 100}, {Smallest: 75, Largest: 80}}, frame.AckRanges)
+	require.Zero(t, frame.ECT0)
+	require.Zero(t, frame.ECT1)
+	require.Zero(t, frame.ECNCE)
+}
+
+func TestParsePathACKECN(t *testing.T) {
+	data := encodeVarInt(42)                         // path ID
+	data = append(data, encodeVarInt(100)...)        // largest acked
+	data = append(data, encodeVarInt(0)...)          // delay
+	data = append(data, encodeVarInt(0)...)          // num blocks
+	data = append(data, encodeVarInt(10)...)         // first ack block
+	data = append(data, encodeVarInt(0x42)...)       // ECT(0)
+	data = append(data, encodeVarInt(0x12345)...)    // ECT(1)
+	data = append(data, encodeVarInt(0x12345678)...) // ECN-CE
+	var frame AckFrame
+	n, err := parseAckFrame(&frame, data, FrameTypePathAckECN, protocol.AckDelayExponent, protocol.Version1)
+	require.NoError(t, err)
+	require.Equal(t, len(data), n)
+	require.True(t, frame.HasPathID)
+	require.Equal(t, protocol.PathID(42), frame.PathID)
+	require.Equal(t, []AckRange{{Smallest: 90, Largest: 100}}, frame.AckRanges)
+	require.Equal(t, uint64(0x42), frame.ECT0)
+	require.Equal(t, uint64(0x12345), frame.ECT1)
+	require.Equal(t, uint64(0x12345678), frame.ECNCE)
+}
+
+func TestParsePathACKErrorOnEOF(t *testing.T) {
+	for _, typ := range []FrameType{FrameTypePathAck, FrameTypePathAckECN} {
+		data := encodeVarInt(0xdeadbeef)           // path ID
+		data = append(data, encodeVarInt(1000)...) // largest acked
+		data = append(data, encodeVarInt(0)...)    // delay
+		data = append(data, encodeVarInt(1)...)    // num blocks
+		data = append(data, encodeVarInt(100)...)  // first ack block
+		data = append(data, encodeVarInt(98)...)   // gap
+		data = append(data, encodeVarInt(50)...)   // ack block
+		if typ == FrameTypePathAckECN {
+			data = append(data, encodeVarInt(0x42)...)       // ECT(0)
+			data = append(data, encodeVarInt(0x12345)...)    // ECT(1)
+			data = append(data, encodeVarInt(0x12345678)...) // ECN-CE
+		}
+		var frame AckFrame
+		n, err := parseAckFrame(&frame, data, typ, protocol.AckDelayExponent, protocol.Version1)
+		require.NoError(t, err)
+		require.Equal(t, len(data), n)
+		for i := range data {
+			var frame AckFrame
+			_, err := parseAckFrame(&frame, data[:i], typ, protocol.AckDelayExponent, protocol.Version1)
+			require.ErrorIs(t, err, io.EOF)
+		}
+	}
+}
+
+func TestWritePathACK(t *testing.T) {
+	f := &AckFrame{
+		AckRanges: []AckRange{{Smallest: 100, Largest: 1337}},
+		PathID:    0xdecaf,
+		HasPathID: true,
+	}
+	b, err := f.Append(nil, protocol.Version1)
+	require.NoError(t, err)
+	require.Len(t, b, int(f.Length(protocol.Version1)))
+	expected := []byte{0x3e}
+	expected = append(expected, encodeVarInt(0xdecaf)...) // path ID
+	expected = append(expected, encodeVarInt(1337)...)    // largest acked
+	expected = append(expected, 0)                        // delay
+	expected = append(expected, encodeVarInt(0)...)       // num ranges
+	expected = append(expected, encodeVarInt(1337-100)...)
+	require.Equal(t, expected, b)
+}
+
+func TestWritePathACKECN(t *testing.T) {
+	f := &AckFrame{
+		AckRanges: []AckRange{{Smallest: 10, Largest: 2000}},
+		ECT0:      13,
+		ECT1:      37,
+		ECNCE:     12345,
+		PathID:    7,
+		HasPathID: true,
+	}
+	b, err := f.Append(nil, protocol.Version1)
+	require.NoError(t, err)
+	require.Len(t, b, int(f.Length(protocol.Version1)))
+	expected := []byte{0x3f}
+	expected = append(expected, encodeVarInt(7)...)    // path ID
+	expected = append(expected, encodeVarInt(2000)...) // largest acked
+	expected = append(expected, 0)                     // delay
+	expected = append(expected, encodeVarInt(0)...)    // num ranges
+	expected = append(expected, encodeVarInt(2000-10)...)
+	expected = append(expected, encodeVarInt(13)...)
+	expected = append(expected, encodeVarInt(37)...)
+	expected = append(expected, encodeVarInt(12345)...)
+	require.Equal(t, expected, b)
+}
+
+func TestPathACKPathIDValues(t *testing.T) {
+	for _, pathID := range []protocol.PathID{0, protocol.MaxPathID, quicvarint.Max} {
+		for _, ecn := range []bool{false, true} {
+			f := &AckFrame{
+				AckRanges: []AckRange{{Smallest: 1000, Largest: 1200}, {Smallest: 1, Largest: 900}},
+				DelayTime: 24 * time.Millisecond,
+				PathID:    pathID,
+				HasPathID: true,
+			}
+			if ecn {
+				f.ECT0 = 1
+				f.ECT1 = 2
+				f.ECNCE = quicvarint.Max
+			}
+			checkMultipathFrameRoundTrip(t, f)
+		}
+	}
+}
+
+// The encoding of ACK frames doesn't change by the support for PATH_ACK frames.
+func TestWriteACKGolden(t *testing.T) {
+	f := &AckFrame{
+		AckRanges: []AckRange{{Smallest: 100, Largest: 1337}},
+		DelayTime: 18 * time.Millisecond,
+	}
+	b, err := f.Append(nil, protocol.Version1)
+	require.NoError(t, err)
+	require.Equal(t, "02453948ca0044d5", hex.EncodeToString(b))
+	require.Len(t, b, int(f.Length(protocol.Version1)))
+
+	f = &AckFrame{
+		AckRanges: []AckRange{{Smallest: 5000, Largest: 5200}, {Smallest: 4000, Largest: 4500}, {Smallest: 1, Largest: 3000}},
+		DelayTime: 25 * time.Millisecond,
+		ECT0:      0x1234,
+		ECT1:      1,
+		ECNCE:     0x42,
+	}
+	b, err = f.Append(nil, protocol.Version1)
+	require.NoError(t, err)
+	require.Equal(t, "0354504c350240c841f241f443e64bb75234014042", hex.EncodeToString(b))
+	require.Len(t, b, int(f.Length(protocol.Version1)))
 }
 
 func TestWriteACKSimpleFrame(t *testing.T) {
@@ -363,6 +517,37 @@ func TestACKTruncate(t *testing.T) {
 		require.True(t, f.validateAckRanges())
 		testACKTruncate(t, *f)
 	})
+
+	for _, pathID := range []protocol.PathID{0, 1337, protocol.MaxPathID, quicvarint.Max} {
+		t.Run(fmt.Sprintf("PATH_ACK for path %d", pathID), func(t *testing.T) {
+			testACKTruncate(t, AckFrame{
+				DelayTime: 18 * time.Millisecond,
+				AckRanges: []AckRange{
+					{Smallest: 300, Largest: 12345678},
+					{Smallest: 200, Largest: 250},
+					{Smallest: 1, Largest: 100},
+				},
+				PathID:    pathID,
+				HasPathID: true,
+			})
+		})
+
+		t.Run(fmt.Sprintf("PATH_ACK for path %d, with ECN and more than MaxNumAckRanges ranges", pathID), func(t *testing.T) {
+			const numRanges = 100
+			ackRanges := make([]AckRange, numRanges)
+			for i := protocol.PacketNumber(1); i <= numRanges; i++ {
+				ackRanges[numRanges-i] = AckRange{Smallest: 1000 * i, Largest: 1000*i + 1}
+			}
+			testACKTruncate(t, AckFrame{
+				AckRanges: ackRanges,
+				ECT0:      1234,
+				ECT1:      5678,
+				ECNCE:     9012,
+				PathID:    pathID,
+				HasPathID: true,
+			})
+		})
+	}
 }
 
 func testACKTruncate(t *testing.T, origACK AckFrame) {
@@ -380,9 +565,9 @@ func testACKTruncate(t *testing.T, origACK AckFrame) {
 	ack := cloneACK()
 	l := ack.Length(protocol.Version1)
 	ack.Truncate(1000, protocol.Version1)
-	require.Equal(t, expectedRanges, len(ack.AckRanges))
+	require.Len(t, ack.AckRanges, expectedRanges)
 	ack.Truncate(l, protocol.Version1)
-	require.Equal(t, expectedRanges, len(ack.AckRanges))
+	require.Len(t, ack.AckRanges, expectedRanges)
 
 	maxLen := l
 	for {
@@ -555,6 +740,8 @@ func TestAckFrameReset(t *testing.T) {
 		ECT0:      1,
 		ECT1:      2,
 		ECNCE:     3,
+		PathID:    4,
+		HasPathID: true,
 	}
 	f.Reset()
 	require.Empty(t, f.AckRanges)
@@ -563,6 +750,8 @@ func TestAckFrameReset(t *testing.T) {
 	require.Zero(t, f.ECT0)
 	require.Zero(t, f.ECT1)
 	require.Zero(t, f.ECNCE)
+	require.Zero(t, f.PathID)
+	require.False(t, f.HasPathID)
 }
 
 func BenchmarkACKSerialization(b *testing.B) {
@@ -608,5 +797,5 @@ func benchmarkACKSerialization(b *testing.B, f *AckFrame) {
 	}
 
 	// the frame should not have been truncated
-	require.Equal(b, numRanges, len(f.AckRanges))
+	require.Len(b, f.AckRanges, numRanges)
 }

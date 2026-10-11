@@ -23,17 +23,26 @@ func (r *nopWriter) Write(_ []byte) (int, error) {
 	return 0, io.ErrShortBuffer
 }
 
-// eofReader is a reader that returns data and the io.EOF at the same time in the last Read call
-type eofReader struct {
+// errorReader returns data and an error together at the end of the input.
+type errorReader struct {
 	Data []byte
+	Err  error
 	pos  int
 }
 
-func (r *eofReader) Read(b []byte) (int, error) {
+func (r *errorReader) Read(b []byte) (int, error) {
 	n := copy(b, r.Data[r.pos:])
 	r.pos += n
 	if r.pos >= len(r.Data) {
-		return n, io.EOF
+		return n, r.Err
+	}
+	return n, nil
+}
+
+func (r *errorReader) Peek(b []byte) (int, error) {
+	n := copy(b, r.Data[r.pos:])
+	if r.pos+n >= len(r.Data) {
+		return n, r.Err
 	}
 	return n, nil
 }
@@ -43,25 +52,25 @@ var _ io.Writer = &nopWriter{}
 func TestReaderPassesThroughUnchanged(t *testing.T) {
 	b := bytes.NewReader([]byte{0})
 	r := NewReader(b)
-	require.Equal(t, b, r)
+	require.Same(t, b, r)
 }
 
 func TestReaderWrapsIOReader(t *testing.T) {
 	n := &nopReader{}
 	r := NewReader(n)
-	require.NotEqual(t, n, r)
+	require.NotSame(t, n, r)
 }
 
 func TestReaderFailure(t *testing.T) {
 	r := NewReader(&nopReader{})
 	val, err := r.ReadByte()
-	require.Equal(t, io.ErrUnexpectedEOF, err)
+	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
 	require.Equal(t, byte(0), val)
 }
 
 func TestReaderHandlesEOF(t *testing.T) {
-	// test that the eofReader behaves as we expect
-	r := &eofReader{Data: []byte("foobar")}
+	// test that the errorReader behaves as we expect
+	r := &errorReader{Data: []byte("foobar"), Err: io.EOF}
 	b := make([]byte, 3)
 	n, err := r.Read(b)
 	require.Equal(t, 3, n)
@@ -69,21 +78,21 @@ func TestReaderHandlesEOF(t *testing.T) {
 	require.Equal(t, "foo", string(b))
 	n, err = r.Read(b)
 	require.Equal(t, 3, n)
-	require.Equal(t, io.EOF, err)
+	require.ErrorIs(t, err, io.EOF)
 	require.Equal(t, "bar", string(b))
 	n, err = r.Read(b)
-	require.Equal(t, io.EOF, err)
+	require.ErrorIs(t, err, io.EOF)
 	require.Zero(t, n)
 
 	// now test using it to read varints
-	reader := NewReader(&eofReader{Data: Append(nil, 1337)})
+	reader := NewReader(&errorReader{Data: Append(nil, 1337), Err: io.EOF})
 	n2, err := Read(reader)
 	require.NoError(t, err)
 	require.EqualValues(t, 1337, n2)
 }
 
 // Regression test: empty reads were being converted to successful
-// reads of a zero value.
+// reads of a zero value. See https://github.com/quic-go/quic-go/pull/5275.
 func TestReaderHandlesEmptyRead(t *testing.T) {
 	r, w := io.Pipe()
 
@@ -101,19 +110,19 @@ func TestReaderHandlesEmptyRead(t *testing.T) {
 func TestWriterPassesThroughUnchanged(t *testing.T) {
 	b := &bytes.Buffer{}
 	w := NewWriter(b)
-	require.Equal(t, b, w)
+	require.Same(t, b, w)
 }
 
 func TestWriterWrapsIOWriter(t *testing.T) {
 	n := &nopWriter{}
 	w := NewWriter(n)
-	require.NotEqual(t, n, w)
+	require.NotSame(t, n, w)
 }
 
 func TestWriterFailure(t *testing.T) {
 	w := NewWriter(&nopWriter{})
 	err := w.WriteByte(0)
-	require.Equal(t, io.ErrShortBuffer, err)
+	require.ErrorIs(t, err, io.ErrShortBuffer)
 }
 
 type bufPeeker []byte

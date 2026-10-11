@@ -7,7 +7,7 @@ import (
 	"flag"
 	"os"
 
-	"github.com/AeonDave/mp-quic-go"
+	quic "github.com/AeonDave/mp-quic-go"
 	"github.com/AeonDave/mp-quic-go/integrationtests/tools"
 	"github.com/AeonDave/mp-quic-go/qlogwriter"
 )

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AeonDave/mp-quic-go"
+	quic "github.com/AeonDave/mp-quic-go"
 	"github.com/AeonDave/mp-quic-go/internal/protocol"
 	"github.com/AeonDave/mp-quic-go/qlog"
 	"github.com/AeonDave/mp-quic-go/qlogwriter"
@@ -185,8 +185,8 @@ func TestServerDisablesVersionNegotiation(t *testing.T) {
 		}),
 	)
 	require.Error(t, err)
-	var nerr net.Error
-	require.True(t, errors.As(err, &nerr))
+	nerr, ok := errors.AsType[net.Error](err)
+	require.True(t, ok)
 	require.True(t, nerr.Timeout())
 	require.Empty(t, clientEventTracer.Events(qlog.VersionNegotiationReceived{}))
 }

@@ -1,7 +1,7 @@
 package qlog
 
 import (
-	"github.com/AeonDave/mp-quic-go"
+	quic "github.com/AeonDave/mp-quic-go"
 	"github.com/AeonDave/mp-quic-go/qlogwriter/jsontext"
 )
 
@@ -25,6 +25,8 @@ func (f Frame) encode(enc *jsontext.Encoder) error {
 	case CancelPushFrame:
 		return frame.encode(enc)
 	case MaxPushIDFrame:
+		return frame.encode(enc)
+	case PriorityUpdateFrame:
 		return frame.encode(enc)
 	case ReservedFrame:
 		return frame.encode(enc)
@@ -183,6 +185,25 @@ func (f *MaxPushIDFrame) encode(enc *jsontext.Encoder) error {
 	h.WriteToken(jsontext.BeginObject)
 	h.WriteToken(jsontext.String("frame_type"))
 	h.WriteToken(jsontext.String("max_push_id"))
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
+// A PriorityUpdateFrame is a PRIORITY_UPDATE frame for a request stream.
+type PriorityUpdateFrame struct {
+	StreamID           quic.StreamID
+	PriorityFieldValue string
+}
+
+func (f *PriorityUpdateFrame) encode(enc *jsontext.Encoder) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("frame_type"))
+	h.WriteToken(jsontext.String("priority_update"))
+	h.WriteToken(jsontext.String("stream_id"))
+	h.WriteToken(jsontext.Uint(uint64(f.StreamID)))
+	h.WriteToken(jsontext.String("priority_field_value"))
+	h.WriteToken(jsontext.String(f.PriorityFieldValue))
 	h.WriteToken(jsontext.EndObject)
 	return h.err
 }

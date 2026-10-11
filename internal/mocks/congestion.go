@@ -375,6 +375,42 @@ func (c *MockSendAlgorithmWithDebugInfosOnPacketSentCall) DoAndReturn(f func(mon
 	return c
 }
 
+// OnPersistentCongestion mocks base method.
+func (m *MockSendAlgorithmWithDebugInfos) OnPersistentCongestion() {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "OnPersistentCongestion")
+}
+
+// OnPersistentCongestion indicates an expected call of OnPersistentCongestion.
+func (mr *MockSendAlgorithmWithDebugInfosMockRecorder) OnPersistentCongestion() *MockSendAlgorithmWithDebugInfosOnPersistentCongestionCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "OnPersistentCongestion", reflect.TypeOf((*MockSendAlgorithmWithDebugInfos)(nil).OnPersistentCongestion))
+	return &MockSendAlgorithmWithDebugInfosOnPersistentCongestionCall{Call: call}
+}
+
+// MockSendAlgorithmWithDebugInfosOnPersistentCongestionCall wrap *gomock.Call
+type MockSendAlgorithmWithDebugInfosOnPersistentCongestionCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockSendAlgorithmWithDebugInfosOnPersistentCongestionCall) Return() *MockSendAlgorithmWithDebugInfosOnPersistentCongestionCall {
+	c.Call = c.Call.Return()
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockSendAlgorithmWithDebugInfosOnPersistentCongestionCall) Do(f func()) *MockSendAlgorithmWithDebugInfosOnPersistentCongestionCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockSendAlgorithmWithDebugInfosOnPersistentCongestionCall) DoAndReturn(f func()) *MockSendAlgorithmWithDebugInfosOnPersistentCongestionCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}
+
 // OnRetransmissionTimeout mocks base method.
 func (m *MockSendAlgorithmWithDebugInfos) OnRetransmissionTimeout(packetsRetransmitted bool) {
 	m.ctrl.T.Helper()

@@ -11,14 +11,25 @@ import (
 // ParseShortHeader parses a short header packet.
 // It must be called after header protection was removed.
 // Otherwise, the check for the reserved bits will (most likely) fail.
+// Packets with the QUIC Bit set to 0 are rejected.
 func ParseShortHeader(data []byte, connIDLen int) (length int, _ protocol.PacketNumber, _ protocol.PacketNumberLen, _ protocol.KeyPhaseBit, _ error) {
+	return parseShortHeader(data, connIDLen, false)
+}
+
+// ParseShortHeaderWithGreasedQUICBit is like ParseShortHeader, but also accepts packets with the QUIC Bit set to 0.
+// It is used by endpoints that sent the grease_quic_bit transport parameter (RFC 9287).
+func ParseShortHeaderWithGreasedQUICBit(data []byte, connIDLen int) (length int, _ protocol.PacketNumber, _ protocol.PacketNumberLen, _ protocol.KeyPhaseBit, _ error) {
+	return parseShortHeader(data, connIDLen, true)
+}
+
+func parseShortHeader(data []byte, connIDLen int, allowGreasedQUICBit bool) (length int, _ protocol.PacketNumber, _ protocol.PacketNumberLen, _ protocol.KeyPhaseBit, _ error) {
 	if len(data) == 0 {
 		return 0, 0, 0, 0, io.EOF
 	}
 	if data[0]&0x80 > 0 {
 		return 0, 0, 0, 0, errors.New("not a short header packet")
 	}
-	if data[0]&0x40 == 0 {
+	if !allowGreasedQUICBit && data[0]&0x40 == 0 {
 		return 0, 0, 0, 0, errors.New("not a QUIC packet")
 	}
 	pnLen := protocol.PacketNumberLen(data[0]&0b11) + 1

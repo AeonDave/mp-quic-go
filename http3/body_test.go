@@ -6,8 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AeonDave/mp-quic-go"
-
+	quic "github.com/AeonDave/mp-quic-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
@@ -137,4 +136,51 @@ func testResponseBodyLengthLimiting(t *testing.T, alongFrameBoundary bool) {
 	n, err := rb.Read([]byte{0})
 	require.Zero(t, n)
 	require.ErrorIs(t, err, errTooMuchData)
+}
+
+// A message whose content is shorter than its Content-Length is malformed (section 4.1.2 of RFC 9114).
+func TestBodyShorterThanContentLength(t *testing.T) {
+	var buf bytes.Buffer
+	buf.Write(getDataFrame([]byte("foo")))
+	buf.Write(getDataFrame([]byte("bar")))
+
+	mockCtrl := gomock.NewController(t)
+	str := NewMockDatagramStream(mockCtrl)
+	str.EXPECT().StreamID().Return(quic.StreamID(42)).AnyTimes()
+	str.EXPECT().CancelRead(quic.StreamErrorCode(ErrCodeMessageError))
+	str.EXPECT().CancelWrite(quic.StreamErrorCode(ErrCodeMessageError))
+	str.EXPECT().Read(gomock.Any()).DoAndReturn(buf.Read).AnyTimes()
+	rb := newResponseBody(
+		newStream(str, nil, nil, func(io.Reader, *headersFrame) error { return nil }, nil),
+		7,
+		make(chan struct{}),
+	)
+	data, err := io.ReadAll(rb)
+	require.Equal(t, []byte("foobar"), data)
+	require.ErrorIs(t, err, errTooLittleData)
+	// the stream is only reset once
+	_, err = rb.Read([]byte{0})
+	require.Error(t, err)
+}
+
+// Without a Content-Length, or with the correct one, the body is read until the end of the stream.
+func TestBodyContentLength(t *testing.T) {
+	for _, contentLength := range []int64{-1, 6} {
+		var buf bytes.Buffer
+		buf.Write(getDataFrame([]byte("foo")))
+		buf.Write(getDataFrame([]byte("bar")))
+
+		mockCtrl := gomock.NewController(t)
+		str := NewMockDatagramStream(mockCtrl)
+		str.EXPECT().StreamID().Return(quic.StreamID(42)).AnyTimes()
+		str.EXPECT().Read(gomock.Any()).DoAndReturn(buf.Read).AnyTimes()
+		rb := newResponseBody(
+			newStream(str, nil, nil, func(io.Reader, *headersFrame) error { return nil }, nil),
+			contentLength,
+			make(chan struct{}),
+		)
+		data, err := io.ReadAll(rb)
+		require.NoError(t, err)
+		require.Equal(t, []byte("foobar"), data)
+	}
 }

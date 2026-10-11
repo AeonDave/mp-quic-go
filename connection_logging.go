@@ -41,6 +41,8 @@ func toQlogFrame(frame wire.Frame) qlog.Frame {
 				Length: int64(len(f.Data)),
 			},
 		}
+	case *rawFrame:
+		return qlog.Frame{Frame: &qlog.UnknownFrame{FrameType: f.frameType}}
 	default:
 		return qlog.Frame{Frame: frame}
 	}
@@ -53,11 +55,13 @@ func toQlogAckFrame(f *wire.AckFrame) *qlog.AckFrame {
 		ECNCE:     f.ECNCE,
 		ECT0:      f.ECT0,
 		ECT1:      f.ECT1,
+		PathID:    f.PathID,
+		HasPathID: f.HasPathID,
 	}
 	return ack
 }
 
-func (c *Conn) logLongHeaderPacket(p *longHeaderPacket, ecn protocol.ECN, datagramID qlog.DatagramID) {
+func (c *Conn) logLongHeaderPacket(p *longHeaderPacket, ecn protocol.ECN, datagramPayloadChecksum qlog.DatagramPayloadChecksum) {
 	// quic-go logging
 	if c.logger.Debug() {
 		p.header.Log(c.logger)
@@ -101,18 +105,18 @@ func (c *Conn) logLongHeaderPacket(p *longHeaderPacket, ecn protocol.ECN, datagr
 				Length:        int(p.length),
 				PayloadLength: int(p.header.Length),
 			},
-			DatagramID: datagramID,
-			Frames:     frames,
-			ECN:        toQlogECN(ecn),
+			DatagramPayloadChecksum: datagramPayloadChecksum,
+			Frames:                  frames,
+			ECN:                     toQlogECN(ecn),
 		})
 	}
 }
 
 func (c *Conn) logShortHeaderPacket(p shortHeaderPacket, ecn protocol.ECN, size protocol.ByteCount) {
-	c.logShortHeaderPacketWithDatagramID(p, ecn, size, false, 0)
+	c.logShortHeaderPacketWithDatagramPayloadChecksum(p, ecn, size, false, 0)
 }
 
-func (c *Conn) logShortHeaderPacketWithDatagramID(p shortHeaderPacket, ecn protocol.ECN, size protocol.ByteCount, isCoalesced bool, datagramID qlog.DatagramID) {
+func (c *Conn) logShortHeaderPacketWithDatagramPayloadChecksum(p shortHeaderPacket, ecn protocol.ECN, size protocol.ByteCount, isCoalesced bool, datagramPayloadChecksum qlog.DatagramPayloadChecksum) {
 	if c.logger.Debug() && !isCoalesced {
 		c.logger.Debugf("-> Sending packet %d (%d bytes) for connection %s, 1-RTT (ECN: %s)", p.PacketNumber, size, c.logID, ecn)
 	}
@@ -121,6 +125,9 @@ func (c *Conn) logShortHeaderPacketWithDatagramID(p shortHeaderPacket, ecn proto
 		wire.LogShortHeader(c.logger, p.DestConnID, p.PacketNumber, p.PacketNumberLen, p.KeyPhase)
 		if p.Ack != nil {
 			wire.LogFrame(c.logger, p.Ack, true)
+		}
+		for _, ack := range p.ExtraAcks {
+			wire.LogFrame(c.logger, ack, true)
 		}
 		for _, f := range p.Frames {
 			wire.LogFrame(c.logger, f.Frame, true)
@@ -132,7 +139,7 @@ func (c *Conn) logShortHeaderPacketWithDatagramID(p shortHeaderPacket, ecn proto
 
 	// tracing
 	if c.qlogger != nil {
-		numFrames := len(p.Frames) + len(p.StreamFrames)
+		numFrames := len(p.Frames) + len(p.StreamFrames) + len(p.ExtraAcks)
 		if p.Ack != nil {
 			numFrames++
 		}
@@ -140,46 +147,55 @@ func (c *Conn) logShortHeaderPacketWithDatagramID(p shortHeaderPacket, ecn proto
 		if p.Ack != nil {
 			fs = append(fs, toQlogFrame(p.Ack))
 		}
+		for _, ack := range p.ExtraAcks {
+			fs = append(fs, toQlogFrame(ack))
+		}
 		for _, f := range p.Frames {
 			fs = append(fs, toQlogFrame(f.Frame))
 		}
 		for _, f := range p.StreamFrames {
 			fs = append(fs, toQlogFrame(f.Frame))
 		}
+		header := qlog.PacketHeader{
+			PacketType:       qlog.PacketType1RTT,
+			KeyPhaseBit:      p.KeyPhase,
+			PacketNumber:     p.PacketNumber,
+			Version:          c.version,
+			DestConnectionID: p.DestConnID,
+		}
+		// With IETF Multipath QUIC, packet numbers are only unique per path.
+		if c.mp != nil && c.mp.active {
+			header.PathID = protocol.PathID(p.PathID)
+			header.HasPathID = true
+		}
 		c.qlogger.RecordEvent(qlog.PacketSent{
-			Header: qlog.PacketHeader{
-				PacketType:       qlog.PacketType1RTT,
-				KeyPhaseBit:      p.KeyPhase,
-				PacketNumber:     p.PacketNumber,
-				Version:          c.version,
-				DestConnectionID: p.DestConnID,
-			},
+			Header: header,
 			Raw: qlog.RawInfo{
 				Length:        int(size),
 				PayloadLength: int(size - wire.ShortHeaderLen(p.DestConnID, p.PacketNumberLen)),
 			},
-			DatagramID: datagramID,
-			Frames:     fs,
-			ECN:        toQlogECN(ecn),
+			DatagramPayloadChecksum: datagramPayloadChecksum,
+			Frames:                  fs,
+			ECN:                     toQlogECN(ecn),
 		})
 	}
 }
 
 func (c *Conn) logCoalescedPacket(packet *coalescedPacket, ecn protocol.ECN) {
-	var datagramID qlog.DatagramID
+	var datagramPayloadChecksum qlog.DatagramPayloadChecksum
 	if c.qlogger != nil {
-		datagramID = qlog.CalculateDatagramID(packet.buffer.Data)
+		datagramPayloadChecksum = qlog.CalculateDatagramPayloadChecksum(packet.buffer.Data)
 	}
 	if c.logger.Debug() {
 		// There's a short period between dropping both Initial and Handshake keys and completion of the handshake,
 		// during which we might call PackCoalescedPacket but just pack a short header packet.
 		if len(packet.longHdrPackets) == 0 && packet.shortHdrPacket != nil {
-			c.logShortHeaderPacketWithDatagramID(
+			c.logShortHeaderPacketWithDatagramPayloadChecksum(
 				*packet.shortHdrPacket,
 				ecn,
 				packet.shortHdrPacket.Length,
 				false,
-				datagramID,
+				datagramPayloadChecksum,
 			)
 			return
 		}
@@ -190,10 +206,10 @@ func (c *Conn) logCoalescedPacket(packet *coalescedPacket, ecn protocol.ECN) {
 		}
 	}
 	for _, p := range packet.longHdrPackets {
-		c.logLongHeaderPacket(p, ecn, datagramID)
+		c.logLongHeaderPacket(p, ecn, datagramPayloadChecksum)
 	}
 	if p := packet.shortHdrPacket; p != nil {
-		c.logShortHeaderPacketWithDatagramID(*p, ecn, p.Length, true, datagramID)
+		c.logShortHeaderPacketWithDatagramPayloadChecksum(*p, ecn, p.Length, true, datagramPayloadChecksum)
 	}
 }
 
@@ -218,7 +234,14 @@ func (c *Conn) qlogTransportParameters(tp *wire.TransportParameters, sentBy prot
 		InitialMaxStreamsUni:            int64(tp.MaxUniStreamNum),
 		MaxDatagramFrameSize:            tp.MaxDatagramFrameSize,
 		EnableResetStreamAt:             tp.EnableResetStreamAt,
+		EnableAddAddress:                tp.EnableAddAddress,
+		GreaseQUICBit:                   tp.GreaseQUICBit,
 	}
+	if tp.HasInitialMaxPathID {
+		initialMaxPathID := tp.InitialMaxPathID
+		ev.InitialMaxPathID = &initialMaxPathID
+	}
+	ev.AddressDiscovery = qlogAddressDiscovery(tp.AddressDiscovery)
 	if sentBy == c.perspective {
 		ev.Initiator = qlog.InitiatorLocal
 	} else {
@@ -233,6 +256,16 @@ func (c *Conn) qlogTransportParameters(tp *wire.TransportParameters, sentBy prot
 		}
 	}
 	c.qlogger.RecordEvent(ev)
+}
+
+// qlogAddressDiscovery returns the value of the address_discovery transport parameter,
+// or nil if the parameter is not sent.
+func qlogAddressDiscovery(m wire.AddressDiscoveryMode) *uint64 {
+	if m == wire.AddressDiscoveryUnsupported {
+		return nil
+	}
+	val := uint64(m - 1)
+	return &val
 }
 
 func toQlogECN(ecn protocol.ECN) qlog.ECN {

@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AeonDave/mp-quic-go"
+	quic "github.com/AeonDave/mp-quic-go"
 	quicproxy "github.com/AeonDave/mp-quic-go/integrationtests/tools/proxy"
 	"github.com/AeonDave/mp-quic-go/internal/protocol"
 	"github.com/AeonDave/mp-quic-go/qlog"
@@ -92,7 +92,7 @@ func TestACKBundling(t *testing.T) {
 	require.NoError(t, err)
 	b := make([]byte, 1)
 	// Send numMsg 1-byte messages.
-	for i := 0; i < numMsg; i++ {
+	for i := range numMsg {
 		_, err = str.Write([]byte{uint8(i)})
 		require.NoError(t, err)
 		_, err = str.Read(b)
@@ -205,7 +205,6 @@ func testConnAndStreamDataBlocked(t *testing.T, limitStream, limitConn bool) {
 	for i := range numBatches {
 		str.SetWriteDeadline(time.Now().Add(rtt))
 		n, err := str.Write(make([]byte, 10000))
-		require.Error(t, err)
 		require.ErrorIs(t, err, os.ErrDeadlineExceeded)
 		require.Equal(t, int(windowSizes[i]), n)
 
@@ -215,7 +214,6 @@ func testConnAndStreamDataBlocked(t *testing.T, limitStream, limitConn bool) {
 		}
 		serverStr.SetReadDeadline(time.Now().Add(rtt))
 		n2, err := io.ReadFull(serverStr, make([]byte, 10000))
-		require.Error(t, err)
 		require.ErrorIs(t, err, os.ErrDeadlineExceeded)
 		require.Equal(t, n, n2)
 	}
@@ -246,7 +244,7 @@ func testConnAndStreamDataBlocked(t *testing.T, limitStream, limitConn bool) {
 	}
 
 	var expectedBlockOffsets []protocol.ByteCount
-	for i := 0; i < numBatches; i++ {
+	for i := range numBatches {
 		var offset protocol.ByteCount
 		for _, s := range windowSizes[:i+1] {
 			offset += s

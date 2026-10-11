@@ -27,7 +27,7 @@ func TestParseStreamDataBlockedErrorsOnEOFs(t *testing.T) {
 	require.Equal(t, len(data), l)
 	for i := range data {
 		_, _, err := parseStreamDataBlockedFrame(data[:i], protocol.Version1)
-		require.Equal(t, io.EOF, err)
+		require.ErrorIs(t, err, io.EOF)
 	}
 }
 
@@ -42,5 +42,5 @@ func TestWriteStreamDataBlocked(t *testing.T) {
 	expected = append(expected, encodeVarInt(uint64(f.StreamID))...)
 	expected = append(expected, encodeVarInt(uint64(f.MaximumStreamData))...)
 	require.Equal(t, expected, b)
-	require.Equal(t, int(f.Length(protocol.Version1)), len(b))
+	require.Len(t, b, int(f.Length(protocol.Version1)))
 }

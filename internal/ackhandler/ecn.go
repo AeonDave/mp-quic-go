@@ -43,6 +43,7 @@ type ecnHandler interface {
 	Mode() protocol.ECN
 	HandleNewlyAcked(packets []packetWithPacketNumber, ect0, ect1, ecnce int64) (congested bool)
 	LostPacket(protocol.PacketNumber)
+	Restart()
 }
 
 // The ecnTracker performs ECN validation of a path.
@@ -61,6 +62,8 @@ type ecnTracker struct {
 
 	numSentECT0, numSentECT1                  int64
 	numAckedECT0, numAckedECT1, numAckedECNCE int64
+	// the value of numAckedECNCE when the current validation started
+	numAckedECNCEBeforeTesting int64
 
 	qlogger qlogwriter.Recorder
 	logger  utils.Logger
@@ -108,7 +111,7 @@ func (e *ecnTracker) SentPacket(pn protocol.PacketNumber, ecn protocol.ECN) {
 	if e.firstTestingPacket == protocol.InvalidPacketNumber {
 		e.firstTestingPacket = pn
 	}
-	if e.numSentECT0+e.numSentECT1 >= numECNTestingPackets {
+	if e.numSentTesting >= numECNTestingPackets {
 		if e.qlogger != nil {
 			e.qlogger.RecordEvent(qlog.ECNStateUpdated{
 				State: qlog.ECNStateUnknown,
@@ -304,8 +307,8 @@ func (e *ecnTracker) HandleNewlyAcked(packets []packetWithPacketNumber, ect0, ec
 
 // failIfMangled fails ECN validation if all testing packets are lost or CE-marked.
 func (e *ecnTracker) failIfMangled() {
-	numAckedECNCE := e.numAckedECNCE + int64(e.numLostTesting)
-	if e.numSentECT0+e.numSentECT1 > numAckedECNCE {
+	numAckedECNCE := e.numAckedECNCE - e.numAckedECNCEBeforeTesting + int64(e.numLostTesting)
+	if int64(e.numSentTesting) > numAckedECNCE {
 		return
 	}
 	if e.qlogger != nil {
@@ -315,6 +318,26 @@ func (e *ecnTracker) failIfMangled() {
 		})
 	}
 	e.state = ecnStateFailed
+}
+
+// Restart restarts ECN validation, e.g. after the peer's address changed (section 9.2 of RFC 9000).
+// The ECN counts reported by the peer cover all packets sent in the packet number space,
+// including the packets sent before the restart. They are therefore kept.
+// Packets sent before the restart are treated as if they were sent without ECN marking.
+func (e *ecnTracker) Restart() {
+	if e.qlogger != nil && e.state != ecnStateInitial {
+		e.qlogger.RecordEvent(qlog.ECNStateUpdated{State: qlog.ECNStateTesting})
+	}
+	if e.state != ecnStateInitial {
+		// The next call to Mode starts testing again, without emitting another qlog event.
+		e.state = ecnStateTesting
+	}
+	e.numSentTesting = 0
+	e.numLostTesting = 0
+	e.firstTestingPacket = protocol.InvalidPacketNumber
+	e.lastTestingPacket = protocol.InvalidPacketNumber
+	e.firstCapablePacket = protocol.InvalidPacketNumber
+	e.numAckedECNCEBeforeTesting = e.numAckedECNCE
 }
 
 func (e *ecnTracker) ecnMarking(pn protocol.PacketNumber) protocol.ECN {

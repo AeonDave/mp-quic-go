@@ -1,32 +1,45 @@
 package handshake
 
 import (
+	"crypto/cipher"
 	"encoding/binary"
 
 	"github.com/AeonDave/mp-quic-go/internal/protocol"
 )
 
-func createAEAD(suite cipherSuite, trafficSecret []byte, v protocol.Version) *xorNonceAEAD {
+// aeadKeys are the packet protection key and IV derived from a traffic secret (RFC 9001, Section 5.1).
+type aeadKeys struct {
+	key []byte
+	iv  []byte
+}
+
+func deriveAEADKeys(suite cipherSuite, trafficSecret []byte, v protocol.Version) aeadKeys {
 	keyLabel := hkdfLabelKeyV1
 	ivLabel := hkdfLabelIVV1
 	if v == protocol.Version2 {
 		keyLabel = hkdfLabelKeyV2
 		ivLabel = hkdfLabelIVV2
 	}
-	key := hkdfExpandLabel(suite.Hash, trafficSecret, []byte{}, keyLabel, suite.KeyLen)
-	iv := hkdfExpandLabel(suite.Hash, trafficSecret, []byte{}, ivLabel, suite.IVLen())
-	return suite.AEAD(key, iv)
+	return aeadKeys{
+		key: hkdfExpandLabel(suite.Hash, trafficSecret, []byte{}, keyLabel, suite.KeyLen),
+		iv:  hkdfExpandLabel(suite.Hash, trafficSecret, []byte{}, ivLabel, suite.IVLen()),
+	}
+}
+
+func createAEAD(suite cipherSuite, trafficSecret []byte, v protocol.Version) cipher.AEAD {
+	keys := deriveAEADKeys(suite, trafficSecret, v)
+	return suite.AEAD(keys.key, keys.iv)
 }
 
 type longHeaderSealer struct {
-	aead            *xorNonceAEAD
+	aead            cipher.AEAD
 	headerProtector headerProtector
 	nonceBuf        [8]byte
 }
 
 var _ LongHeaderSealer = &longHeaderSealer{}
 
-func newLongHeaderSealer(aead *xorNonceAEAD, headerProtector headerProtector) LongHeaderSealer {
+func newLongHeaderSealer(aead cipher.AEAD, headerProtector headerProtector) LongHeaderSealer {
 	if aead.NonceSize() != 8 {
 		panic("unexpected nonce size")
 	}
@@ -50,7 +63,7 @@ func (s *longHeaderSealer) Overhead() int {
 }
 
 type longHeaderOpener struct {
-	aead            *xorNonceAEAD
+	aead            cipher.AEAD
 	headerProtector headerProtector
 	highestRcvdPN   protocol.PacketNumber // highest packet number received (which could be successfully unprotected)
 
@@ -60,13 +73,29 @@ type longHeaderOpener struct {
 
 var _ LongHeaderOpener = &longHeaderOpener{}
 
-func newLongHeaderOpener(aead *xorNonceAEAD, headerProtector headerProtector) LongHeaderOpener {
+func newLongHeaderOpener(aead cipher.AEAD, headerProtector headerProtector) LongHeaderOpener {
 	if aead.NonceSize() != 8 {
 		panic("unexpected nonce size")
 	}
 	return &longHeaderOpener{
 		aead:            aead,
 		headerProtector: headerProtector,
+	}
+}
+
+// continuePacketNumberSpace is used when the Initial keys change during compatible version negotiation (RFC 9368).
+// The packet number space of the Initial packets continues, so the packet numbers received with the new keys are
+// decoded relative to the largest packet number received with the previous keys (section 17.1 of RFC 9000):
+// a peer might use large packet numbers, and encode them in fewer bytes.
+func continuePacketNumberSpace(opener LongHeaderOpener, prev ...LongHeaderOpener) {
+	o, ok := opener.(*longHeaderOpener)
+	if !ok {
+		return
+	}
+	for _, p := range prev {
+		if p, ok := p.(*longHeaderOpener); ok && p != nil {
+			o.highestRcvdPN = max(o.highestRcvdPN, p.highestRcvdPN)
+		}
 	}
 }
 

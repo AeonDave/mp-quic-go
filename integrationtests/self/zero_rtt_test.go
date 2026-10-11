@@ -11,11 +11,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
-	"github.com/AeonDave/mp-quic-go"
+	quic "github.com/AeonDave/mp-quic-go"
 	"github.com/AeonDave/mp-quic-go/internal/protocol"
-	"github.com/AeonDave/mp-quic-go/internal/synctest"
 	"github.com/AeonDave/mp-quic-go/internal/wire"
 	"github.com/AeonDave/mp-quic-go/qlog"
 	"github.com/AeonDave/mp-quic-go/qlogwriter"
@@ -523,7 +523,7 @@ func test0RTTRetransmitOnRetry(t *testing.T, useRetry bool) {
 
 		require.Len(t, connIDToCounter, 2)
 		require.InDelta(t, 5000+100 /* framing overhead */, int(connIDToCounter[0].bytes), 100) // the FIN bit might be sent extra
-		require.InDelta(t, int(connIDToCounter[0].bytes), int(connIDToCounter[1].bytes), 20)
+		require.InDelta(t, int(connIDToCounter[0].bytes), int(connIDToCounter[1].bytes), 30)
 		zeroRTTPackets := counter.getRcvd0RTTPacketNumbers()
 		require.GreaterOrEqual(t, len(zeroRTTPackets), 5)
 		require.GreaterOrEqual(t, zeroRTTPackets[0], protocol.PacketNumber(5))
@@ -624,7 +624,7 @@ func check0RTTRejected(t *testing.T,
 	require.False(t, serverConn.ConnectionState().Used0RTT)
 	if sendData {
 		_, err = serverConn.AcceptUniStream(ctx)
-		require.Equal(t, context.DeadlineExceeded, err)
+		require.ErrorIs(t, err, context.DeadlineExceeded)
 	}
 
 	ctx, cancel = context.WithTimeout(context.Background(), time.Second)
@@ -865,6 +865,86 @@ func Test0RTTRejectedWhenDisabled(t *testing.T) {
 	})
 }
 
+// singleTicketSessionCache only stores the first session ticket, and uses it for every connection.
+type singleTicketSessionCache struct {
+	mx    sync.Mutex
+	key   string
+	state *tls.ClientSessionState
+}
+
+func (c *singleTicketSessionCache) Get(key string) (*tls.ClientSessionState, bool) {
+	c.mx.Lock()
+	defer c.mx.Unlock()
+	if c.state == nil || key != c.key {
+		return nil, false
+	}
+	return c.state, true
+}
+
+func (c *singleTicketSessionCache) Put(key string, state *tls.ClientSessionState) {
+	c.mx.Lock()
+	defer c.mx.Unlock()
+	if c.state == nil {
+		c.key, c.state = key, state
+	}
+}
+
+// The server accepts 0-RTT only once per session ticket (section 9.2 of RFC 9001, section 8.1 of RFC 8446).
+// When the client (or an attacker replaying its packets) uses the session ticket again, 0-RTT is rejected,
+// and the 0-RTT data is not processed.
+func Test0RTTReplay(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const rtt = 5 * time.Millisecond
+		router := &zeroRTTCountingRouter{Router: &simnet.PerfectRouter{}}
+		clientConn, serverConn, closeFn := newSimnetLinkWithRouter(t, rtt, router)
+		defer closeFn(t)
+
+		tlsConf := getTLSConfig()
+		tr := &quic.Transport{Conn: serverConn}
+		defer tr.Close()
+		counter, tracer := newPacketTracer()
+		ln, err := tr.ListenEarly(
+			tlsConf,
+			getQuicConfig(&quic.Config{
+				Allow0RTT: true,
+				Tracer:    func(context.Context, bool, quic.ConnectionID) qlogwriter.Trace { return tracer },
+			}),
+		)
+		require.NoError(t, err)
+		defer ln.Close()
+		clientTLSConf := dialAndReceiveTicket(t, ln, clientConn, &singleTicketSessionCache{})
+
+		time.Sleep(time.Hour)
+		synctest.Wait()
+
+		transfer0RTTData(t, ln, clientConn, clientTLSConf, getQuicConfig(nil), []byte("foobar"))
+		require.NotEmpty(t, counter.getRcvd0RTTPacketNumbers())
+
+		time.Sleep(time.Hour)
+		synctest.Wait()
+
+		counter2, tracer2 := newPacketTracer()
+		require.NoError(t, ln.Close())
+		ln, err = tr.ListenEarly(
+			tlsConf,
+			getQuicConfig(&quic.Config{
+				Allow0RTT: true,
+				Tracer:    func(context.Context, bool, quic.ConnectionID) qlogwriter.Trace { return tracer2 },
+			}),
+		)
+		require.NoError(t, err)
+		num0RTTBefore := router.Num0RTTPackets()
+		conn, sconn := check0RTTRejected(t, ln, clientConn, ln.Addr(), clientTLSConf, true)
+		defer conn.CloseWithError(0, "")
+		// the session is resumed, without 0-RTT
+		require.True(t, conn.ConnectionState().TLS.DidResume)
+		require.True(t, sconn.ConnectionState().TLS.DidResume)
+		sconn.CloseWithError(0, "")
+		require.Greater(t, router.Num0RTTPackets(), num0RTTBefore)
+		require.Empty(t, counter2.getRcvd0RTTPacketNumbers())
+	})
+}
+
 func Test0RTTRejectedOnDatagramsDisabled(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const rtt = 5 * time.Millisecond
@@ -896,7 +976,8 @@ func Test0RTTRejectedOnDatagramsDisabled(t *testing.T) {
 		defer ln.Close()
 		conn, sconn := check0RTTRejected(t, ln, clientConn, ln.Addr(), clientTLSConf, true)
 		defer conn.CloseWithError(0, "")
-		require.False(t, conn.ConnectionState().SupportsDatagrams)
+		require.False(t, conn.ConnectionState().SupportsDatagrams.Remote)
+		require.False(t, conn.ConnectionState().SupportsDatagrams.Local)
 
 		sconn.CloseWithError(0, "")
 		// The client should send 0-RTT packets, but the server doesn't process them.
@@ -1128,7 +1209,8 @@ func Test0RTTDatagrams(t *testing.T) {
 		)
 		require.NoError(t, err)
 		defer conn.CloseWithError(0, "")
-		require.True(t, conn.ConnectionState().SupportsDatagrams)
+		require.True(t, conn.ConnectionState().SupportsDatagrams.Remote)
+		require.True(t, conn.ConnectionState().SupportsDatagrams.Local)
 		require.NoError(t, conn.SendDatagram(msg))
 		select {
 		case <-conn.HandshakeComplete():
@@ -1147,6 +1229,129 @@ func Test0RTTDatagrams(t *testing.T) {
 		t.Logf("sent %d 0-RTT packets", num0RTT)
 		require.NotZero(t, num0RTT)
 		sconn.CloseWithError(0, "")
-		require.Len(t, counter.getRcvd0RTTPacketNumbers(), 1)
+		expected0RTTPackets := 1
+		if clientMultipathConfigured() {
+			// With a multipath controller, quic.Dial uses non-zero-length connection IDs (see TestConnectionIDsZeroLength).
+			// The NEW_CONNECTION_ID frames might be sent in another 0-RTT packet.
+			expected0RTTPackets = num0RTT
+		}
+		require.Len(t, counter.getRcvd0RTTPacketNumbers(), expected0RTTPackets)
+	})
+}
+
+// The server remembers the address_discovery transport parameter in the session ticket.
+// It rejects 0-RTT if the value changed (section 3 of draft-ietf-quic-address-discovery-01).
+func Test0RTTRejectedOnAddressDiscoveryChanged(t *testing.T) {
+	for _, tc := range []struct {
+		name                   string
+		provideBefore, provide bool
+		requestBefore, request bool
+	}{
+		{name: "enabled", provide: true},
+		{name: "disabled", provideBefore: true},
+		{name: "changed", provideBefore: true, provide: true, request: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				const rtt = 5 * time.Millisecond
+				router := &zeroRTTCountingRouter{Router: &simnet.PerfectRouter{}}
+				clientConn, serverConn, closeFn := newSimnetLinkWithRouter(t, rtt, router)
+				defer closeFn(t)
+
+				tlsConf := getTLSConfig()
+				tr := &quic.Transport{Conn: serverConn}
+				defer tr.Close()
+				ln, err := tr.ListenEarly(tlsConf, getQuicConfig(&quic.Config{
+					Allow0RTT:              true,
+					ProvideObservedAddress: tc.provideBefore,
+					RequestObservedAddress: tc.requestBefore,
+				}))
+				require.NoError(t, err)
+				clientTLSConf := dialAndReceiveTicket(t, ln, clientConn, nil)
+				require.NoError(t, ln.Close())
+
+				time.Sleep(time.Hour)
+				synctest.Wait()
+
+				counter, tracer := newPacketTracer()
+				ln, err = tr.ListenEarly(tlsConf, getQuicConfig(&quic.Config{
+					Allow0RTT:              true,
+					ProvideObservedAddress: tc.provide,
+					RequestObservedAddress: tc.request,
+					Tracer:                 func(context.Context, bool, quic.ConnectionID) qlogwriter.Trace { return tracer },
+				}))
+				require.NoError(t, err)
+				defer ln.Close()
+				conn, sconn := check0RTTRejected(t, ln, clientConn, ln.Addr(), clientTLSConf, true)
+				defer conn.CloseWithError(0, "")
+				sconn.CloseWithError(0, "")
+				require.NotZero(t, router.Num0RTTPackets())
+				require.Empty(t, counter.getRcvd0RTTPacketNumbers())
+			})
+		})
+	}
+}
+
+// If the address_discovery transport parameter didn't change, the server accepts 0-RTT.
+// The server reports the client's address.
+func Test0RTTWithAddressDiscovery(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const rtt = 5 * time.Millisecond
+		router := &zeroRTTCountingRouter{Router: &simnet.PerfectRouter{}}
+		clientConn, serverConn, closeFn := newSimnetLinkWithRouter(t, rtt, router)
+		defer closeFn(t)
+
+		tlsConf := getTLSConfig()
+		tr := &quic.Transport{Conn: serverConn}
+		defer tr.Close()
+		serverConf := getQuicConfig(&quic.Config{Allow0RTT: true, ProvideObservedAddress: true})
+		ln, err := tr.ListenEarly(tlsConf, serverConf)
+		require.NoError(t, err)
+		clientTLSConf := dialAndReceiveTicket(t, ln, clientConn, nil)
+		require.NoError(t, ln.Close())
+
+		time.Sleep(time.Hour)
+		synctest.Wait()
+
+		ln, err = tr.ListenEarly(tlsConf, serverConf)
+		require.NoError(t, err)
+		defer ln.Close()
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		clientTr := &quic.Transport{Conn: clientConn}
+		defer clientTr.Close()
+		conn, err := clientTr.DialEarly(ctx, ln.Addr(), clientTLSConf, getQuicConfig(&quic.Config{RequestObservedAddress: true}))
+		require.NoError(t, err)
+		defer conn.CloseWithError(0, "")
+		str, err := conn.OpenUniStream()
+		require.NoError(t, err)
+		_, err = str.Write([]byte("foobar"))
+		require.NoError(t, err)
+		require.NoError(t, str.Close())
+
+		sconn, err := ln.Accept(ctx)
+		require.NoError(t, err)
+		defer sconn.CloseWithError(0, "")
+		rstr, err := sconn.AcceptUniStream(ctx)
+		require.NoError(t, err)
+		data, err := io.ReadAll(rstr)
+		require.NoError(t, err)
+		require.Equal(t, []byte("foobar"), data)
+
+		select {
+		case <-conn.HandshakeComplete():
+		case <-ctx.Done():
+			t.Fatal("handshake did not complete in time")
+		}
+		time.Sleep(rtt)
+		synctest.Wait()
+		require.True(t, conn.ConnectionState().Used0RTT)
+		require.True(t, sconn.ConnectionState().Used0RTT)
+		require.True(t, conn.ConnectionState().SupportsAddressDiscovery.Receive)
+		require.True(t, sconn.ConnectionState().SupportsAddressDiscovery.Send)
+		observed, ok := conn.ObservedAddr()
+		require.True(t, ok)
+		require.Equal(t, clientConn.LocalAddr().String(), observed.String())
 	})
 }

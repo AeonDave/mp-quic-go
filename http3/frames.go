@@ -7,7 +7,7 @@ import (
 	"io"
 	"maps"
 
-	"github.com/AeonDave/mp-quic-go"
+	quic "github.com/AeonDave/mp-quic-go"
 	"github.com/AeonDave/mp-quic-go/http3/qlog"
 	"github.com/AeonDave/mp-quic-go/qlogwriter"
 	"github.com/AeonDave/mp-quic-go/quicvarint"
@@ -17,6 +17,8 @@ import (
 type FrameType uint64
 
 type frame any
+
+var errPriorityUpdateForPush = errors.New("http3: PRIORITY_UPDATE frame for push")
 
 // The maximum length of an encoded HTTP/3 frame header is 16:
 // The frame has a type and length field, both QUIC varints (maximum 8 bytes in length)
@@ -56,10 +58,17 @@ func (p *frameParser) ParseNext(qlogger qlogwriter.Recorder) (frame, error) {
 	for {
 		t, err := quicvarint.Read(r)
 		if err != nil {
+			// The stream ended in the middle of the frame type.
+			if err == io.EOF && r.NumRead > 0 {
+				return nil, io.ErrUnexpectedEOF
+			}
 			return nil, err
 		}
 		l, err := quicvarint.Read(r)
 		if err != nil {
+			if err == io.EOF {
+				return nil, io.ErrUnexpectedEOF
+			}
 			return nil, err
 		}
 
@@ -83,7 +92,11 @@ func (p *frameParser) ParseNext(qlogger qlogwriter.Recorder) (frame, error) {
 			}, nil
 		case 0x4: // SETTINGS
 			return parseSettingsFrame(r, l, p.streamID, qlogger)
-		case 0x3: // unsupported: CANCEL_PUSH
+		case 0x3: // CANCEL_PUSH
+			id, err := parseSingleVarIntPayload(r, t, l, "CANCEL_PUSH")
+			if err != nil {
+				return nil, err
+			}
 			if qlogger != nil {
 				qlogger.RecordEvent(qlog.FrameParsed{
 					StreamID: p.streamID,
@@ -91,7 +104,8 @@ func (p *frameParser) ParseNext(qlogger qlogwriter.Recorder) (frame, error) {
 					Frame:    qlog.Frame{Frame: qlog.CancelPushFrame{}},
 				})
 			}
-		case 0x5: // unsupported: PUSH_PROMISE
+			return &cancelPushFrame{PushID: id}, nil
+		case 0x5: // PUSH_PROMISE
 			if qlogger != nil {
 				qlogger.RecordEvent(qlog.FrameParsed{
 					StreamID: p.streamID,
@@ -99,9 +113,20 @@ func (p *frameParser) ParseNext(qlogger qlogwriter.Recorder) (frame, error) {
 					Frame:    qlog.Frame{Frame: qlog.PushPromiseFrame{}},
 				})
 			}
+			// Server push is not supported, and the payload is not read:
+			// receiving a PUSH_PROMISE frame is always a connection error.
+			return &pushPromiseFrame{Length: l}, nil
 		case 0x7: // GOAWAY
 			return parseGoAwayFrame(r, l, p.streamID, qlogger)
-		case 0xd: // unsupported: MAX_PUSH_ID
+		case 0xf0700: // PRIORITY_UPDATE for a request stream
+			return parsePriorityUpdateFrame(r, l, p.streamID, qlogger)
+		case 0xf0701: // PRIORITY_UPDATE for a push stream
+			return nil, errPriorityUpdateForPush
+		case 0xd: // MAX_PUSH_ID
+			id, err := parseSingleVarIntPayload(r, t, l, "MAX_PUSH_ID")
+			if err != nil {
+				return nil, err
+			}
 			if qlogger != nil {
 				qlogger.RecordEvent(qlog.FrameParsed{
 					StreamID: p.streamID,
@@ -109,6 +134,7 @@ func (p *frameParser) ParseNext(qlogger qlogwriter.Recorder) (frame, error) {
 					Frame:    qlog.Frame{Frame: qlog.MaxPushIDFrame{}},
 				})
 			}
+			return &maxPushIDFrame{PushID: id}, nil
 		case 0x2, 0x6, 0x8, 0x9: // reserved frame types
 			if qlogger != nil {
 				qlogger.RecordEvent(qlog.FrameParsed{
@@ -132,6 +158,9 @@ func (p *frameParser) ParseNext(qlogger qlogwriter.Recorder) (frame, error) {
 
 		// skip over the payload
 		if _, err := io.CopyN(io.Discard, r, int64(l)); err != nil {
+			if err == io.EOF {
+				return nil, io.ErrUnexpectedEOF
+			}
 			return nil, err
 		}
 		r.Reset()
@@ -166,6 +195,47 @@ const (
 	settingDatagram = 0x33
 )
 
+// A frameError is returned when a frame of a known type is malformed.
+// The frame type is needed to determine the error code: frames that are not allowed on a stream
+// are an error of type H3_FRAME_UNEXPECTED, whether they are malformed or not.
+type frameError struct {
+	Type uint64
+	err  error
+}
+
+func (e *frameError) Error() string { return e.err.Error() }
+func (e *frameError) Unwrap() error { return e.err }
+
+// isControlStreamFrame says if err is a frameError for a frame type that is only allowed on the control stream.
+// isTruncatedFrame says if a stream ended in the middle of a frame.
+// If the stream was terminated cleanly, this is a connection error of type H3_FRAME_ERROR (section 7.1 of RFC 9114).
+func isTruncatedFrame(err error) bool {
+	return err == io.ErrUnexpectedEOF
+}
+
+func isControlStreamFrame(err error) bool {
+	fe, ok := errors.AsType[*frameError](err)
+	if !ok {
+		return false
+	}
+	switch fe.Type {
+	case 0x3, 0x4, 0x7, 0xd: // CANCEL_PUSH, SETTINGS, GOAWAY, MAX_PUSH_ID
+		return true
+	}
+	return false
+}
+
+// errTruncatedSettings is returned when a SETTINGS frame ends inside a setting.
+var errTruncatedSettings = errors.New("http3: SETTINGS frame ends inside a setting")
+
+// A settingsError is a semantic error in a SETTINGS frame.
+// It is a connection error of type H3_SETTINGS_ERROR (section 7.2.4 of RFC 9114).
+type settingsError struct {
+	msg string
+}
+
+func (e *settingsError) Error() string { return e.msg }
+
 type settingsFrame struct {
 	MaxFieldSectionSize int64 // SETTINGS_MAX_FIELD_SECTION_SIZE, -1 if not set
 
@@ -174,13 +244,11 @@ type settingsFrame struct {
 	Other           map[uint64]uint64 // all settings that we don't explicitly recognize
 }
 
-func pointer[T any](v T) *T {
-	return &v
-}
+const maxSettingsFrameSize = 8 << 10
 
 func parseSettingsFrame(r *countingByteReader, l uint64, streamID quic.StreamID, qlogger qlogwriter.Recorder) (*settingsFrame, error) {
-	if l > 8*(1<<10) {
-		return nil, fmt.Errorf("unexpected size for SETTINGS frame: %d", l)
+	if l > maxSettingsFrameSize {
+		return nil, &frameError{Type: 0x4, err: fmt.Errorf("unexpected size for SETTINGS frame: %d", l)}
 	}
 	buf := make([]byte, l)
 	if _, err := io.ReadFull(r, buf); err != nil {
@@ -194,50 +262,55 @@ func parseSettingsFrame(r *countingByteReader, l uint64, streamID quic.StreamID,
 	settingsFrame := qlog.SettingsFrame{MaxFieldSectionSize: -1}
 	var readMaxFieldSectionSize, readDatagram, readExtendedConnect bool
 	for b.Len() > 0 {
+		// The payload was read completely, so an error here means that the frame ends inside a parameter.
+		// This is a frame error (section 7.1 of RFC 9114), not the end of the stream.
 		id, err := quicvarint.Read(b)
-		if err != nil { // should not happen. We allocated the whole frame already.
-			return nil, err
+		if err != nil {
+			return nil, &frameError{Type: 0x4, err: errTruncatedSettings}
 		}
 		val, err := quicvarint.Read(b)
-		if err != nil { // should not happen. We allocated the whole frame already.
-			return nil, err
+		if err != nil {
+			return nil, &frameError{Type: 0x4, err: errTruncatedSettings}
 		}
 
 		switch id {
+		case 0x2, 0x3, 0x4, 0x5:
+			// HTTP/2 settings that have no HTTP/3 equivalent (section 7.2.4.1 of RFC 9114)
+			return nil, &frameError{Type: 0x4, err: &settingsError{fmt.Sprintf("HTTP/2 setting: %d", id)}}
 		case settingMaxFieldSectionSize:
 			if readMaxFieldSectionSize {
-				return nil, fmt.Errorf("duplicate setting: %d", id)
+				return nil, &frameError{Type: 0x4, err: &settingsError{fmt.Sprintf("duplicate setting: %d", id)}}
 			}
 			readMaxFieldSectionSize = true
 			frame.MaxFieldSectionSize = int64(val)
 			settingsFrame.MaxFieldSectionSize = int64(val)
 		case settingExtendedConnect:
 			if readExtendedConnect {
-				return nil, fmt.Errorf("duplicate setting: %d", id)
+				return nil, &frameError{Type: 0x4, err: &settingsError{fmt.Sprintf("duplicate setting: %d", id)}}
 			}
 			readExtendedConnect = true
 			if val != 0 && val != 1 {
-				return nil, fmt.Errorf("invalid value for SETTINGS_ENABLE_CONNECT_PROTOCOL: %d", val)
+				return nil, &frameError{Type: 0x4, err: &settingsError{fmt.Sprintf("invalid value for SETTINGS_ENABLE_CONNECT_PROTOCOL: %d", val)}}
 			}
 			frame.ExtendedConnect = val == 1
 			if qlogger != nil {
-				settingsFrame.ExtendedConnect = pointer(frame.ExtendedConnect)
+				settingsFrame.ExtendedConnect = new(frame.ExtendedConnect)
 			}
 		case settingDatagram:
 			if readDatagram {
-				return nil, fmt.Errorf("duplicate setting: %d", id)
+				return nil, &frameError{Type: 0x4, err: &settingsError{fmt.Sprintf("duplicate setting: %d", id)}}
 			}
 			readDatagram = true
 			if val != 0 && val != 1 {
-				return nil, fmt.Errorf("invalid value for SETTINGS_H3_DATAGRAM: %d", val)
+				return nil, &frameError{Type: 0x4, err: &settingsError{fmt.Sprintf("invalid value for SETTINGS_H3_DATAGRAM: %d", val)}}
 			}
 			frame.Datagram = val == 1
 			if qlogger != nil {
-				settingsFrame.Datagram = pointer(frame.Datagram)
+				settingsFrame.Datagram = new(frame.Datagram)
 			}
 		default:
 			if _, ok := frame.Other[id]; ok {
-				return nil, fmt.Errorf("duplicate setting: %d", id)
+				return nil, &frameError{Type: 0x4, err: &settingsError{fmt.Sprintf("duplicate setting: %d", id)}}
 			}
 			if frame.Other == nil {
 				frame.Other = make(map[uint64]uint64)
@@ -299,15 +372,32 @@ type goAwayFrame struct {
 	StreamID quic.StreamID
 }
 
-func parseGoAwayFrame(r *countingByteReader, l uint64, streamID quic.StreamID, qlogger qlogwriter.Recorder) (*goAwayFrame, error) {
-	frame := &goAwayFrame{}
+// parseSingleVarIntPayload parses the payload of a frame that consists of a single variable-length integer.
+// Since such a payload is at most 8 bytes long, a frame that declares a longer (or an empty) payload
+// is rejected without reading the payload.
+func parseSingleVarIntPayload(r *countingByteReader, t, l uint64, name string) (uint64, error) {
+	if l == 0 || l > 8 {
+		return 0, &frameError{Type: t, err: fmt.Errorf("%s frame: invalid length: %d", name, l)}
+	}
 	startLen := r.NumRead
-	id, err := quicvarint.Read(r)
+	val, err := quicvarint.Read(r)
 	if err != nil {
-		return nil, err
+		if err == io.EOF {
+			return 0, io.ErrUnexpectedEOF
+		}
+		return 0, err
 	}
 	if r.NumRead-startLen != int(l) {
-		return nil, errors.New("GOAWAY frame: inconsistent length")
+		return 0, &frameError{Type: t, err: fmt.Errorf("%s frame: inconsistent length", name)}
+	}
+	return val, nil
+}
+
+func parseGoAwayFrame(r *countingByteReader, l uint64, streamID quic.StreamID, qlogger qlogwriter.Recorder) (*goAwayFrame, error) {
+	frame := &goAwayFrame{}
+	id, err := parseSingleVarIntPayload(r, 0x7, l, "GOAWAY")
+	if err != nil {
+		return nil, err
 	}
 	frame.StreamID = quic.StreamID(id)
 	if qlogger != nil {
@@ -324,4 +414,72 @@ func (f *goAwayFrame) Append(b []byte) []byte {
 	b = quicvarint.Append(b, 0x7)
 	b = quicvarint.Append(b, uint64(quicvarint.Len(uint64(f.StreamID))))
 	return quicvarint.Append(b, uint64(f.StreamID))
+}
+
+// CANCEL_PUSH, section 7.2.3 of RFC 9114
+type cancelPushFrame struct {
+	PushID uint64
+}
+
+func (f *cancelPushFrame) Append(b []byte) []byte {
+	b = quicvarint.Append(b, 0x3)
+	b = quicvarint.Append(b, uint64(quicvarint.Len(f.PushID)))
+	return quicvarint.Append(b, f.PushID)
+}
+
+// PUSH_PROMISE, section 7.2.5 of RFC 9114.
+// Only the frame header is parsed.
+type pushPromiseFrame struct {
+	Length uint64
+}
+
+// MAX_PUSH_ID, section 7.2.7 of RFC 9114
+type maxPushIDFrame struct {
+	PushID uint64
+}
+
+func (f *maxPushIDFrame) Append(b []byte) []byte {
+	b = quicvarint.Append(b, 0xd)
+	b = quicvarint.Append(b, uint64(quicvarint.Len(f.PushID)))
+	return quicvarint.Append(b, f.PushID)
+}
+
+// PRIORITY_UPDATE, RFC 9218
+type priorityUpdateFrame struct {
+	ElementID          uint64
+	PriorityFieldValue string
+}
+
+const maxPriorityUpdateFrameSize = 4 << 10
+
+func parsePriorityUpdateFrame(r *countingByteReader, l uint64, streamID quic.StreamID, qlogger qlogwriter.Recorder) (*priorityUpdateFrame, error) {
+	if l > maxPriorityUpdateFrameSize {
+		return nil, fmt.Errorf("unexpected size for PRIORITY_UPDATE frame: %d", l)
+	}
+	buf := make([]byte, l)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		if err == io.ErrUnexpectedEOF {
+			return nil, io.EOF
+		}
+		return nil, err
+	}
+	id, n, err := quicvarint.Parse(buf)
+	if err != nil {
+		return nil, err
+	}
+	frame := &priorityUpdateFrame{
+		ElementID:          id,
+		PriorityFieldValue: string(buf[n:]),
+	}
+	if qlogger != nil {
+		qlogger.RecordEvent(qlog.FrameParsed{
+			StreamID: streamID,
+			Raw:      qlog.RawInfo{Length: r.NumRead, PayloadLength: int(l)},
+			Frame: qlog.Frame{Frame: qlog.PriorityUpdateFrame{
+				StreamID:           quic.StreamID(frame.ElementID),
+				PriorityFieldValue: frame.PriorityFieldValue,
+			}},
+		})
+	}
+	return frame, nil
 }

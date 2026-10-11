@@ -42,6 +42,44 @@ func (m *MockAckFrameSource) EXPECT() *MockAckFrameSourceMockRecorder {
 	return m.recorder
 }
 
+// AckDuePaths mocks base method.
+func (m *MockAckFrameSource) AckDuePaths(now monotime.Time) []protocol.PathID {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "AckDuePaths", now)
+	ret0, _ := ret[0].([]protocol.PathID)
+	return ret0
+}
+
+// AckDuePaths indicates an expected call of AckDuePaths.
+func (mr *MockAckFrameSourceMockRecorder) AckDuePaths(now any) *MockAckFrameSourceAckDuePathsCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AckDuePaths", reflect.TypeOf((*MockAckFrameSource)(nil).AckDuePaths), now)
+	return &MockAckFrameSourceAckDuePathsCall{Call: call}
+}
+
+// MockAckFrameSourceAckDuePathsCall wrap *gomock.Call
+type MockAckFrameSourceAckDuePathsCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockAckFrameSourceAckDuePathsCall) Return(arg0 []protocol.PathID) *MockAckFrameSourceAckDuePathsCall {
+	c.Call = c.Call.Return(arg0)
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockAckFrameSourceAckDuePathsCall) Do(f func(monotime.Time) []protocol.PathID) *MockAckFrameSourceAckDuePathsCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockAckFrameSourceAckDuePathsCall) DoAndReturn(f func(monotime.Time) []protocol.PathID) *MockAckFrameSourceAckDuePathsCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}
+
 // GetAckFrame mocks base method.
 func (m *MockAckFrameSource) GetAckFrame(arg0 protocol.EncryptionLevel, now monotime.Time, onlyIfQueued bool, pathID protocol.PathID) *wire.AckFrame {
 	m.ctrl.T.Helper()

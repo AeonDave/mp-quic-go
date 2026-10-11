@@ -13,8 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AeonDave/mp-quic-go"
-
+	quic "github.com/AeonDave/mp-quic-go"
 	"github.com/stretchr/testify/require"
 )
 
@@ -205,8 +204,7 @@ func TestMultiplexingNonQUICPackets(t *testing.T) {
 		err  error
 	}
 	rcvdPackets := make(chan nonQUICPacket, numPackets)
-	receiveCtx, receiveCancel := context.WithCancel(context.Background())
-	defer receiveCancel()
+	receiveCtx := t.Context()
 	// start receiving non-QUIC packets
 	go func() {
 		for {
@@ -337,7 +335,7 @@ func TestMultiplexingNonQUICPackets(t *testing.T) {
 		select {
 		case p := <-rcvdPackets:
 			require.Equal(t, tr1.Conn.LocalAddr(), p.addr, "non-QUIC packet received from wrong address")
-			require.Equal(t, packetLen, len(p.b), "non-QUIC packet incorrect length")
+			require.Len(t, p.b, packetLen, "non-QUIC packet incorrect length")
 			require.NoError(t, p.err, "error receiving non-QUIC packet")
 			counter++
 		case <-timeout:

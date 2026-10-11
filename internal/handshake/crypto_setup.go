@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/AeonDave/mp-quic-go/internal/monotime"
 	"github.com/AeonDave/mp-quic-go/internal/protocol"
 	"github.com/AeonDave/mp-quic-go/internal/qerr"
 	"github.com/AeonDave/mp-quic-go/internal/utils"
@@ -29,15 +30,43 @@ type cryptoSetup struct {
 	tlsConf *tls.Config
 	conn    *tls.QUICConn
 
+	// The post-handshake messages received from the server that were not completely received yet,
+	// see checkPostHandshakeMessages (client only).
+	postHandshakeData []byte
+
 	events []Event
 
+	// The version in use for the connection.
+	// It differs from chosenVersion after compatible version negotiation (RFC 9368).
 	version protocol.Version
+	// The client's Chosen Version, i.e. the version of the client's first flight.
+	// 0-RTT packets always use this version (section 4.1 of RFC 9369).
+	chosenVersion protocol.Version
+	// For the client: the versions the client supports, sorted by preference.
+	// For the server: the versions the server prefers for compatible version negotiation,
+	// sorted by preference. If empty, the server uses the client's Chosen Version.
+	versions []protocol.Version
+	// set by the client, if this connection attempt was started in response to a Version Negotiation packet
+	reactedToVersionNegotiation bool
+	// Did we write data at the Initial encryption level?
+	// For the server, this is a HelloRetryRequest, if it happens before receiving the transport parameters.
+	wroteInitialData bool
+	// For the server: the first ClientHello, until it was received completely.
+	clientHello []byte
+	// For the server: set once the first ClientHello was received completely.
+	parsedClientHello bool
+	// For the server: the client's Version Information, once the Negotiated Version was selected.
+	negotiatedVersionInfo *wire.VersionInformation
+	// the connection ID used to derive the Initial keys
+	initialConnID protocol.ConnectionID
 
 	ourParams  *wire.TransportParameters
 	peerParams *wire.TransportParameters
 
 	zeroRTTParameters *wire.TransportParameters
 	allow0RTT         bool
+	// Server only: records that a session ticket is used for 0-RTT, see NewCryptoSetupServer.
+	useTicketFor0RTT func(SessionTicketID, time.Time) bool
 
 	rttStats *utils.RTTStats
 
@@ -53,11 +82,20 @@ type cryptoSetup struct {
 
 	initialOpener LongHeaderOpener
 	initialSealer LongHeaderSealer
+	// After switching to a different version, the server keeps the Initial keys of the client's Chosen Version
+	// until it drops the Initial keys (section 4.1 of RFC 9369).
+	chosenVersionInitialOpener LongHeaderOpener
+	// Before the client learns the Negotiated Version, it might receive Initial packets of another compatible version.
+	candidateVersion       protocol.Version
+	candidateInitialOpener LongHeaderOpener
 
 	handshakeOpener LongHeaderOpener
 	handshakeSealer LongHeaderSealer
 
 	used0RTT atomic.Bool
+
+	// the cipher suite negotiated by TLS, set when the first keys are installed
+	suite cipherSuite
 
 	aead          *updatableAEAD
 	has1RTTSealer bool
@@ -66,7 +104,11 @@ type cryptoSetup struct {
 
 var _ CryptoSetup = &cryptoSetup{}
 
-// NewCryptoSetupClient creates a new crypto setup for the client
+// NewCryptoSetupClient creates a new crypto setup for the client.
+// The version is the client's Chosen Version, versions are the versions supported by the client,
+// sorted by preference.
+// reactedToVersionNegotiation is set if this connection attempt was started in response to a Version Negotiation packet.
+// These are needed to validate the server's version_information transport parameter (section 4 of RFC 9368).
 func NewCryptoSetupClient(
 	connID protocol.ConnectionID,
 	tp *wire.TransportParameters,
@@ -76,6 +118,8 @@ func NewCryptoSetupClient(
 	qlogger qlogwriter.Recorder,
 	logger utils.Logger,
 	version protocol.Version,
+	versions []protocol.Version,
+	reactedToVersionNegotiation bool,
 ) CryptoSetup {
 	cs := newCryptoSetup(
 		connID,
@@ -86,9 +130,15 @@ func NewCryptoSetupClient(
 		protocol.PerspectiveClient,
 		version,
 	)
+	cs.versions = versions
+	cs.reactedToVersionNegotiation = reactedToVersionNegotiation
 
-	tlsConf = tlsConf.Clone()
-	tlsConf.MinVersion = tls.VersionTLS13
+	tlsConf = setupConfigForClient(tlsConf)
+	if tlsConf.ClientSessionCache != nil {
+		// Session tickets are specific to a QUIC version (section 5 of RFC 9369).
+		tlsConf = tlsConf.Clone()
+		tlsConf.ClientSessionCache = &versionedSessionCache{ClientSessionCache: tlsConf.ClientSessionCache, cs: cs}
+	}
 	cs.tlsConf = tlsConf
 	cs.allow0RTT = enable0RTT
 
@@ -101,17 +151,28 @@ func NewCryptoSetupClient(
 	return cs
 }
 
-// NewCryptoSetupServer creates a new crypto setup for the server
+// NewCryptoSetupServer creates a new crypto setup for the server.
+// The version is the version of the client's first flight.
+// If preferredVersions is not empty, the server performs compatible version negotiation (section 2.3 of RFC 9368),
+// selecting the first of the preferredVersions that the client's first flight is compatible with.
+// The CryptoSetup then emits an EventVersionNegotiated, if it switched to a different version.
+//
+// If allow0RTT is set, useTicketFor0RTT is called for every session ticket that a client uses for 0-RTT, with the ID
+// and the issue time of the ticket, before accepting 0-RTT. It returns false if the ticket must not be used for 0-RTT,
+// because it was already used, which protects against the replay of 0-RTT data (section 9.2 of RFC 9001,
+// section 8 of RFC 8446). If it is nil, 0-RTT is rejected.
 func NewCryptoSetupServer(
 	connID protocol.ConnectionID,
 	localAddr, remoteAddr net.Addr,
 	tp *wire.TransportParameters,
 	tlsConf *tls.Config,
 	allow0RTT bool,
+	useTicketFor0RTT func(SessionTicketID, time.Time) bool,
 	rttStats *utils.RTTStats,
 	qlogger qlogwriter.Recorder,
 	logger utils.Logger,
 	version protocol.Version,
+	preferredVersions []protocol.Version,
 ) CryptoSetup {
 	cs := newCryptoSetup(
 		connID,
@@ -123,14 +184,14 @@ func NewCryptoSetupServer(
 		version,
 	)
 	cs.allow0RTT = allow0RTT
+	cs.useTicketFor0RTT = useTicketFor0RTT
+	cs.versions = preferredVersions
 
 	tlsConf = setupConfigForServer(tlsConf, localAddr, remoteAddr)
+	tlsConf = restrictSessionTicketsToVersion(tlsConf, version)
 
 	cs.tlsConf = tlsConf
-	cs.conn = tls.QUICServer(&tls.QUICConfig{
-		TLSConfig:           tlsConf,
-		EnableSessionEvents: true,
-	})
+	cs.conn = tls.QUICServer(getQUICConfig(tlsConf, localAddr, remoteAddr))
 	return cs
 }
 
@@ -157,6 +218,7 @@ func newCryptoSetup(
 	return &cryptoSetup{
 		initialSealer: initialSealer,
 		initialOpener: initialOpener,
+		initialConnID: connID,
 		aead:          newUpdatableAEAD(rttStats, qlogger, logger, version),
 		events:        make([]Event, 0, 16),
 		ourParams:     tp,
@@ -165,11 +227,20 @@ func newCryptoSetup(
 		logger:        logger,
 		perspective:   perspective,
 		version:       version,
+		chosenVersion: version,
 	}
 }
 
 func (h *cryptoSetup) ChangeConnectionID(id protocol.ConnectionID) {
-	initialSealer, initialOpener := NewInitialAEAD(id, h.perspective, h.version)
+	h.initialConnID = id
+	h.candidateVersion = 0
+	h.candidateInitialOpener = nil
+	h.installInitialKeys()
+}
+
+// installInitialKeys derives the Initial keys for the current version and connection ID.
+func (h *cryptoSetup) installInitialKeys() {
+	initialSealer, initialOpener := NewInitialAEAD(h.initialConnID, h.perspective, h.version)
 	h.initialSealer = initialSealer
 	h.initialOpener = initialOpener
 	if h.qlogger != nil {
@@ -184,8 +255,75 @@ func (h *cryptoSetup) ChangeConnectionID(id protocol.ConnectionID) {
 	}
 }
 
+// SwitchVersion is called by the client when it learns the Negotiated Version of compatible version negotiation,
+// i.e. when it receives the first Initial packet with a version that differs from the client's Chosen Version
+// (section 4.1 of RFC 9369).
+// It must be called before the CRYPTO frames of this packet are handled.
+func (h *cryptoSetup) SwitchVersion(v protocol.Version) {
+	if h.perspective == protocol.PerspectiveServer {
+		panic("cryptoSetup BUG: SwitchVersion called for the server")
+	}
+	if v == h.version {
+		return
+	}
+	h.switchVersion(v)
+	h.candidateVersion = 0
+	h.candidateInitialOpener = nil
+}
+
+func (h *cryptoSetup) switchVersion(v protocol.Version) {
+	if h.handshakeOpener != nil || h.handshakeSealer != nil {
+		panic("cryptoSetup BUG: switching version after installing Handshake keys")
+	}
+	h.logger.Debugf("Switching from QUIC version %s to %s", h.version, v)
+	prevOpener := h.initialOpener
+	if h.perspective == protocol.PerspectiveServer && h.version == h.chosenVersion {
+		// Packets from the client might still use the Chosen Version.
+		h.chosenVersionInitialOpener = h.initialOpener
+	}
+	h.version = v
+	// The Handshake and 1-RTT keys are derived using the Negotiated Version.
+	h.aead.version = v
+	h.installInitialKeys()
+	// The packet number space of the Initial packets continues.
+	continuePacketNumberSpace(h.initialOpener, prevOpener, h.candidateInitialOpener)
+}
+
 func (h *cryptoSetup) SetLargest1RTTAcked(pn protocol.PacketNumber) error {
 	return h.aead.SetLargestAcked(pn)
+}
+
+// SetLargest1RTTAckedForPath is called when the peer acknowledges 1-RTT packets sent on a path.
+func (h *cryptoSetup) SetLargest1RTTAckedForPath(pathID protocol.PathID, pn protocol.PacketNumber, now monotime.Time) error {
+	return h.aead.SetLargestAckedForPath(pathID, pn, now)
+}
+
+// EnableMultipath enables the multipath extension (draft-ietf-quic-multipath) for the 1-RTT keys.
+// It is called after receiving the peer's transport parameters, if both endpoints advertised the
+// initial_max_path_id transport parameter. At that point, the cipher suite has been negotiated.
+// maxPTO returns the largest PTO among all paths.
+func (h *cryptoSetup) EnableMultipath(maxPTO func() time.Duration) error {
+	if h.suite.ID == 0 {
+		return &qerr.TransportError{
+			ErrorCode:    qerr.InternalError,
+			ErrorMessage: "cipher suite not negotiated yet",
+		}
+	}
+	// Section 2.1 of draft-ietf-quic-multipath:
+	// Cipher suites with a nonce shorter than 12 bytes cannot be used together with the multipath extension.
+	if h.suite.IVLen() < minMultipathNonceLength {
+		return &qerr.TransportError{
+			ErrorCode:    qerr.TransportParameterError,
+			ErrorMessage: fmt.Sprintf("cipher suite %s can't be used with multipath", tls.CipherSuiteName(h.suite.ID)),
+		}
+	}
+	h.aead.EnableMultipath(maxPTO)
+	return nil
+}
+
+// DropPath drops the 1-RTT packet protection state of a path.
+func (h *cryptoSetup) DropPath(pathID protocol.PathID) {
+	h.aead.DropPath(pathID)
 }
 
 func (h *cryptoSetup) StartHandshake(ctx context.Context) error {
@@ -229,6 +367,16 @@ func (h *cryptoSetup) HandleMessage(data []byte, encLevel protocol.EncryptionLev
 }
 
 func (h *cryptoSetup) handleMessage(data []byte, encLevel protocol.EncryptionLevel) error {
+	if h.perspective == protocol.PerspectiveServer && encLevel == protocol.EncryptionInitial && !h.parsedClientHello {
+		if err := h.negotiateVersionFromClientHello(data); err != nil {
+			return err
+		}
+	}
+	if h.perspective == protocol.PerspectiveClient && encLevel == protocol.Encryption1RTT {
+		if err := h.checkPostHandshakeMessages(data); err != nil {
+			return err
+		}
+	}
 	if err := h.conn.HandleData(encLevel.ToTLSEncryptionLevel(), data); err != nil {
 		return err
 	}
@@ -241,6 +389,43 @@ func (h *cryptoSetup) handleMessage(data []byte, encLevel protocol.EncryptionLev
 			return nil
 		}
 	}
+}
+
+// checkPostHandshakeMessages checks the TLS messages that the server sends after the handshake, before
+// crypto/tls processes them. crypto/tls rejects the following messages with other errors than RFC 9001 requires:
+//   - a CertificateRequest: post-handshake client authentication is not allowed (section 4.4 of RFC 9001),
+//   - a NewSessionTicket with an early_data extension whose max_early_data_size is not 0xffffffff
+//     (section 4.6.1 of RFC 9001).
+//
+// Both are a PROTOCOL_VIOLATION.
+func (h *cryptoSetup) checkPostHandshakeMessages(data []byte) error {
+	h.postHandshakeData = append(h.postHandshakeData, data...)
+	for len(h.postHandshakeData) >= 4 {
+		msgLen := 4 + (int(h.postHandshakeData[1])<<16 | int(h.postHandshakeData[2])<<8 | int(h.postHandshakeData[3]))
+		if len(h.postHandshakeData) < msgLen {
+			return nil
+		}
+		msg := h.postHandshakeData[:msgLen]
+		switch msg[0] {
+		case typeCertificateRequest:
+			return &qerr.TransportError{
+				ErrorCode:    qerr.ProtocolViolation,
+				ErrorMessage: "received a post-handshake CertificateRequest",
+			}
+		case typeNewSessionTicket:
+			if size, ok := newSessionTicketMaxEarlyDataSize(msg); ok && size != 0xffffffff {
+				return &qerr.TransportError{
+					ErrorCode:    qerr.ProtocolViolation,
+					ErrorMessage: fmt.Sprintf("invalid max_early_data_size in NewSessionTicket: %d", size),
+				}
+			}
+		}
+		h.postHandshakeData = h.postHandshakeData[msgLen:]
+	}
+	if len(h.postHandshakeData) == 0 {
+		h.postHandshakeData = nil
+	}
+	return nil
 }
 
 func (h *cryptoSetup) handleEvent(ev tls.QUICEvent) (err error) {
@@ -296,6 +481,8 @@ func (h *cryptoSetup) handleEvent(ev tls.QUICEvent) (err error) {
 			ev.SessionState.EarlyData = allowEarlyData
 		}
 		return nil
+	case tls.QUICErrorEvent:
+		return ev.Err
 	default:
 		// Unknown events should be ignored.
 		// crypto/tls will ensure that this is safe to do.
@@ -318,8 +505,25 @@ func (h *cryptoSetup) handleTransportParameters(data []byte) error {
 	if err := tp.Unmarshal(data, h.perspective.Opposite()); err != nil {
 		return err
 	}
+	var negotiatedVersion protocol.Version
+	switch h.perspective {
+	case protocol.PerspectiveServer:
+		v, err := h.negotiateVersion(tp.VersionInformation)
+		if err != nil {
+			return err
+		}
+		negotiatedVersion = v
+	case protocol.PerspectiveClient:
+		if err := h.validateVersionInformation(tp.VersionInformation); err != nil {
+			return err
+		}
+	}
 	h.peerParams = &tp
 	h.events = append(h.events, Event{Kind: EventReceivedTransportParameters, TransportParameters: h.peerParams})
+	if negotiatedVersion != 0 && negotiatedVersion != h.version {
+		h.switchVersion(negotiatedVersion)
+		h.events = append(h.events, Event{Kind: EventVersionNegotiated, Version: negotiatedVersion})
+	}
 	return nil
 }
 
@@ -370,9 +574,8 @@ func decodeDataFromSessionState(b []byte, earlyData bool) (*wire.TransportParame
 }
 
 func (h *cryptoSetup) getDataForSessionTicket() []byte {
-	return (&sessionTicket{
-		Parameters: h.ourParams,
-	}).Marshal()
+	// After compatible version negotiation, the ticket belongs to the Negotiated Version (section 5 of RFC 9369).
+	return newSessionTicket(h.version, h.ourParams, time.Now()).Marshal()
 }
 
 // GetSessionTicket generates a new session ticket.
@@ -427,6 +630,12 @@ func (h *cryptoSetup) handleSessionTicket(data []byte, using0RTT bool) (allowEar
 	if !using0RTT {
 		return false
 	}
+	// Session tickets are specific to a QUIC version (section 5 of RFC 9369).
+	// Tickets of other versions are usually rejected by the UnwrapSession callback already.
+	if t.Version != h.chosenVersion {
+		h.logger.Debugf("Session ticket was issued for QUIC version %s. Rejecting 0-RTT.", t.Version)
+		return false
+	}
 	valid := h.ourParams.ValidFor0RTT(t.Parameters)
 	if !valid {
 		h.logger.Debugf("Transport parameters changed. Rejecting 0-RTT.")
@@ -434,6 +643,11 @@ func (h *cryptoSetup) handleSessionTicket(data []byte, using0RTT bool) (allowEar
 	}
 	if !h.allow0RTT {
 		h.logger.Debugf("0-RTT not allowed. Rejecting 0-RTT.")
+		return false
+	}
+	// This needs to be the last check: the ticket can't be used for 0-RTT again.
+	if h.useTicketFor0RTT == nil || !h.useTicketFor0RTT(t.ID, t.Issued) {
+		h.logger.Debugf("Session ticket can't be used for 0-RTT (already used, or too old). Rejecting 0-RTT.")
 		return false
 	}
 	return true
@@ -453,21 +667,26 @@ func (h *cryptoSetup) rejected0RTT() {
 
 func (h *cryptoSetup) setReadKey(el tls.QUICEncryptionLevel, suiteID uint16, trafficSecret []byte) {
 	suite := getCipherSuite(suiteID)
+	h.suite = suite
+	var ev EventKind
 	//nolint:exhaustive // The TLS stack doesn't export Initial keys.
 	switch el {
 	case tls.QUICEncryptionLevelEarly:
+		ev = EventReceived0RTTReadKeys
 		if h.perspective == protocol.PerspectiveClient {
 			panic("Received 0-RTT read key for the client")
 		}
+		// 0-RTT packets use the client's Chosen Version (section 4.1 of RFC 9369).
 		h.zeroRTTOpener = newLongHeaderOpener(
-			createAEAD(suite, trafficSecret, h.version),
-			newHeaderProtector(suite, trafficSecret, true, h.version),
+			createAEAD(suite, trafficSecret, h.chosenVersion),
+			newHeaderProtector(suite, trafficSecret, true, h.chosenVersion),
 		)
 		h.used0RTT.Store(true)
 		if h.logger.Debug() {
 			h.logger.Debugf("Installed 0-RTT Read keys (using %s)", tls.CipherSuiteName(suite.ID))
 		}
 	case tls.QUICEncryptionLevelHandshake:
+		ev = EventReceivedHandshakeReadKeys
 		h.handshakeOpener = newLongHeaderOpener(
 			createAEAD(suite, trafficSecret, h.version),
 			newHeaderProtector(suite, trafficSecret, true, h.version),
@@ -476,6 +695,7 @@ func (h *cryptoSetup) setReadKey(el tls.QUICEncryptionLevel, suiteID uint16, tra
 			h.logger.Debugf("Installed Handshake Read keys (using %s)", tls.CipherSuiteName(suite.ID))
 		}
 	case tls.QUICEncryptionLevelApplication:
+		ev = EventReceived1RTTReadKeys
 		h.aead.SetReadKey(suite, trafficSecret)
 		h.has1RTTOpener = true
 		if h.logger.Debug() {
@@ -484,7 +704,7 @@ func (h *cryptoSetup) setReadKey(el tls.QUICEncryptionLevel, suiteID uint16, tra
 	default:
 		panic("unexpected read encryption level")
 	}
-	h.events = append(h.events, Event{Kind: EventReceivedReadKeys})
+	h.events = append(h.events, Event{Kind: ev})
 	if h.qlogger != nil {
 		h.qlogger.RecordEvent(qlog.KeyUpdated{
 			Trigger: qlog.KeyUpdateTLS,
@@ -495,15 +715,17 @@ func (h *cryptoSetup) setReadKey(el tls.QUICEncryptionLevel, suiteID uint16, tra
 
 func (h *cryptoSetup) setWriteKey(el tls.QUICEncryptionLevel, suiteID uint16, trafficSecret []byte) {
 	suite := getCipherSuite(suiteID)
+	h.suite = suite
 	//nolint:exhaustive // The TLS stack doesn't export Initial keys.
 	switch el {
 	case tls.QUICEncryptionLevelEarly:
 		if h.perspective == protocol.PerspectiveServer {
 			panic("Received 0-RTT write key for the server")
 		}
+		// 0-RTT packets use the client's Chosen Version (section 4.1 of RFC 9369).
 		h.zeroRTTSealer = newLongHeaderSealer(
-			createAEAD(suite, trafficSecret, h.version),
-			newHeaderProtector(suite, trafficSecret, true, h.version),
+			createAEAD(suite, trafficSecret, h.chosenVersion),
+			newHeaderProtector(suite, trafficSecret, true, h.chosenVersion),
 		)
 		if h.logger.Debug() {
 			h.logger.Debugf("Installed 0-RTT Write keys (using %s)", tls.CipherSuiteName(suite.ID))
@@ -555,6 +777,7 @@ func (h *cryptoSetup) writeRecord(encLevel tls.QUICEncryptionLevel, p []byte) {
 	//nolint:exhaustive // handshake records can only be written for Initial and Handshake.
 	switch encLevel {
 	case tls.QUICEncryptionLevelInitial:
+		h.wroteInitialData = true
 		h.events = append(h.events, Event{Kind: EventWriteInitialData, Data: p})
 	case tls.QUICEncryptionLevelHandshake:
 		h.events = append(h.events, Event{Kind: EventWriteHandshakeData, Data: p})
@@ -569,6 +792,9 @@ func (h *cryptoSetup) DiscardInitialKeys() {
 	dropped := h.initialOpener != nil
 	h.initialOpener = nil
 	h.initialSealer = nil
+	h.chosenVersionInitialOpener = nil
+	h.candidateVersion = 0
+	h.candidateInitialOpener = nil
 	if dropped {
 		h.logger.Debugf("Dropping Initial keys.")
 		if h.qlogger != nil {
@@ -629,14 +855,42 @@ func (h *cryptoSetup) Get1RTTSealer() (ShortHeaderSealer, error) {
 	if !h.has1RTTSealer {
 		return nil, ErrKeysNotYetAvailable
 	}
+	if h.aead.ConfidentialityLimitReached() {
+		return nil, ErrConfidentialityLimitReached
+	}
 	return h.aead, nil
 }
 
-func (h *cryptoSetup) GetInitialOpener() (LongHeaderOpener, error) {
+// GetInitialOpener returns the opener for Initial packets of version v.
+func (h *cryptoSetup) GetInitialOpener(v protocol.Version) (LongHeaderOpener, error) {
 	if h.initialOpener == nil {
 		return nil, ErrKeysDropped
 	}
-	return h.initialOpener, nil
+	if v == h.version {
+		return h.initialOpener, nil
+	}
+	switch h.perspective {
+	case protocol.PerspectiveServer:
+		// The client might send Initial packets using its Chosen Version
+		// until it learns the Negotiated Version (section 4.1 of RFC 9369).
+		if v == h.chosenVersion && h.chosenVersionInitialOpener != nil {
+			return h.chosenVersionInitialOpener, nil
+		}
+	case protocol.PerspectiveClient:
+		// The client learns the Negotiated Version by observing the first long header Version field
+		// that differs from its Chosen Version (section 4.1 of RFC 9369).
+		// This is only possible before the Handshake keys are installed.
+		if h.handshakeOpener == nil && h.version == h.chosenVersion && protocol.IsCompatibleVersion(h.version, v) {
+			if h.candidateVersion != v {
+				_, opener := NewInitialAEAD(h.initialConnID, h.perspective, v)
+				continuePacketNumberSpace(opener, h.initialOpener)
+				h.candidateVersion = v
+				h.candidateInitialOpener = opener
+			}
+			return h.candidateInitialOpener, nil
+		}
+	}
+	return nil, ErrUnexpectedVersion
 }
 
 func (h *cryptoSetup) Get0RTTOpener() (LongHeaderOpener, error) {
@@ -684,8 +938,12 @@ func (h *cryptoSetup) ConnectionState() ConnectionState {
 }
 
 func wrapError(err error) error {
-	if alertErr := tls.AlertError(0); errors.As(err, &alertErr) {
+	if alertErr, ok := errors.AsType[tls.AlertError](err); ok {
 		return qerr.NewLocalCryptoError(uint8(alertErr), err)
+	}
+	// errors returned when processing the transport parameters, e.g. a TRANSPORT_PARAMETER_ERROR
+	if transportErr, ok := errors.AsType[*qerr.TransportError](err); ok {
+		return transportErr
 	}
 	return &qerr.TransportError{ErrorCode: qerr.InternalError, ErrorMessage: err.Error()}
 }

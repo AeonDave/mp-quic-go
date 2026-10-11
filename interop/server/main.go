@@ -6,9 +6,10 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 
-	"github.com/AeonDave/mp-quic-go"
+	quic "github.com/AeonDave/mp-quic-go"
 	"github.com/AeonDave/mp-quic-go/http3"
 	"github.com/AeonDave/mp-quic-go/internal/qtls"
 	"github.com/AeonDave/mp-quic-go/interop/http09"
@@ -51,8 +52,15 @@ func main() {
 	}
 
 	switch testcase {
-	case "versionnegotiation", "handshake", "retry", "transfer", "resumption", "multiconnect", "zerortt":
+	case "versionnegotiation", "handshake", "retry", "transfer", "resumption", "multiconnect", "zerortt", "ecn":
+		// ECN is used by default, if the platform supports it.
 		err = runHTTP09Server(tlsConf, quicConf, testcase == "retry")
+	case "connectionmigration":
+		err = runPreferredAddressServer(tlsConf, quicConf)
+	case "v2":
+		// prefer QUIC version 2, using compatible version negotiation (RFC 9368)
+		quicConf.Versions = []quic.Version{quic.Version2, quic.Version1}
+		err = runHTTP09Server(tlsConf, quicConf, false)
 	case "chacha20":
 		reset := qtls.SetCipherSuite(tls.TLS_CHACHA20_POLY1305_SHA256)
 		defer reset()
@@ -86,6 +94,36 @@ func runHTTP09Server(tlsConf *tls.Config, quicConf *quic.Config, forceRetry bool
 	tr := &quic.Transport{
 		Conn:                conn,
 		VerifySourceAddress: func(net.Addr) bool { return forceRetry },
+	}
+	ln, err := tr.ListenEarly(tlsConf, quicConf)
+	if err != nil {
+		return err
+	}
+	return server.ServeListener(ln)
+}
+
+// The server's addresses in the network of the interop runner.
+var (
+	serverIPv4 = netip.MustParseAddrPort("193.167.100.100:443")
+	serverIPv6 = netip.MustParseAddrPort("[fd00:cafe:cafe:100::100]:443")
+)
+
+// runPreferredAddressServer sends the server's preferred address (section 9.6 of RFC 9000).
+// The server recognizes the packets sent to the preferred address by their local IP address, so the preferred
+// address needs a different IP address than the one the client connected to: the server sends its address of the
+// other address family as its preferred address.
+func runPreferredAddressServer(tlsConf *tls.Config, quicConf *quic.Config) error {
+	http.DefaultServeMux.Handle("/", http.FileServer(http.Dir("/www")))
+	server := http09.Server{}
+
+	// a dual-stack socket, receiving the packets sent to both addresses
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: 443})
+	if err != nil {
+		return err
+	}
+	tr := &quic.Transport{
+		Conn:             conn,
+		PreferredAddress: &quic.PreferredAddress{IPv4: serverIPv4, IPv6: serverIPv6},
 	}
 	ln, err := tr.ListenEarly(tlsConf, quicConf)
 	if err != nil {

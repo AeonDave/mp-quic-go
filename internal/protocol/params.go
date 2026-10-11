@@ -2,12 +2,6 @@ package protocol
 
 import "time"
 
-// DesiredReceiveBufferSize is the kernel UDP receive buffer size that we'd like to use.
-const DesiredReceiveBufferSize = (1 << 20) * 7 // 7 MB
-
-// DesiredSendBufferSize is the kernel UDP send buffer size that we'd like to use.
-const DesiredSendBufferSize = (1 << 20) * 7 // 7 MB
-
 // InitialPacketSize is the initial (before Path MTU discovery) maximum packet size used.
 const InitialPacketSize = 1280
 
@@ -134,6 +128,15 @@ const MaxActiveConnectionIDs = 4
 
 // MaxIssuedConnectionIDs is the maximum number of connection IDs that we're issuing at the same time.
 const MaxIssuedConnectionIDs = 6
+
+// MaxMultipathPaths is the maximum number of paths that the OLIA congestion controller keeps track of.
+// It is also the upper bound for Config.MaxPaths.
+const MaxMultipathPaths = 64
+
+// MaxAdvertisedAddresses is the maximum number of addresses that an endpoint advertises using the
+// address advertisement extension (ADD_ADDRESS), and the maximum number of addresses advertised by the peer
+// that an endpoint keeps track of.
+const MaxAdvertisedAddresses = 16
 
 // PacketsPerConnectionID is the number of packets we send using one connection ID.
 // If the peer provices us with enough new connection IDs, we switch to a new connection ID.

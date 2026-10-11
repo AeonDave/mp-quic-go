@@ -186,6 +186,16 @@ func (e ConnectionClosed) Encode(enc *jsontext.Encoder, _ time.Time) error {
 				h.WriteToken(jsontext.String("aead_limit_reached"))
 			case qerr.NoViablePathError:
 				h.WriteToken(jsontext.String("no_viable_path"))
+			case qerr.VersionNegotiationErrorCode:
+				h.WriteToken(jsontext.String("version_negotiation_error"))
+			case qerr.ApplicationAbandonPath:
+				h.WriteToken(jsontext.String("application_abandon_path"))
+			case qerr.PathResourceLimitReached:
+				h.WriteToken(jsontext.String("path_resource_limit_reached"))
+			case qerr.PathUnstableOrPoor:
+				h.WriteToken(jsontext.String("path_unstable_or_poor"))
+			case qerr.NoCIDAvailableForPath:
+				h.WriteToken(jsontext.String("no_cid_available_for_path"))
 			default:
 				h.WriteToken(jsontext.String("unknown"))
 				h.WriteToken(jsontext.String("error_code"))
@@ -212,14 +222,14 @@ func (e ConnectionClosed) Encode(enc *jsontext.Encoder, _ time.Time) error {
 }
 
 type PacketSent struct {
-	Header            PacketHeader
-	Raw               RawInfo
-	DatagramID        DatagramID
-	Frames            []Frame
-	ECN               ECN
-	IsCoalesced       bool
-	Trigger           string
-	SupportedVersions []Version
+	Header                  PacketHeader
+	Raw                     RawInfo
+	DatagramPayloadChecksum DatagramPayloadChecksum
+	Frames                  []Frame
+	ECN                     ECN
+	IsCoalesced             bool
+	Trigger                 string
+	SupportedVersions       []Version
 }
 
 func (e PacketSent) Name() string { return "transport:packet_sent" }
@@ -235,9 +245,9 @@ func (e PacketSent) Encode(enc *jsontext.Encoder, _ time.Time) error {
 	if err := e.Raw.encode(enc); err != nil {
 		return err
 	}
-	if e.DatagramID != 0 {
-		h.WriteToken(jsontext.String("datagram_id"))
-		h.WriteToken(jsontext.Uint(uint64(e.DatagramID)))
+	if e.DatagramPayloadChecksum != 0 {
+		h.WriteToken(jsontext.String("datagram_payload_checksum"))
+		h.WriteToken(jsontext.Uint(uint64(e.DatagramPayloadChecksum)))
 	}
 	if len(e.Frames) > 0 {
 		h.WriteToken(jsontext.String("frames"))
@@ -262,13 +272,13 @@ func (e PacketSent) Encode(enc *jsontext.Encoder, _ time.Time) error {
 }
 
 type PacketReceived struct {
-	Header      PacketHeader
-	Raw         RawInfo
-	DatagramID  DatagramID
-	Frames      []Frame
-	ECN         ECN
-	IsCoalesced bool
-	Trigger     string
+	Header                  PacketHeader
+	Raw                     RawInfo
+	DatagramPayloadChecksum DatagramPayloadChecksum
+	Frames                  []Frame
+	ECN                     ECN
+	IsCoalesced             bool
+	Trigger                 string
 }
 
 func (e PacketReceived) Name() string { return "transport:packet_received" }
@@ -284,9 +294,9 @@ func (e PacketReceived) Encode(enc *jsontext.Encoder, _ time.Time) error {
 	if err := e.Raw.encode(enc); err != nil {
 		return err
 	}
-	if e.DatagramID != 0 {
-		h.WriteToken(jsontext.String("datagram_id"))
-		h.WriteToken(jsontext.Uint(uint64(e.DatagramID)))
+	if e.DatagramPayloadChecksum != 0 {
+		h.WriteToken(jsontext.String("datagram_payload_checksum"))
+		h.WriteToken(jsontext.Uint(uint64(e.DatagramPayloadChecksum)))
 	}
 	if len(e.Frames) > 0 {
 		h.WriteToken(jsontext.String("frames"))
@@ -355,9 +365,9 @@ func (e VersionNegotiationSent) Encode(enc *jsontext.Encoder, _ time.Time) error
 }
 
 type PacketBuffered struct {
-	Header     PacketHeader
-	Raw        RawInfo
-	DatagramID DatagramID
+	Header                  PacketHeader
+	Raw                     RawInfo
+	DatagramPayloadChecksum DatagramPayloadChecksum
 }
 
 func (e PacketBuffered) Name() string { return "transport:packet_buffered" }
@@ -373,9 +383,9 @@ func (e PacketBuffered) Encode(enc *jsontext.Encoder, _ time.Time) error {
 	if err := e.Raw.encode(enc); err != nil {
 		return err
 	}
-	if e.DatagramID != 0 {
-		h.WriteToken(jsontext.String("datagram_id"))
-		h.WriteToken(jsontext.Uint(uint64(e.DatagramID)))
+	if e.DatagramPayloadChecksum != 0 {
+		h.WriteToken(jsontext.String("datagram_payload_checksum"))
+		h.WriteToken(jsontext.Uint(uint64(e.DatagramPayloadChecksum)))
 	}
 	h.WriteToken(jsontext.String("trigger"))
 	h.WriteToken(jsontext.String("keys_unavailable"))
@@ -385,10 +395,10 @@ func (e PacketBuffered) Encode(enc *jsontext.Encoder, _ time.Time) error {
 
 // PacketDropped is the transport:packet_dropped event.
 type PacketDropped struct {
-	Header     PacketHeader
-	Raw        RawInfo
-	DatagramID DatagramID
-	Trigger    PacketDropReason
+	Header                  PacketHeader
+	Raw                     RawInfo
+	DatagramPayloadChecksum DatagramPayloadChecksum
+	Trigger                 PacketDropReason
 }
 
 func (e PacketDropped) Name() string { return "transport:packet_dropped" }
@@ -404,12 +414,37 @@ func (e PacketDropped) Encode(enc *jsontext.Encoder, _ time.Time) error {
 	if err := e.Raw.encode(enc); err != nil {
 		return err
 	}
-	if e.DatagramID != 0 {
-		h.WriteToken(jsontext.String("datagram_id"))
-		h.WriteToken(jsontext.Uint(uint64(e.DatagramID)))
+	if e.DatagramPayloadChecksum != 0 {
+		h.WriteToken(jsontext.String("datagram_payload_checksum"))
+		h.WriteToken(jsontext.Uint(uint64(e.DatagramPayloadChecksum)))
 	}
 	h.WriteToken(jsontext.String("trigger"))
 	h.WriteToken(jsontext.String(string(e.Trigger)))
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
+// StreamPriorityUpdated closely follows the http3:priority_updated event from
+// draft-ietf-quic-qlog-h3-events.
+type StreamPriorityUpdated struct {
+	StreamID    StreamID
+	Urgency     int8
+	Incremental bool
+}
+
+func (e StreamPriorityUpdated) Name() string { return "transport:priority_updated" }
+
+func (e StreamPriorityUpdated) Encode(enc *jsontext.Encoder, _ time.Time) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("stream_id"))
+	h.WriteToken(jsontext.Int(int64(e.StreamID)))
+	h.WriteToken(jsontext.String("new"))
+	newPriority := fmt.Sprintf("u=%d", e.Urgency)
+	if e.Incremental {
+		newPriority += ", i"
+	}
+	h.WriteToken(jsontext.String(newPriority))
 	h.WriteToken(jsontext.EndObject)
 	return h.err
 }
@@ -434,7 +469,7 @@ func (e MTUUpdated) Encode(enc *jsontext.Encoder, _ time.Time) error {
 
 // MetricsUpdated logs RTT and congestion metrics as defined in the
 // recovery:metrics_updated event.
-// The PTO count is logged via PTOCountUpdated.
+// The PTO count is logged via [PTOCountUpdated].
 type MetricsUpdated struct {
 	MinRTT           time.Duration
 	SmoothedRTT      time.Duration
@@ -500,7 +535,9 @@ func (e PTOCountUpdated) Encode(enc *jsontext.Encoder, _ time.Time) error {
 }
 
 type PacketLost struct {
-	Header  PacketHeader
+	Header PacketHeader
+	// The trigger is omitted if it is empty, e.g. for the packets of a path of IETF Multipath QUIC
+	// that potentially failed.
 	Trigger PacketLossReason
 }
 
@@ -513,8 +550,10 @@ func (e PacketLost) Encode(enc *jsontext.Encoder, _ time.Time) error {
 	if err := e.Header.encode(enc); err != nil {
 		return err
 	}
-	h.WriteToken(jsontext.String("trigger"))
-	h.WriteToken(jsontext.String(string(e.Trigger)))
+	if e.Trigger != "" {
+		h.WriteToken(jsontext.String("trigger"))
+		h.WriteToken(jsontext.String(string(e.Trigger)))
+	}
 	h.WriteToken(jsontext.EndObject)
 	return h.err
 }
@@ -614,6 +653,17 @@ type ParametersSet struct {
 	PreferredAddress                *PreferredAddress
 	MaxDatagramFrameSize            protocol.ByteCount
 	EnableResetStreamAt             bool
+	// InitialMaxPathID is the initial_max_path_id transport parameter of the multipath extension.
+	// It is nil if the transport parameter was not sent.
+	InitialMaxPathID *PathID
+	// EnableAddAddress is the add_address transport parameter of the address advertisement extension
+	// of this module.
+	EnableAddAddress bool
+	// AddressDiscovery is the value of the address_discovery transport parameter of QUIC Address Discovery
+	// (draft-ietf-quic-address-discovery-01): 0, 1 or 2. It is nil if the transport parameter was not sent.
+	AddressDiscovery *uint64
+	// GreaseQUICBit is the grease_quic_bit transport parameter (RFC 9287).
+	GreaseQUICBit bool
 }
 
 func (e ParametersSet) Name() string {
@@ -704,6 +754,22 @@ func (e ParametersSet) Encode(enc *jsontext.Encoder, _ time.Time) error {
 		h.WriteToken(jsontext.String("reset_stream_at"))
 		h.WriteToken(jsontext.True)
 	}
+	if e.InitialMaxPathID != nil {
+		h.WriteToken(jsontext.String("initial_max_path_id"))
+		h.WriteToken(jsontext.Uint(uint64(*e.InitialMaxPathID)))
+	}
+	if e.EnableAddAddress {
+		h.WriteToken(jsontext.String("add_address"))
+		h.WriteToken(jsontext.True)
+	}
+	if e.AddressDiscovery != nil {
+		h.WriteToken(jsontext.String("address_discovery"))
+		h.WriteToken(jsontext.Uint(*e.AddressDiscovery))
+	}
+	if e.GreaseQUICBit {
+		h.WriteToken(jsontext.String("grease_quic_bit"))
+		h.WriteToken(jsontext.True)
+	}
 	h.WriteToken(jsontext.EndObject)
 	return h.err
 }
@@ -778,7 +844,14 @@ func (e eventLossTimerCanceled) Encode(enc *jsontext.Encoder, _ time.Time) error
 
 type CongestionStateUpdated struct {
 	State CongestionState
+	// Trigger is the event that caused the state change, if the state can be entered in several ways,
+	// e.g. CongestionStateTriggerPersistentCongestion. It is omitted if empty.
+	Trigger string
 }
+
+// CongestionStateTriggerPersistentCongestion is the trigger of a CongestionStateUpdated event
+// logged when persistent congestion is established (section 7.6 of RFC 9002).
+const CongestionStateTriggerPersistentCongestion = "persistent_congestion"
 
 func (e CongestionStateUpdated) Name() string { return "recovery:congestion_state_updated" }
 
@@ -787,6 +860,10 @@ func (e CongestionStateUpdated) Encode(enc *jsontext.Encoder, _ time.Time) error
 	h.WriteToken(jsontext.BeginObject)
 	h.WriteToken(jsontext.String("new"))
 	h.WriteToken(jsontext.String(e.State.String()))
+	if e.Trigger != "" {
+		h.WriteToken(jsontext.String("trigger"))
+		h.WriteToken(jsontext.String(e.Trigger))
+	}
 	h.WriteToken(jsontext.EndObject)
 	return h.err
 }

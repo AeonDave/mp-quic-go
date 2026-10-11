@@ -19,12 +19,17 @@ type sentPacketHistory struct {
 
 	firstPacketNumber   protocol.PacketNumber
 	highestPacketNumber protocol.PacketNumber
+
+	// The largest packet number of the acknowledged packets sent after the last packet in the history,
+	// or InvalidPacketNumber. It becomes the precedingAcked value of the next packet.
+	ackedAfterLast protocol.PacketNumber
 }
 
 func newSentPacketHistory(isAppData bool) *sentPacketHistory {
 	h := &sentPacketHistory{
 		highestPacketNumber: protocol.InvalidPacketNumber,
 		firstPacketNumber:   protocol.InvalidPacketNumber,
+		ackedAfterLast:      protocol.InvalidPacketNumber,
 	}
 	if isAppData {
 		h.packets = make([]*packet, 0, 32)
@@ -60,6 +65,8 @@ func (h *sentPacketHistory) SkippedPacket(pn protocol.PacketNumber) {
 
 func (h *sentPacketHistory) SentPacket(pn protocol.PacketNumber, p *packet) {
 	h.checkSequentialPacketNumberUse(pn)
+	p.precedingAcked = h.ackedAfterLast
+	h.ackedAfterLast = protocol.InvalidPacketNumber
 	h.packets = append(h.packets, p)
 	if p.Outstanding() {
 		h.numOutstanding++
@@ -68,7 +75,8 @@ func (h *sentPacketHistory) SentPacket(pn protocol.PacketNumber, p *packet) {
 
 func (h *sentPacketHistory) SentPathProbePacket(pn protocol.PacketNumber, p *packet) {
 	h.checkSequentialPacketNumberUse(pn)
-	h.packets = append(h.packets, &packet{isPathProbePacket: true})
+	h.packets = append(h.packets, &packet{isPathProbePacket: true, precedingAcked: h.ackedAfterLast})
+	h.ackedAfterLast = protocol.InvalidPacketNumber
 	h.pathProbePackets = append(h.pathProbePackets, packetWithPacketNumber{PacketNumber: pn, packet: p})
 }
 
@@ -133,13 +141,19 @@ func (h *sentPacketHistory) Len() int {
 	return len(h.packets)
 }
 
-// Remove removes a packet from the sent packet history.
+func (h *sentPacketHistory) NumOutstanding() int {
+	return h.numOutstanding
+}
+
+// Remove removes a packet from the sent packet history, because it was acknowledged
+// (or, for 0-RTT packets, because 0-RTT was rejected).
 // It must not be used for skipped packet numbers.
 func (h *sentPacketHistory) Remove(pn protocol.PacketNumber) error {
 	idx, ok := h.getIndex(pn)
 	if !ok {
 		return fmt.Errorf("packet %d not found in sent packet history", pn)
 	}
+	h.setPrecedingAcked(idx, pn)
 	p := h.packets[idx]
 	if p.Outstanding() {
 		h.numOutstanding--
@@ -187,36 +201,6 @@ func (h *sentPacketHistory) RemovePathProbe(pn protocol.PacketNumber) *packet {
 	return packetToDelete
 }
 
-func (h *sentPacketHistory) SetPathID(pn protocol.PacketNumber, pathID protocol.PathID) (*packet, bool) {
-	var found *packet
-	for i := range h.pathProbePackets {
-		if h.pathProbePackets[i].PacketNumber == pn {
-			h.pathProbePackets[i].packet.PathID = pathID
-			found = h.pathProbePackets[i].packet
-			break
-		}
-	}
-	idx, ok := h.getIndex(pn)
-	if !ok {
-		if found == nil {
-			return nil, false
-		}
-		return found, true
-	}
-	p := h.packets[idx]
-	if p == nil {
-		if found == nil {
-			return nil, false
-		}
-		return found, true
-	}
-	p.PathID = pathID
-	if found == nil {
-		found = p
-	}
-	return found, true
-}
-
 // getIndex gets the index of packet p in the packets slice.
 func (h *sentPacketHistory) getIndex(p protocol.PacketNumber) (int, bool) {
 	if len(h.packets) == 0 {
@@ -253,13 +237,6 @@ func (h *sentPacketHistory) cleanupStart() {
 	h.firstPacketNumber = protocol.InvalidPacketNumber
 }
 
-func (h *sentPacketHistory) LowestPacketNumber() protocol.PacketNumber {
-	if len(h.packets) == 0 {
-		return protocol.InvalidPacketNumber
-	}
-	return h.firstPacketNumber
-}
-
 func (h *sentPacketHistory) DeclareLost(pn protocol.PacketNumber) {
 	idx, ok := h.getIndex(pn)
 	if !ok {
@@ -272,10 +249,43 @@ func (h *sentPacketHistory) DeclareLost(pn protocol.PacketNumber) {
 			panic("negative number of outstanding packets")
 		}
 	}
+	// An acknowledged packet sent before p now precedes the packet following p.
+	if p.precedingAcked != protocol.InvalidPacketNumber {
+		h.setPrecedingAcked(idx, p.precedingAcked)
+	}
 	h.packets[idx] = nil
 	if idx == 0 {
 		h.cleanupStart()
 	}
+}
+
+// DeclareProbed is called when the frames of a packet are retransmitted in a PTO probe packet.
+// The packet is no longer outstanding, but it stays in the history until it is removed or declared lost.
+func (h *sentPacketHistory) DeclareProbed(pn protocol.PacketNumber) {
+	idx, ok := h.getIndex(pn)
+	if !ok {
+		return
+	}
+	p := h.packets[idx]
+	if p.Outstanding() {
+		h.numOutstanding--
+		if h.numOutstanding < 0 {
+			panic("negative number of outstanding packets")
+		}
+	}
+	p.probed = true
+}
+
+// setPrecedingAcked records that the acknowledged packet ackedPN was sent before the packet following the
+// packet at index idx: it sets the precedingAcked value of that packet, or of the next packet sent.
+func (h *sentPacketHistory) setPrecedingAcked(idx int, ackedPN protocol.PacketNumber) {
+	for _, p := range h.packets[idx+1:] {
+		if p != nil {
+			p.precedingAcked = max(p.precedingAcked, ackedPN)
+			return
+		}
+	}
+	h.ackedAfterLast = max(h.ackedAfterLast, ackedPN)
 }
 
 // Difference returns the difference between two packet numbers a and b (a - b),

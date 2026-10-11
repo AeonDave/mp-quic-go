@@ -14,7 +14,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/AeonDave/mp-quic-go"
+	quic "github.com/AeonDave/mp-quic-go"
 	"github.com/AeonDave/mp-quic-go/http3"
 	"github.com/AeonDave/mp-quic-go/internal/handshake"
 	"github.com/AeonDave/mp-quic-go/internal/protocol"
@@ -82,7 +82,13 @@ func runTestcase(testcase string) error {
 	defer r.Close()
 
 	switch testcase {
-	case "handshake", "transfer", "retry":
+	case "handshake", "transfer", "retry", "ecn":
+		// ECN is used by default, if the platform supports it.
+	case "v2":
+		// start with QUIC version 1, and ask the server to switch to version 2,
+		// using compatible version negotiation (RFC 9368)
+		quicConf.Versions = []quic.Version{quic.Version2, quic.Version1}
+		quicConf.InitialVersion = quic.Version1
 	case "keyupdate":
 		handshake.FirstKeyUpdateInterval = 100
 	case "chacha20":

@@ -5,45 +5,59 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AeonDave/mp-quic-go/internal/protocol"
 	"github.com/stretchr/testify/require"
 )
 
-func TestPathSchedulerWrapper_SelectPathProvidesAddresses(t *testing.T) {
-	pm := NewMultipathPathManager(protocol.PerspectiveClient)
-	pm.EnableMultipath()
-
-	localAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1234}
-	remoteAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 4321}
-	pm.SetPrimaryPath(localAddr, remoteAddr)
-
-	scheduler := NewMultipathScheduler(pm, SchedulingPolicyRoundRobin)
+// The scheduler wrapper selects one of the paths passed in the context, and returns its PathInfo.
+func TestPathSchedulerWrapperSelectPathProvidesAddresses(t *testing.T) {
+	scheduler := NewMultipathScheduler(SchedulingPolicyRoundRobin)
 	scheduler.EnableMultipath()
 
-	info, ok := scheduler.SelectPath(PathSelectionContext{Now: time.Now()})
+	path := PathInfo{
+		ID:         0,
+		LocalAddr:  &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1234},
+		RemoteAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 4321},
+	}
+	_, ok := scheduler.SelectPath(PathSelectionContext{Now: time.Now()})
+	require.False(t, ok)
+	info, ok := scheduler.SelectPath(PathSelectionContext{Now: time.Now(), Paths: []PathInfo{path}})
 	require.True(t, ok)
-	require.Equal(t, PathID(0), info.ID)
-	require.Equal(t, localAddr, info.LocalAddr)
-	require.Equal(t, remoteAddr, info.RemoteAddr)
+	require.Equal(t, path, info)
 }
 
-func TestPathSchedulerWrapper_RegisterPathEnablesMultipath(t *testing.T) {
-	pm := NewMultipathPathManager(protocol.PerspectiveClient)
-	pm.EnableMultipath()
+// The statistics of a path are collected once the path was registered, and removed when the path is removed.
+func TestPathSchedulerWrapperPathStatistics(t *testing.T) {
+	scheduler := NewMultipathScheduler(SchedulingPolicyMinRTT)
+	scheduler.EnableMultipath()
+	scheduler.OnPacketAcked(PathEvent{PathID: 1, AckEliciting: true, SmoothedRTT: time.Millisecond})
+	require.Empty(t, scheduler.pathStats)
 
-	localAddr := &net.UDPAddr{IP: net.IPv4(192, 168, 0, 1), Port: 4444}
-	remoteAddr := &net.UDPAddr{IP: net.IPv4(192, 168, 0, 2), Port: 5555}
+	scheduler.RegisterPath(PathInfo{ID: 1})
+	scheduler.RegisterPath(PathInfo{ID: 2})
+	scheduler.OnPacketSent(PathEvent{PathID: 1, PacketSize: 1000, AckEliciting: true})
+	scheduler.OnPacketAcked(PathEvent{PathID: 1, AckEliciting: true, SmoothedRTT: 100 * time.Millisecond})
+	scheduler.OnPacketAcked(PathEvent{PathID: 2, AckEliciting: true, SmoothedRTT: 10 * time.Millisecond})
+	scheduler.OnPacketLost(PathEvent{PathID: 1, PacketSize: 1000, AckEliciting: true})
+	require.Equal(t, &schedulerPathStats{smoothedRTT: 100 * time.Millisecond, packetsSent: 1, bytesSent: 1000, packetsLost: 1}, scheduler.pathStats[1])
 
-	scheduler := NewMultipathScheduler(pm, SchedulingPolicyRoundRobin)
-	scheduler.RegisterPath(PathInfo{
-		ID:         0,
-		LocalAddr:  localAddr,
-		RemoteAddr: remoteAddr,
-	})
-
-	info, ok := scheduler.SelectPath(PathSelectionContext{Now: time.Now()})
+	// the path with the lower RTT is selected
+	paths := []PathInfo{{ID: 1}, {ID: 2}}
+	info, ok := scheduler.SelectPath(PathSelectionContext{Now: time.Now(), Paths: paths})
 	require.True(t, ok)
-	require.Equal(t, PathID(0), info.ID)
-	require.Equal(t, localAddr, info.LocalAddr)
-	require.Equal(t, remoteAddr, info.RemoteAddr)
+	require.Equal(t, PathID(2), info.ID)
+
+	scheduler.RemovePath(2)
+	require.NotContains(t, scheduler.pathStats, PathID(2))
+}
+
+// A scheduler wrapper used by another connection is cloned without its paths.
+func TestPathSchedulerWrapperClone(t *testing.T) {
+	scheduler := NewMultipathScheduler(SchedulingPolicyLowLatency)
+	scheduler.RegisterPath(PathInfo{ID: 1})
+	clone, ok := scheduler.cloneForConnection().(*PathSchedulerWrapper)
+	require.True(t, ok)
+	require.NotSame(t, scheduler, clone)
+	require.Equal(t, SchedulingPolicyLowLatency, clone.policy)
+	require.IsType(t, &LowLatencyScheduler{}, clone.scheduler)
+	require.Empty(t, clone.pathStats)
 }

@@ -6,12 +6,13 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"testing"
 	"time"
 
-	"github.com/AeonDave/mp-quic-go"
+	quic "github.com/AeonDave/mp-quic-go"
 	"github.com/AeonDave/mp-quic-go/http3"
 
 	"github.com/stretchr/testify/require"
@@ -24,9 +25,10 @@ func TestHTTPSettings(t *testing.T) {
 	t.Run("server settings", func(t *testing.T) {
 		tlsConf := tlsClientConfigWithoutServerName.Clone()
 		tlsConf.NextProtos = []string{http3.NextProtoH3}
-		conn, err := quic.DialAddr(
+		conn, err := quic.Dial(
 			context.Background(),
-			fmt.Sprintf("localhost:%d", port),
+			newUDPConnLocalhost(t),
+			&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port},
 			tlsConf,
 			getQuicConfig(nil),
 		)
@@ -63,6 +65,7 @@ func TestHTTPSettings(t *testing.T) {
 			EnableDatagrams:    true,
 			AdditionalSettings: map[uint64]uint64{1337: 42},
 		}
+		addDialCallback(t, tr)
 		defer tr.Close()
 		req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("https://localhost:%d/settings", port), nil)
 		require.NoError(t, err)
@@ -99,7 +102,15 @@ func dialAndOpenHTTPDatagramStream(t *testing.T, addr string) *http3.RequestStre
 	tlsConf.NextProtos = []string{http3.NextProtoH3}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	conn, err := quic.DialAddr(ctx, u.Host, tlsConf, getQuicConfig(&quic.Config{EnableDatagrams: true}))
+	serverAddr, err := net.ResolveUDPAddr("udp4", u.Host)
+	require.NoError(t, err)
+	conn, err := quic.Dial(
+		ctx,
+		newUDPConnLocalhost(t),
+		serverAddr,
+		tlsConf,
+		getQuicConfig(&quic.Config{EnableDatagrams: true}),
+	)
 	require.NoError(t, err)
 	t.Cleanup(func() { conn.CloseWithError(0, "") })
 
@@ -185,9 +196,7 @@ loop:
 
 	select {
 	case err := <-errChan:
-		var serr *quic.StreamError
-		require.ErrorAs(t, err, &serr)
-		require.Equal(t, quic.StreamErrorCode(42), serr.ErrorCode)
+		require.ErrorIs(t, err, &http3.Error{ErrorCode: 42, Remote: true})
 	case <-time.After(time.Second):
 		t.Fatal("didn't receive error")
 	}
@@ -244,7 +253,7 @@ func TestHTTPDatagramClose(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("didn't receive error")
 	}
-	require.Equal(t, io.EOF, resetErr)
+	require.ErrorIs(t, resetErr, io.EOF)
 
 	// make sure we can't send anymore
 	require.Error(t, str.SendDatagram([]byte("foo")))
@@ -300,7 +309,7 @@ func TestHTTPDatagramStreamReset(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("didn't receive error")
 	}
-	require.Equal(t, &quic.StreamError{ErrorCode: 42, Remote: false}, resetErr)
+	require.ErrorIs(t, resetErr, &http3.Error{ErrorCode: 42, Remote: false})
 
 	var err error
 	require.Eventually(t, func() bool {
@@ -308,5 +317,5 @@ func TestHTTPDatagramStreamReset(t *testing.T) {
 		return err != nil
 	}, time.Second, 10*time.Millisecond)
 	// make sure we can't send anymore
-	require.Equal(t, &quic.StreamError{ErrorCode: 42, Remote: true}, err)
+	require.ErrorIs(t, err, &http3.Error{ErrorCode: 42, Remote: true})
 }

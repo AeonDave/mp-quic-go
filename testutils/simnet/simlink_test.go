@@ -2,12 +2,12 @@ package simnet
 
 import (
 	"fmt"
-	"math"
 	"net"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
-	"github.com/AeonDave/mp-quic-go/internal/synctest"
 	"github.com/stretchr/testify/require"
 )
 
@@ -80,22 +80,14 @@ func TestLatency(t *testing.T) {
 
 				observedLatency := recvStartTime.Sub(sendStartTime)
 				// Uplink is now instant (no latency), only downlink has latency
-				var expectedLatency time.Duration
 				if testUpload {
 					// Uplink test: expect near-zero latency
-					expectedLatency = 0
 					t.Logf("observed latency: %s (uplink is instant)", observedLatency)
-					if observedLatency > 5*time.Millisecond {
-						t.Fatalf("observed latency %s is too high for instant uplink", observedLatency)
-					}
+					require.LessOrEqual(t, observedLatency, 5*time.Millisecond)
 				} else {
 					// Downlink test: expect configured latency
-					expectedLatency = downlinkLatency
-					percentErrorLatency := math.Abs(observedLatency.Seconds()-expectedLatency.Seconds()) / expectedLatency.Seconds()
-					t.Logf("observed latency: %s, expected latency: %s, percent error: %f", observedLatency, expectedLatency, percentErrorLatency)
-					if percentErrorLatency > 0.20 {
-						t.Fatalf("observed latency %s is wrong", observedLatency)
-					}
+					t.Logf("observed latency: %s, expected latency: %s", observedLatency, downlinkLatency)
+					require.InEpsilon(t, downlinkLatency, observedLatency, 0.20)
 				}
 			})
 		})
@@ -109,14 +101,10 @@ func TestMTUEnforcement(t *testing.T) {
 			MTU: MTU,
 		}
 
-		packetsReceived := 0
-		packetHandler := func(p Packet) {
-			packetsReceived++
-		}
-
+		var packetsReceived atomic.Uint32
 		router := &testRouter{
-			onSend: packetHandler,
-			onRecv: packetHandler,
+			onSend: func(p Packet) { packetsReceived.Add(1) },
+			onRecv: func(p Packet) { packetsReceived.Add(1) },
 		}
 		link := SimulatedLink{
 			UplinkSettings:   linkSettings,
@@ -149,8 +137,6 @@ func TestMTUEnforcement(t *testing.T) {
 		link.Close()
 
 		// Only packets within MTU should be received (2 packets: 1 from SendPacket, 1 from RecvPacket)
-		if packetsReceived != 2 {
-			t.Fatalf("expected 2 packets to be received, got %d", packetsReceived)
-		}
+		require.Equal(t, uint32(2), packetsReceived.Load())
 	})
 }

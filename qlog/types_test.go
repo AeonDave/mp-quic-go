@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/AeonDave/mp-quic-go/internal/protocol"
+	"github.com/AeonDave/mp-quic-go/internal/qerr"
 
 	"github.com/stretchr/testify/require"
 )
@@ -15,6 +16,17 @@ func TestEncryptionLevelToPacketType(t *testing.T) {
 	require.Equal(t, "1RTT", string(EncryptionLevelToPacketType(protocol.Encryption1RTT)))
 }
 
-func TestCalculateDatagramID(t *testing.T) {
-	require.Equal(t, DatagramID(0xcbf43926), CalculateDatagramID([]byte("123456789")))
+func TestCalculateDatagramPayloadChecksum(t *testing.T) {
+	require.Equal(t, DatagramPayloadChecksum(0xe3069283), CalculateDatagramPayloadChecksum([]byte("123456789")))
+}
+
+func TestMultipathTransportErrorNames(t *testing.T) {
+	require.Equal(t, "application_abandon_path", transportError(qerr.ApplicationAbandonPath).String())
+	require.Equal(t, "path_resource_limit_reached", transportError(qerr.PathResourceLimitReached).String())
+	require.Equal(t, "path_unstable_or_poor", transportError(qerr.PathUnstableOrPoor).String())
+	require.Equal(t, "no_cid_available_for_path", transportError(qerr.NoCIDAvailableForPath).String())
+}
+
+func TestVersionNegotiationErrorName(t *testing.T) {
+	require.Equal(t, "version_negotiation_error", transportError(qerr.VersionNegotiationErrorCode).String())
 }

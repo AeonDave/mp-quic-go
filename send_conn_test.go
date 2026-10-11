@@ -118,7 +118,7 @@ func TestSendConnRemoteAddrChange(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "foobar", string(b[:n]))
 
-	require.NoError(t, c.WriteTo([]byte("foobaz"), ln2.LocalAddr()))
+	require.NoError(t, c.WriteTo([]byte("foobaz"), ln2.LocalAddr(), packetInfo{}))
 	ln2.SetReadDeadline(time.Now().Add(time.Second))
 	b = make([]byte, 1024)
 	n, err = ln2.Read(b)
@@ -132,4 +132,94 @@ func TestSendConnRemoteAddrChange(t *testing.T) {
 	n, err = ln2.Read(b)
 	require.NoError(t, err)
 	require.Equal(t, "lorem ipsum", string(b[:n]))
+}
+
+// A sendConn for a path of IETF Multipath QUIC sends on the same underlying connection,
+// to another remote address and from another local address.
+func TestSendConnNewPathConn(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("we don't OOB conn on windows, and no packet info will be available")
+	}
+	remoteAddr := &net.UDPAddr{IP: net.IPv4(192, 168, 100, 200), Port: 1337}
+	pathRemoteAddr := &net.UDPAddr{IP: net.IPv4(192, 168, 100, 201), Port: 1338}
+	rawConn := NewMockRawConn(gomock.NewController(t))
+	rawConn.EXPECT().LocalAddr().Return(&net.UDPAddr{IP: net.IPv4zero, Port: 14}).AnyTimes()
+	rawConn.EXPECT().capabilities().AnyTimes()
+	c := newSendConn(rawConn, remoteAddr, packetInfo{addr: netip.MustParseAddr("127.0.0.1")}, utils.DefaultLogger)
+
+	pi := packetInfo{addr: netip.MustParseAddr("127.0.0.2")}
+	pc := c.newPathConn(pathRemoteAddr, pi)
+	require.Equal(t, pathRemoteAddr, pc.RemoteAddr())
+	require.Equal(t, "127.0.0.2:14", pc.LocalAddr().String())
+	rawConn.EXPECT().WritePacket([]byte("foobar"), pathRemoteAddr, pi.OOB(), uint16(0), protocol.ECT0)
+	require.NoError(t, pc.Write([]byte("foobar"), 0, protocol.ECT0))
+	// the original sendConn is not affected
+	require.Equal(t, remoteAddr, c.RemoteAddr())
+	require.Equal(t, "127.0.0.1:14", c.LocalAddr().String())
+}
+
+// packetInfoRawConn is a rawConn that sends packets from the local address in the packet info,
+// like the MultiSocketManager.
+type packetInfoRawConn struct {
+	rawConn
+	writes []packetInfoWrite
+}
+
+type packetInfoWrite struct {
+	data    []byte
+	addr    net.Addr
+	info    packetInfo
+	gsoSize uint16
+	ecn     protocol.ECN
+}
+
+func (c *packetInfoRawConn) WritePacketWithInfo(b []byte, addr net.Addr, info packetInfo, gsoSize uint16, ecn protocol.ECN) (int, error) {
+	c.writes = append(c.writes, packetInfoWrite{data: append([]byte(nil), b...), addr: addr, info: info, gsoSize: gsoSize, ecn: ecn})
+	return len(b), nil
+}
+
+// If the underlying connection selects the socket based on the packet info, Write and WriteTo pass the packet info.
+func TestSendConnWritePacketInfo(t *testing.T) {
+	mockRawConn := NewMockRawConn(gomock.NewController(t))
+	mockRawConn.EXPECT().LocalAddr().Return(&net.UDPAddr{IP: net.IPv4zero, Port: 14}).AnyTimes()
+	mockRawConn.EXPECT().capabilities().AnyTimes()
+	rawConn := &packetInfoRawConn{rawConn: mockRawConn}
+	remoteAddr := &net.UDPAddr{IP: net.IPv4(192, 168, 100, 200), Port: 1337}
+	info := packetInfo{addr: netip.MustParseAddr("127.0.0.1")}
+	c := newSendConn(rawConn, remoteAddr, info, utils.DefaultLogger)
+	require.NoError(t, c.Write([]byte("foobar"), 0, protocol.ECT1))
+
+	pathInfo := packetInfo{addr: netip.MustParseAddr("127.0.0.2")}
+	pc := c.newPathConn(remoteAddr, pathInfo)
+	require.NoError(t, pc.Write([]byte("lorem"), 5, protocol.ECNNon))
+	// probe packets are sent from the local address in the packet info, to another remote address
+	probeAddr := &net.UDPAddr{IP: net.IPv4(192, 168, 100, 201), Port: 1338}
+	probeInfo := packetInfo{addr: netip.MustParseAddr("127.0.0.3")}
+	require.NoError(t, c.WriteTo([]byte("ipsum"), probeAddr, probeInfo))
+	require.Equal(t, []packetInfoWrite{
+		{data: []byte("foobar"), addr: remoteAddr, info: info, gsoSize: 0, ecn: protocol.ECT1},
+		{data: []byte("lorem"), addr: remoteAddr, info: pathInfo, gsoSize: 5, ecn: protocol.ECNNon},
+		{data: []byte("ipsum"), addr: probeAddr, info: probeInfo, gsoSize: 0, ecn: protocol.ECNUnsupported},
+	}, rawConn.writes)
+	// WriteTo doesn't change the remote address
+	require.Equal(t, remoteAddr, c.RemoteAddr())
+}
+
+// The local address follows the packet info passed to ChangeRemoteAddr, e.g. when a server migrates to its
+// preferred address.
+func TestSendConnLocalAddrChange(t *testing.T) {
+	remoteAddr := &net.UDPAddr{IP: net.IPv4(192, 168, 100, 200), Port: 1337}
+	rawConn := NewMockRawConn(gomock.NewController(t))
+	rawConn.EXPECT().LocalAddr().Return(&net.UDPAddr{IP: net.IPv4zero, Port: 443}).AnyTimes()
+	c := newSendConn(rawConn, remoteAddr, packetInfo{addr: netip.MustParseAddr("10.0.0.1")}, utils.DefaultLogger)
+	require.Equal(t, "10.0.0.1:443", c.LocalAddr().String())
+
+	newRemoteAddr := &net.UDPAddr{IP: net.IPv4(192, 168, 100, 201), Port: 1337}
+	c.ChangeRemoteAddr(newRemoteAddr, packetInfo{addr: netip.MustParseAddr("10.0.0.2")})
+	require.Equal(t, "10.0.0.2:443", c.LocalAddr().String())
+	require.Equal(t, newRemoteAddr, c.RemoteAddr())
+	// without a local address in the packet info, the local address doesn't change
+	c.ChangeRemoteAddr(remoteAddr, packetInfo{})
+	require.Equal(t, "10.0.0.2:443", c.LocalAddr().String())
+	require.Equal(t, remoteAddr, c.RemoteAddr())
 }

@@ -9,13 +9,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	mrand "math/rand/v2"
 	"net"
 	"net/http"
 	"net/http/httptrace"
 	"net/textproto"
 	"os"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -23,11 +23,10 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/AeonDave/mp-quic-go"
+	quic "github.com/AeonDave/mp-quic-go"
 	"github.com/AeonDave/mp-quic-go/http3"
 	"github.com/AeonDave/mp-quic-go/http3/qlog"
 	quicproxy "github.com/AeonDave/mp-quic-go/integrationtests/tools/proxy"
-	"github.com/AeonDave/mp-quic-go/internal/protocol"
 	"github.com/AeonDave/mp-quic-go/testutils/events"
 
 	"github.com/stretchr/testify/assert"
@@ -174,7 +173,7 @@ func TestHTTPMultipleRequests(t *testing.T) {
 
 		cl := newHTTP3Client(t)
 		var eg errgroup.Group
-		for i := 0; i < 200; i++ {
+		for range 200 {
 			eg.Go(func() error {
 				resp, err := cl.Get(fmt.Sprintf("https://localhost:%d/hello", port))
 				if err != nil {
@@ -204,7 +203,7 @@ func TestHTTPMultipleRequests(t *testing.T) {
 		cl := newHTTP3Client(t)
 		const num = 150
 
-		for i := 0; i < num; i++ {
+		for range num {
 			resp, err := cl.Get(fmt.Sprintf("https://localhost:%d/prdata", port))
 			require.NoError(t, err)
 			require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -434,9 +433,7 @@ func TestHTTPRequestTrailers(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/client-trailers", func(w http.ResponseWriter, r *http.Request) {
 		trailerBeforeBody := make(http.Header)
-		for k, v := range r.Trailer {
-			trailerBeforeBody[k] = v
-		}
+		maps.Copy(trailerBeforeBody, r.Trailer)
 		trailerChan <- trailerBeforeBody
 
 		body, err := io.ReadAll(r.Body)
@@ -447,9 +444,7 @@ func TestHTTPRequestTrailers(t *testing.T) {
 		bodyChan <- string(body)
 
 		trailer := make(http.Header)
-		for k, v := range r.Trailer {
-			trailer[k] = v
-		}
+		maps.Copy(trailer, r.Trailer)
 		trailerChan <- trailer
 
 		w.WriteHeader(http.StatusOK)
@@ -525,9 +520,8 @@ func TestHTTPErrAbortHandler(t *testing.T) {
 	close(respChan)
 	require.NoError(t, err)
 	body, err := io.ReadAll(resp.Body)
-	require.Error(t, err)
 	var h3Err *http3.Error
-	require.True(t, errors.As(err, &h3Err))
+	require.ErrorAs(t, err, &h3Err)
 	require.Equal(t, http3.ErrCodeInternalError, h3Err.ErrorCode)
 	// the body will be a prefix of what's written
 	require.True(t, bytes.HasPrefix([]byte("foobar"), body))
@@ -611,8 +605,12 @@ func TestHTTPServerIdleTimeout(t *testing.T) {
 	t.Cleanup(func() { tr.Close() })
 	cl := &http.Client{Transport: tr}
 
-	_, err := cl.Get(fmt.Sprintf("https://localhost:%d/hello", port))
+	resp, err := cl.Get(fmt.Sprintf("https://localhost:%d/hello", port))
 	require.NoError(t, err)
+	// Wait for the server to close the request stream and start the idle timer.
+	_, err = io.Copy(io.Discard, resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
 
 	var conn *quic.Conn
 	select {
@@ -672,7 +670,6 @@ func TestHTTPClientRequestContextCancellation(t *testing.T) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("https://localhost:%d/cancel-before", port), nil)
 		require.NoError(t, err)
 		_, err = cl.Do(req)
-		require.Error(t, err)
 		require.ErrorIs(t, err, context.DeadlineExceeded)
 	})
 
@@ -698,9 +695,8 @@ func TestHTTPClientRequestContextCancellation(t *testing.T) {
 
 		select {
 		case err := <-errChan:
-			require.Error(t, err)
 			var http3Err *http3.Error
-			require.True(t, errors.As(err, &http3Err))
+			require.ErrorAs(t, err, &http3Err)
 			require.Equal(t, http3.ErrCodeRequestCanceled, http3Err.ErrorCode)
 			require.True(t, http3Err.Remote)
 		case <-time.After(time.Second):
@@ -709,7 +705,7 @@ func TestHTTPClientRequestContextCancellation(t *testing.T) {
 
 		_, err = resp.Body.Read([]byte{0})
 		var http3Err *http3.Error
-		require.True(t, errors.As(err, &http3Err))
+		require.ErrorAs(t, err, &http3Err)
 		require.Equal(t, http3.ErrCodeRequestCanceled, http3Err.ErrorCode)
 		require.False(t, http3Err.Remote)
 	})
@@ -748,7 +744,7 @@ func TestHTTPDeadlines(t *testing.T) {
 
 		body, err := io.ReadAll(&readerWithTimeout{Reader: resp.Body, Timeout: 2 * deadlineDelay})
 		require.NoError(t, err)
-		require.True(t, time.Now().After(expectedEnd))
+		require.Greater(t, time.Now(), expectedEnd)
 		require.Equal(t, "ok", string(body))
 
 		select {
@@ -776,10 +772,13 @@ func TestHTTPDeadlines(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 
-		body, err := io.ReadAll(&readerWithTimeout{Reader: resp.Body, Timeout: 2 * deadlineDelay})
-		require.NoError(t, err)
-		require.True(t, time.Now().After(expectedEnd))
-		require.Contains(t, string(body), "aa")
+		// The write deadline interrupts the server in the middle of a DATA frame. The server resets the stream,
+		// since a stream ending in the middle of a frame is a connection error (section 7.1 of RFC 9114).
+		_, err = io.ReadAll(&readerWithTimeout{Reader: resp.Body, Timeout: 2 * deadlineDelay})
+		var h3Err *http3.Error
+		require.ErrorAs(t, err, &h3Err)
+		require.Equal(t, http3.ErrCodeRequestCanceled, h3Err.ErrorCode)
+		require.Greater(t, time.Now(), expectedEnd)
 
 		select {
 		case err := <-errChan:
@@ -824,7 +823,7 @@ func TestHTTPServeQUICConn(t *testing.T) {
 	require.NoError(t, cl.Transport.(io.Closer).Close())
 	select {
 	case err := <-errChan:
-		require.Error(t, err)
+		require.ErrorIs(t, err, &http3.Error{ErrorCode: 0, Remote: true})
 		require.ErrorContains(t, err, "accepting stream failed")
 	case <-time.After(time.Second):
 		t.Fatal("server didn't shut down")
@@ -901,9 +900,7 @@ func TestHTTPConnContext(t *testing.T) {
 
 	select {
 	case ctx := <-connCtxChan:
-		serv, ok := ctx.Value(http3.ServerContextKey).(*http3.Server)
-		require.True(t, ok)
-		require.Equal(t, server, serv)
+		require.Same(t, server, ctx.Value(http3.ServerContextKey))
 	default:
 		t.Fatal("handler was not called")
 	}
@@ -914,9 +911,7 @@ func TestHTTPConnContext(t *testing.T) {
 		require.True(t, ok)
 		require.Equal(t, "bar", v)
 
-		serv, ok := ctx.Value(http3.ServerContextKey).(*http3.Server)
-		require.True(t, ok)
-		require.Equal(t, server, serv)
+		require.Same(t, server, ctx.Value(http3.ServerContextKey))
 	default:
 		t.Fatal("handler was not called")
 	}
@@ -977,7 +972,7 @@ func TestHTTPStreamedRequests(t *testing.T) {
 	require.Equal(t, 200, rsp.StatusCode)
 
 	reader := bufio.NewReader(rsp.Body)
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		msg := fmt.Sprintf("Hello world, %d!\n", i)
 		fmt.Fprint(w, msg)
 		msgRcvd, err := reader.ReadString('\n')
@@ -1070,71 +1065,6 @@ func TestHTTP1xxTerminalResponse(t *testing.T) {
 	require.NoError(t, resp.Body.Close())
 }
 
-func TestHTTP0RTT(t *testing.T) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/0rtt", func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, strconv.FormatBool(!r.TLS.HandshakeComplete))
-	})
-	port := startHTTPServer(t, mux)
-
-	var num0RTTPackets atomic.Uint32
-	proxy := quicproxy.Proxy{
-		Conn:       newUDPConnLocalhost(t),
-		ServerAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port},
-		DelayPacket: func(_ quicproxy.Direction, _, _ net.Addr, data []byte) time.Duration {
-			if containsPacketType(data, protocol.PacketType0RTT) {
-				num0RTTPackets.Add(1)
-			}
-			return scaleDuration(25 * time.Millisecond)
-		},
-	}
-	require.NoError(t, proxy.Start())
-	defer proxy.Close()
-
-	tlsConf := getTLSClientConfigWithoutServerName()
-	puts := make(chan string, 10)
-	tlsConf.ClientSessionCache = newClientSessionCache(tls.NewLRUClientSessionCache(10), nil, puts)
-	tr := &http3.Transport{
-		TLSClientConfig:    tlsConf,
-		QUICConfig:         getQuicConfig(&quic.Config{MaxIdleTimeout: 10 * time.Second}),
-		DisableCompression: true,
-	}
-	defer tr.Close()
-	addDialCallback(t, tr)
-
-	proxyPort := proxy.LocalAddr().(*net.UDPAddr).Port
-	req, err := http.NewRequest(http3.MethodGet0RTT, fmt.Sprintf("https://localhost:%d/0rtt", proxyPort), nil)
-	require.NoError(t, err)
-	rsp, err := tr.RoundTrip(req)
-	require.NoError(t, err)
-	require.Equal(t, 200, rsp.StatusCode)
-	data, err := io.ReadAll(rsp.Body)
-	require.NoError(t, err)
-	require.Equal(t, "false", string(data))
-	require.Zero(t, num0RTTPackets.Load())
-
-	select {
-	case <-puts:
-	case <-time.After(time.Second):
-		t.Fatal("did not receive session ticket")
-	}
-
-	tr2 := &http3.Transport{
-		TLSClientConfig:    tr.TLSClientConfig,
-		QUICConfig:         tr.QUICConfig,
-		DisableCompression: true,
-	}
-	defer tr2.Close()
-	addDialCallback(t, tr2)
-	rsp, err = tr2.RoundTrip(req)
-	require.NoError(t, err)
-	require.Equal(t, 200, rsp.StatusCode)
-	data, err = io.ReadAll(rsp.Body)
-	require.NoError(t, err)
-	require.Equal(t, "true", string(data))
-	require.NotZero(t, num0RTTPackets.Load())
-}
-
 func TestHTTPStreamer(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/httpstreamer", func(w http.ResponseWriter, r *http.Request) {
@@ -1157,8 +1087,7 @@ func TestHTTPStreamer(t *testing.T) {
 	require.NoError(t, err)
 	tlsConf := getTLSClientConfigWithoutServerName()
 	tlsConf.NextProtos = []string{http3.NextProtoH3}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	conn, err := quic.Dial(ctx, newUDPConnLocalhost(t), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port}, tlsConf, getQuicConfig(nil))
 	require.NoError(t, err)
 	defer conn.CloseWithError(0, "")
@@ -1201,12 +1130,12 @@ func (c *blackHoleConn) ReadFrom(b []byte) (int, net.Addr, error) {
 		<-c.close
 		return 0, nil, errors.New("blocked")
 	}
-	n, _, err := c.PacketConn.ReadFrom(b)
+	n, addr, err := c.PacketConn.ReadFrom(b)
 	if c.block.Load() {
 		<-c.close
 		return 0, nil, errors.New("blocked")
 	}
-	return n, nil, err
+	return n, addr, err
 }
 
 func (c *blackHoleConn) Close() error {

@@ -9,7 +9,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/AeonDave/mp-quic-go"
+	quic "github.com/AeonDave/mp-quic-go"
 	h3qlog "github.com/AeonDave/mp-quic-go/http3/qlog"
 	"github.com/AeonDave/mp-quic-go/internal/utils"
 	"github.com/AeonDave/mp-quic-go/qlog"

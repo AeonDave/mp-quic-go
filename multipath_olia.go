@@ -1,115 +1,250 @@
 package quic
 
 import (
+	"math"
 	"sync"
 	"time"
 
+	"github.com/AeonDave/mp-quic-go/internal/congestion"
 	"github.com/AeonDave/mp-quic-go/internal/protocol"
+	"github.com/AeonDave/mp-quic-go/internal/utils"
 )
 
 // OLIACongestionControl implements the OLIA (Opportunistic Linked-Increase Algorithm)
 // congestion control for multipath connections. OLIA provides coupled congestion control
 // across multiple paths to ensure fairness and performance.
 //
+// Every path of a connection has its own OLIACongestionControl, and all of them share one
+// oliaSharedState (see NewOLIASharedState). The window of path r evolves as follows,
+// with windows w in packets and RTTs in seconds:
+//
+//   - Slow start (cwnd < ssthresh): the window grows by the number of acknowledged bytes.
+//     Slow start ends at the first loss, or earlier when hybrid slow start detects
+//     a rising RTT (MaybeExitSlowStart).
+//   - Congestion avoidance: for each acknowledged packet, w_r grows by
+//     (w_r/rtt_r²) / (Σ_p w_p/rtt_p)² + α_r/w_r.
+//     α_r moves window from the paths with the largest window to the presumably best paths
+//     (largest ℓ_p²/rtt_p, where ℓ_p is the number of bytes acknowledged between the last two
+//     losses, or since the last loss if that is larger).
+//   - Loss: the window is halved, at most once per recovery epoch, as in Reno.
+//   - Persistent congestion (section 7.6 of RFC 9002): the window drops to the minimum window,
+//     and slow start begins again.
+//
+// The window never drops below 2 packets.
+//
+// All methods are safe for concurrent use. Each controller is protected by its own mutex.
+// The shared state has a separate mutex and only stores copies of the paths' states,
+// so a controller never takes another controller's mutex. The lock order is always
+// controller first, then shared state.
+//
 // Reference: "MPTCP is not Pareto-optimal: performance issues and a possible solution"
-// by R. Khalili et al., CoNEXT 2012
+// by R. Khalili et al., CoNEXT 2012, and draft-khalili-mptcp-congestion-control.
 type OLIACongestionControl struct {
-	pathID protocol.PathID
-
-	// Shared state across all OLIA instances
-	sharedState *oliaSharedState
-
-	// Path-specific state
 	mu sync.Mutex
 
-	// Bytes acknowledged in current measurement period
-	ackedBytes protocol.ByteCount
+	pathID protocol.PathID
 
-	// Bytes acknowledged between last two losses
-	loss1 protocol.ByteCount
-	loss2 protocol.ByteCount
-	loss3 protocol.ByteCount
+	// Shared state across all OLIA instances of a connection.
+	sharedState *oliaSharedState
 
-	// OLIA parameters
+	// Optional RTT source. When set, it takes precedence over UpdateRTT.
+	rttStats *utils.RTTStats
+
+	// Congestion window and slow start threshold, in bytes.
+	congestionWindow   protocol.ByteCount
+	slowStartThreshold protocol.ByteCount
+	// Fraction of a byte of window change that has not been applied yet.
+	cwndRemainder float64
+
+	// ℓ_r: bytes acknowledged between the last two losses, and since the last loss.
+	bytesBetweenLosses protocol.ByteCount
+	bytesSinceLoss     protocol.ByteCount
+
+	// α_r = epsilonNum / epsilonDen, from the last congestion avoidance update.
 	epsilonNum int
 	epsilonDen uint32
-	sndCwndCnt int
 
-	// Congestion window in bytes
-	congestionWindow protocol.ByteCount
+	// RTT measurements. 0 means unknown.
+	rtt    time.Duration
+	minRTT time.Duration
 
-	// Slow start threshold
-	slowStartThreshold protocol.ByteCount
+	// Recovery epoch tracking, as in quic-go's cubic sender.
+	largestSentPacketNumber  protocol.PacketNumber
+	largestAckedPacketNumber protocol.PacketNumber
+	largestSentAtLastCutback protocol.PacketNumber
 
-	// RTT measurements
-	rtt       time.Duration
-	minRTT    time.Duration
-	updateRTT bool
+	hybridSlowStart congestion.HybridSlowStart
 
-	// Packet tracking
-	lastPacketNumber protocol.PacketNumber
+	maxDatagramSize protocol.ByteCount
+	initialWindow   protocol.ByteCount
 
-	// Configuration
-	maxDatagramSize     protocol.ByteCount
-	initialWindow       protocol.ByteCount
-	minCongestionWindow protocol.ByteCount
-	maxCongestionWindow protocol.ByteCount
-}
-
-// oliaSharedState contains state shared across all OLIA instances in a multipath connection.
-type oliaSharedState struct {
-	mu       sync.RWMutex
-	pathOLIA map[protocol.PathID]*OLIACongestionControl
+	// Reused buffer for snapshots of the other paths.
+	others []oliaPathState
 }
 
 const (
-	oliaScale = 10
+	oliaInitialWindowPackets = 10
+	oliaMinWindowPackets     = 2
+	oliaMaxWindowPackets     = protocol.MaxCongestionWindowPackets
+	// Do not increase the window unless less than this many packets of the window are unused.
+	oliaMaxBurstPackets = 3
+	// Upper bound for the datagram size. It keeps all window computations far away from int64 overflow.
+	oliaMaxDatagramSize = protocol.ByteCount(1 << 16)
+	// Lower bound for RTTs used in the increase computation.
+	oliaMinRTT = time.Microsecond
+	// Relative tolerance when looking for the best paths.
+	oliaRelTolerance = 1e-9
+	// Maximum number of paths tracked by one shared state.
+	// When a new path is registered and the limit is reached, the path updated least recently is dropped.
+	oliaMaxPaths = protocol.MaxMultipathPaths
 )
 
 var (
-	defaultOLIAInitialWindow = protocol.ByteCount(10 * protocol.InitialPacketSize)
-	defaultOLIAMaxWindow     = protocol.ByteCount(1000 * protocol.InitialPacketSize)
-	defaultOLIAMinWindow     = protocol.ByteCount(2 * protocol.InitialPacketSize)
+	defaultOLIAInitialWindow = protocol.ByteCount(oliaInitialWindowPackets * protocol.InitialPacketSize)
+	defaultOLIAMaxWindow     = protocol.ByteCount(oliaMaxWindowPackets * protocol.InitialPacketSize)
+	defaultOLIAMinWindow     = protocol.ByteCount(oliaMinWindowPackets * protocol.InitialPacketSize)
 )
+
+// oliaPathState is the per-path information OLIA needs about every path of a connection.
+type oliaPathState struct {
+	cwnd protocol.ByteCount // congestion window, in bytes
+	mss  protocol.ByteCount // maximum datagram size, in bytes
+	rtt  time.Duration      // smoothed RTT
+	ell  protocol.ByteCount // ℓ_r, in bytes
+}
+
+// oliaSharedState contains state shared across all OLIA instances in a multipath connection.
+// It holds a copy of each path's state, updated by the path's controller.
+// Use one shared state per connection.
+type oliaSharedState struct {
+	mu    sync.RWMutex
+	paths map[protocol.PathID]oliaPathEntry
+	seq   uint64
+}
+
+type oliaPathEntry struct {
+	// owner identifies the controller that registered the path. It is only compared, never dereferenced.
+	owner *OLIACongestionControl
+	state oliaPathState
+	// seq is the shared state's update counter at the last update of this path.
+	seq uint64
+}
 
 // NewOLIASharedState creates shared state for OLIA congestion control.
 func NewOLIASharedState() *oliaSharedState {
 	return &oliaSharedState{
-		pathOLIA: make(map[protocol.PathID]*OLIACongestionControl),
+		paths: make(map[protocol.PathID]oliaPathEntry),
 	}
 }
 
+// register adds (or replaces) the path, dropping the least recently updated path if the state is full.
+func (s *oliaSharedState) register(o *OLIACongestionControl, pathID protocol.PathID, st oliaPathState) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.paths == nil {
+		s.paths = make(map[protocol.PathID]oliaPathEntry)
+	}
+	if _, ok := s.paths[pathID]; !ok && len(s.paths) >= oliaMaxPaths {
+		var oldestID protocol.PathID
+		oldestSeq := uint64(math.MaxUint64)
+		for id, e := range s.paths {
+			if e.seq < oldestSeq {
+				oldestID, oldestSeq = id, e.seq
+			}
+		}
+		delete(s.paths, oldestID)
+	}
+	s.seq++
+	s.paths[pathID] = oliaPathEntry{owner: o, state: st, seq: s.seq}
+}
+
+// update stores the path's state, if the path is still registered by this controller.
+func (s *oliaSharedState) update(o *OLIACongestionControl, pathID protocol.PathID, st oliaPathState) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e, ok := s.paths[pathID]
+	if !ok || e.owner != o {
+		return
+	}
+	s.seq++
+	e.state = st
+	e.seq = s.seq
+	s.paths[pathID] = e
+}
+
+// unregister removes the path, if it is registered by this controller.
+func (s *oliaSharedState) unregister(o *OLIACongestionControl, pathID protocol.PathID) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if e, ok := s.paths[pathID]; ok && e.owner == o {
+		delete(s.paths, pathID)
+	}
+}
+
+// snapshotOthers appends a copy of the state of all paths except the given one to buf[:0].
+func (s *oliaSharedState) snapshotOthers(o *OLIACongestionControl, pathID protocol.PathID, buf []oliaPathState) []oliaPathState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	buf = buf[:0]
+	for id, e := range s.paths {
+		if id == pathID || e.owner == o {
+			continue
+		}
+		buf = append(buf, e.state)
+	}
+	return buf
+}
+
 // NewOLIACongestionControl creates a new OLIA congestion controller for a path.
+// The controller uses the RTT passed to UpdateRTT, and utils.DefaultInitialRTT until then.
+// If sharedState is nil, the controller is not coupled to other paths and behaves like Reno.
 func NewOLIACongestionControl(
 	pathID protocol.PathID,
 	sharedState *oliaSharedState,
 	maxDatagramSize protocol.ByteCount,
 ) *OLIACongestionControl {
-	if maxDatagramSize == 0 {
+	return newOLIACongestionControl(pathID, sharedState, maxDatagramSize, nil)
+}
+
+// newOLIACongestionControl creates a new OLIA congestion controller for a path.
+// If rttStats is not nil, the controller takes its RTT from it.
+func newOLIACongestionControl(
+	pathID protocol.PathID,
+	sharedState *oliaSharedState,
+	maxDatagramSize protocol.ByteCount,
+	rttStats *utils.RTTStats,
+) *OLIACongestionControl {
+	if maxDatagramSize <= 0 {
 		maxDatagramSize = protocol.InitialPacketSize
+	}
+	maxDatagramSize = min(maxDatagramSize, oliaMaxDatagramSize)
+	if sharedState == nil {
+		sharedState = NewOLIASharedState()
 	}
 
 	o := &OLIACongestionControl{
-		pathID:              pathID,
-		sharedState:         sharedState,
-		maxDatagramSize:     maxDatagramSize,
-		initialWindow:       defaultOLIAInitialWindow,
-		minCongestionWindow: defaultOLIAMinWindow,
-		maxCongestionWindow: defaultOLIAMaxWindow,
-		congestionWindow:    defaultOLIAInitialWindow,
-		slowStartThreshold:  defaultOLIAMaxWindow,
-		loss1:               0,
-		loss2:               0,
-		loss3:               0,
-		epsilonNum:          0,
-		epsilonDen:          1,
-		sndCwndCnt:          0,
+		pathID:                   pathID,
+		sharedState:              sharedState,
+		rttStats:                 rttStats,
+		maxDatagramSize:          maxDatagramSize,
+		initialWindow:            oliaInitialWindowPackets * maxDatagramSize,
+		congestionWindow:         oliaInitialWindowPackets * maxDatagramSize,
+		slowStartThreshold:       protocol.MaxByteCount,
+		epsilonNum:               0,
+		epsilonDen:               1,
+		largestSentPacketNumber:  protocol.InvalidPacketNumber,
+		largestAckedPacketNumber: protocol.InvalidPacketNumber,
+		largestSentAtLastCutback: protocol.InvalidPacketNumber,
 	}
+	o.refreshRTTLocked()
 
-	// Register this path with shared state
-	sharedState.mu.Lock()
-	sharedState.pathOLIA[pathID] = o
-	sharedState.mu.Unlock()
+	// Register this path with shared state.
+	// o is not shared yet, so its fields can be read without holding o.mu.
+	sharedState.register(o, pathID, o.pathStateLocked())
 
 	return o
 }
@@ -141,10 +276,13 @@ func (o *OLIACongestionControl) OnPacketSent(
 
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.lastPacketNumber = packetNumber
+	o.largestSentPacketNumber = max(o.largestSentPacketNumber, packetNumber)
+	o.hybridSlowStart.OnPacketSent(packetNumber)
 }
 
 // OnPacketAcked is called when a packet is acknowledged.
+// bytesInFlight is the number of bytes in flight before the packet was acknowledged.
+// The window only grows if the sender is (almost) limited by it.
 func (o *OLIACongestionControl) OnPacketAcked(
 	packetNumber protocol.PacketNumber,
 	ackedBytes protocol.ByteCount,
@@ -154,223 +292,165 @@ func (o *OLIACongestionControl) OnPacketAcked(
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
-	// Update bytes acked since last loss
-	o.loss3 += ackedBytes
-	o.ackedBytes += ackedBytes
-
-	if o.InSlowStart() {
-		// Slow start: increase cwnd by acked bytes
-		o.congestionWindow += ackedBytes
-		if o.congestionWindow > o.maxCongestionWindow {
-			o.congestionWindow = o.maxCongestionWindow
-		}
-	} else {
-		// Congestion avoidance: use OLIA algorithm
-		o.updateCongestionWindow(ackedBytes)
+	o.largestAckedPacketNumber = max(o.largestAckedPacketNumber, packetNumber)
+	o.refreshRTTLocked()
+	if ackedBytes > 0 {
+		o.bytesSinceLoss = saturatingAddByteCount(o.bytesSinceLoss, ackedBytes)
 	}
-}
+	defer o.publishLocked()
 
-// updateCongestionWindow updates the congestion window using OLIA algorithm.
-func (o *OLIACongestionControl) updateCongestionWindow(ackedBytes protocol.ByteCount) {
-	// Calculate OLIA epsilon parameter
-	o.calculateEpsilon()
-
-	// Get the best rate among all paths
-	rate := o.getBestRate()
-	if rate == 0 {
-		rate = 1 // Avoid division by zero
+	if o.inRecoveryLocked() || ackedBytes <= 0 {
+		return
 	}
-
-	// Calculate cwnd scaled
-	cwndScaled := uint64(o.congestionWindow) / uint64(o.maxDatagramSize)
-
-	// Calculate increment denominator
-	incDen := uint64(o.epsilonDen) * cwndScaled * uint64(rate)
-	if incDen == 0 {
-		incDen = 1
-	}
-
-	// Calculate increment based on epsilon
-	var increment int
-	if o.epsilonNum == -1 {
-		// Negative epsilon case
-		if uint64(o.epsilonDen)*cwndScaled*cwndScaled < uint64(rate) {
-			incNum := uint64(rate) - uint64(o.epsilonDen)*cwndScaled*cwndScaled
-			increment = -int(oliaScale64(incNum, oliaScale) / incDen)
-		} else {
-			incNum := uint64(o.epsilonDen)*cwndScaled*cwndScaled - uint64(rate)
-			increment = int(oliaScale64(incNum, oliaScale) / incDen)
-		}
-	} else {
-		// Positive epsilon case
-		incNum := uint64(o.epsilonNum)*uint64(rate) + uint64(o.epsilonDen)*cwndScaled*cwndScaled
-		increment = int(oliaScale64(incNum, oliaScale) / incDen)
-	}
-
-	o.sndCwndCnt += increment
-
-	// Update congestion window based on counter
-	scaledThreshold := (1 << oliaScale) - 1
-	if o.sndCwndCnt >= scaledThreshold {
-		o.congestionWindow += o.maxDatagramSize
-		if o.congestionWindow > o.maxCongestionWindow {
-			o.congestionWindow = o.maxCongestionWindow
-		}
-		o.sndCwndCnt = 0
-	} else if o.sndCwndCnt <= -scaledThreshold {
-		if o.congestionWindow > o.minCongestionWindow+o.maxDatagramSize {
-			o.congestionWindow -= o.maxDatagramSize
-		}
-		o.sndCwndCnt = 0
-	}
-}
-
-// calculateEpsilon calculates the OLIA epsilon parameter for this path.
-func (o *OLIACongestionControl) calculateEpsilon() {
-	o.sharedState.mu.RLock()
-	defer o.sharedState.mu.RUnlock()
-
-	// Find maximum cwnd and best performing path
-	var maxCwnd protocol.ByteCount
-	var bestRTT time.Duration
-	var bestBytes protocol.ByteCount
-
-	for pathID, other := range o.sharedState.pathOLIA {
-		var cwnd protocol.ByteCount
-		var rtt time.Duration
-		var bytes protocol.ByteCount
-
-		if pathID == o.pathID {
-			// Self - already have lock, read directly
-			cwnd = o.congestionWindow
-			rtt = o.rtt
-			bytes = o.loss2 - o.loss1
-			if o.loss3 > o.loss2 && o.loss3-o.loss2 > bytes {
-				bytes = o.loss3 - o.loss2
-			}
-		} else {
-			other.mu.Lock()
-			cwnd = other.congestionWindow
-			rtt = other.rtt
-			bytes = other.loss2 - other.loss1
-			if other.loss3 > other.loss2 && other.loss3-other.loss2 > bytes {
-				bytes = other.loss3 - other.loss2
-			}
-			other.mu.Unlock()
-		}
-
-		if cwnd > maxCwnd {
-			maxCwnd = cwnd
-		}
-
-		if rtt > 0 {
-			tmpRTT := rtt * rtt
-			if bestRTT == 0 || int64(bytes)*int64(bestRTT) < int64(bestBytes)*int64(tmpRTT) {
-				bestRTT = tmpRTT
-				bestBytes = bytes
-			}
-		}
-	}
-
-	// Count paths in set M (max cwnd) and BNotM (best but not max)
-	var M, BNotM uint8
-	for pathID, other := range o.sharedState.pathOLIA {
-		var cwnd protocol.ByteCount
-		var rtt time.Duration
-		var bytes protocol.ByteCount
-
-		if pathID == o.pathID {
-			// Self - already have lock
-			cwnd = o.congestionWindow
-			rtt = o.rtt
-			bytes = o.loss2 - o.loss1
-			if o.loss3 > o.loss2 && o.loss3-o.loss2 > bytes {
-				bytes = o.loss3 - o.loss2
-			}
-		} else {
-			other.mu.Lock()
-			cwnd = other.congestionWindow
-			rtt = other.rtt
-			bytes = other.loss2 - other.loss1
-			if other.loss3 > other.loss2 && other.loss3-other.loss2 > bytes {
-				bytes = other.loss3 - other.loss2
-			}
-			other.mu.Unlock()
-		}
-
-		if cwnd == maxCwnd {
-			M++
-		} else if rtt > 0 {
-			tmpRTT := rtt * rtt
-			if int64(bytes)*int64(bestRTT) >= int64(bestBytes)*int64(tmpRTT) {
-				BNotM++
-			}
-		}
-	}
-
-	// Calculate epsilon for this path
-	if BNotM == 0 {
-		o.epsilonNum = 0
-		o.epsilonDen = 1
-	} else {
-		rtt := o.rtt
-		bytes := o.SmoothedBytesBetweenLosses()
-		cwnd := o.congestionWindow
-
-		if cwnd < maxCwnd && rtt > 0 {
-			tmpRTT := rtt * rtt
-			if int64(bytes)*int64(bestRTT) >= int64(bestBytes)*int64(tmpRTT) {
-				// This path is in BNotM
-				o.epsilonNum = 1
-				o.epsilonDen = uint32(len(o.sharedState.pathOLIA)) * uint32(BNotM)
+	if o.isCwndLimitedLocked(bytesInFlight) {
+		if o.inSlowStartLocked() {
+			// Exponential growth, up to the slow start threshold.
+			if room := o.slowStartThreshold - o.congestionWindow; ackedBytes >= room {
+				o.congestionWindow = o.slowStartThreshold
 			} else {
-				o.epsilonNum = -1
-				o.epsilonDen = uint32(len(o.sharedState.pathOLIA)) * uint32(M)
+				o.congestionWindow += ackedBytes
 			}
-		} else if cwnd == maxCwnd {
-			// This path is in M
-			o.epsilonNum = -1
-			o.epsilonDen = uint32(len(o.sharedState.pathOLIA)) * uint32(M)
+			o.congestionWindow = min(o.congestionWindow, o.maxWindowLocked())
 		} else {
-			o.epsilonNum = 0
-			o.epsilonDen = 1
+			o.congestionAvoidanceLocked(ackedBytes)
 		}
+	}
+	if o.inSlowStartLocked() {
+		o.hybridSlowStart.OnPacketAcked(packetNumber)
 	}
 }
 
-// getBestRate calculates the rate parameter used in OLIA.
-func (o *OLIACongestionControl) getBestRate() protocol.ByteCount {
-	o.sharedState.mu.RLock()
-	defer o.sharedState.mu.RUnlock()
+// congestionAvoidanceLocked applies the OLIA increase for ackedBytes acknowledged bytes.
+func (o *OLIACongestionControl) congestionAvoidanceLocked(ackedBytes protocol.ByteCount) {
+	o.others = o.sharedState.snapshotOthers(o, o.pathID, o.others)
+	inc, epsNum, epsDen := oliaIncrease(o.pathStateLocked(), o.others)
+	o.epsilonNum, o.epsilonDen = epsNum, epsDen
+	o.applyWindowChangeLocked(inc * float64(ackedBytes))
+	// A negative α can shrink the window. This must not restart slow start.
+	o.slowStartThreshold = min(o.slowStartThreshold, o.congestionWindow)
+}
 
-	var rate protocol.ByteCount = 1 // Minimum rate to avoid division by zero
+// applyWindowChangeLocked changes the window by delta bytes (possibly negative or fractional),
+// keeping it between the minimum and maximum window.
+func (o *OLIACongestionControl) applyWindowChangeLocked(delta float64) {
+	if math.IsNaN(delta) || math.IsInf(delta, 0) {
+		return
+	}
+	o.cwndRemainder += delta
+	whole := math.Trunc(o.cwndRemainder)
+	if whole == 0 {
+		return
+	}
+	o.cwndRemainder -= whole
+	newWindow := float64(o.congestionWindow) + whole
+	if minWindow := o.minWindowLocked(); newWindow <= float64(minWindow) {
+		o.congestionWindow = minWindow
+		o.cwndRemainder = 0
+	} else if maxWindow := o.maxWindowLocked(); newWindow >= float64(maxWindow) {
+		o.congestionWindow = maxWindow
+		o.cwndRemainder = 0
+	} else {
+		o.congestionWindow = protocol.ByteCount(newWindow)
+	}
+}
 
-	for pathID, other := range o.sharedState.pathOLIA {
-		var cwnd protocol.ByteCount
-		var rtt time.Duration
-
-		if pathID == o.pathID {
-			// Self - already have lock, read directly
-			cwnd = o.congestionWindow
-			rtt = o.rtt
-		} else {
-			other.mu.Lock()
-			cwnd = other.congestionWindow
-			rtt = other.rtt
-			other.mu.Unlock()
+// oliaIncrease computes the OLIA congestion avoidance increase of path self for each acknowledged
+// byte, i.e. the window grows by inc*ackedBytes bytes. Equivalently, inc is the increase in packets
+// per acknowledged packet:
+//
+//	inc = (w_self/rtt_self²) / (Σ_p w_p/rtt_p)² + α_self/w_self
+//
+// with windows w in packets. others are the other paths of the connection.
+// α_self = epsNum/epsDen, computed as in draft-khalili-mptcp-congestion-control:
+//
+//   - max_w_paths are the paths with the largest window. As in Linux, windows are compared in whole
+//     packets, so that paths whose windows differ by a fraction of a packet are treated as equal.
+//   - best_paths are the paths with the largest ℓ_p/rtt_p², as in Linux:
+//     the throughput of a Reno flow scales with √ℓ/rtt.
+//   - collected_paths are the best paths that are not in max_w_paths.
+//   - α_r = 1/(n·|collected_paths|) if r is in collected_paths,
+//     α_r = -1/(n·|max_w_paths|) if r is in max_w_paths and collected_paths is not empty,
+//     and α_r = 0 otherwise, where n is the number of paths.
+//
+// The result is finite and within [-1, 1].
+func oliaIncrease(self oliaPathState, others []oliaPathState) (inc float64, epsNum int, epsDen uint32) {
+	type pathValues struct {
+		w        float64            // window, in packets
+		wPackets protocol.ByteCount // window, in whole packets
+		rtt      float64            // RTT, in seconds
+		q        float64            // ℓ/rtt², to find the best paths
+	}
+	values := func(p oliaPathState) (pathValues, bool) {
+		if p.cwnd <= 0 || p.mss <= 0 {
+			return pathValues{}, false
 		}
+		rtt := p.rtt
+		if rtt <= 0 {
+			rtt = utils.DefaultInitialRTT
+		}
+		rttSec := max(rtt, oliaMinRTT).Seconds()
+		ell := float64(max(p.ell, 0))
+		return pathValues{
+			w:        float64(p.cwnd) / float64(p.mss),
+			wPackets: p.cwnd / p.mss,
+			rtt:      rttSec,
+			q:        ell / (rttSec * rttSec),
+		}, true
+	}
 
-		if rtt > 0 {
-			// rate += cwnd² / rtt
-			scaledNum := oliaScale64(uint64(cwnd), oliaScale) * uint64(rtt.Nanoseconds())
-			rate += protocol.ByteCount(scaledNum / uint64(rtt.Nanoseconds()))
+	var buf [8]pathValues
+	paths := buf[:0]
+	s, ok := values(self)
+	if !ok {
+		return 0, 0, 1
+	}
+	paths = append(paths, s)
+	for _, p := range others {
+		if v, ok := values(p); ok {
+			paths = append(paths, v)
 		}
 	}
 
-	return rate * rate
+	// sum = rtt_self * Σ_p w_p/rtt_p. It is at least w_self > 0.
+	var sum, bestQ float64
+	var maxWPackets protocol.ByteCount
+	for _, p := range paths {
+		sum += p.w * (s.rtt / p.rtt)
+		maxWPackets = max(maxWPackets, p.wPackets)
+		bestQ = max(bestQ, p.q)
+	}
+	isBest := func(p pathValues) bool { return p.q >= bestQ*(1-oliaRelTolerance) }
+
+	var numMaxW, numCollected int
+	for _, p := range paths {
+		if p.wPackets == maxWPackets {
+			numMaxW++
+		} else if isBest(p) {
+			numCollected++
+		}
+	}
+	selfMaxW := s.wPackets == maxWPackets
+	selfCollected := !selfMaxW && isBest(s)
+	n := len(paths)
+	switch {
+	case selfCollected:
+		epsNum, epsDen = 1, uint32(n*numCollected)
+	case selfMaxW && numCollected > 0:
+		epsNum, epsDen = -1, uint32(n*numMaxW)
+	default:
+		epsNum, epsDen = 0, 1
+	}
+
+	inc = s.w/(sum*sum) + float64(epsNum)/(float64(epsDen)*s.w)
+	if math.IsNaN(inc) || math.IsInf(inc, 0) {
+		return 0, epsNum, epsDen
+	}
+	return min(max(inc, -1), 1), epsNum, epsDen
 }
 
-// OnCongestionEvent is called when congestion is detected (packet loss).
+// OnCongestionEvent is called when congestion is detected (packet loss or ECN-CE).
+// All congestion events for packets sent before the last window reduction belong to the same
+// recovery epoch and are ignored.
 func (o *OLIACongestionControl) OnCongestionEvent(
 	packetNumber protocol.PacketNumber,
 	lostBytes protocol.ByteCount,
@@ -379,32 +459,97 @@ func (o *OLIACongestionControl) OnCongestionEvent(
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
-	// Update loss measurements
-	o.loss1 = o.loss2
-	o.loss2 = o.loss3
-
-	// Reduce congestion window (multiplicative decrease)
-	o.congestionWindow = o.congestionWindow / 2
-	if o.congestionWindow < o.minCongestionWindow {
-		o.congestionWindow = o.minCongestionWindow
+	// TCP NewReno (RFC 6582): all losses of packets sent before the last cutback are one loss event.
+	if packetNumber <= o.largestSentAtLastCutback {
+		return
 	}
+	o.refreshRTTLocked()
+	o.recordLossLocked()
 
-	// Update slow start threshold
+	// Multiplicative decrease. This also ends slow start.
+	o.congestionWindow = max(o.congestionWindow/2, o.minWindowLocked())
 	o.slowStartThreshold = o.congestionWindow
+	o.cwndRemainder = 0
+	o.largestSentAtLastCutback = max(o.largestSentPacketNumber, packetNumber)
+	o.publishLocked()
+}
 
-	// Reset OLIA counter
-	o.sndCwndCnt = 0
+// OnPersistentCongestion is called when persistent congestion is established (section 7.6 of RFC 9002).
+// The congestion window is reduced to the minimum window, and slow start begins again.
+// The slow start threshold and the recovery period of the preceding congestion event are kept,
+// so that losses of packets sent before that event don't reduce the window again.
+func (o *OLIACongestionControl) OnPersistentCongestion() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	o.hybridSlowStart.Restart()
+	o.congestionWindow = o.minWindowLocked()
+	o.cwndRemainder = 0
+	o.publishLocked()
+}
+
+// recordLossLocked updates ℓ_r for a new loss event.
+func (o *OLIACongestionControl) recordLossLocked() {
+	// Like Linux, only start a new inter-loss interval if bytes were acknowledged since the last loss.
+	if o.bytesSinceLoss > 0 {
+		o.bytesBetweenLosses = o.bytesSinceLoss
+		o.bytesSinceLoss = 0
+	}
+}
+
+// MaybeExitSlowStart exits slow start if hybrid slow start detects an RTT increase.
+// It is called when an ACK provides a new RTT sample.
+func (o *OLIACongestionControl) MaybeExitSlowStart() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	if !o.inSlowStartLocked() {
+		return
+	}
+	latestRTT, minRTT := o.rtt, o.minRTT
+	if o.rttStats != nil {
+		latestRTT, minRTT = o.rttStats.LatestRTT(), o.rttStats.MinRTT()
+	}
+	if latestRTT <= 0 || minRTT <= 0 {
+		return
+	}
+	if o.hybridSlowStart.ShouldExitSlowStart(latestRTT, minRTT, o.congestionWindow/o.maxDatagramSize) {
+		o.slowStartThreshold = o.congestionWindow
+	}
 }
 
 // InSlowStart returns whether the connection is in slow start.
 func (o *OLIACongestionControl) InSlowStart() bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.inSlowStartLocked()
+}
+
+func (o *OLIACongestionControl) inSlowStartLocked() bool {
 	return o.congestionWindow < o.slowStartThreshold
 }
 
-// InRecovery returns whether the connection is in recovery mode.
+// InRecovery returns whether the connection is in recovery, i.e. whether no packet sent after
+// the last window reduction has been acknowledged yet.
 func (o *OLIACongestionControl) InRecovery() bool {
-	// OLIA doesn't have explicit recovery state
-	return false
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.inRecoveryLocked()
+}
+
+func (o *OLIACongestionControl) inRecoveryLocked() bool {
+	return o.largestSentAtLastCutback != protocol.InvalidPacketNumber &&
+		(o.largestAckedPacketNumber == protocol.InvalidPacketNumber || o.largestAckedPacketNumber <= o.largestSentAtLastCutback)
+}
+
+// isCwndLimitedLocked returns whether the sender is (almost) limited by the congestion window.
+func (o *OLIACongestionControl) isCwndLimitedLocked(bytesInFlight protocol.ByteCount) bool {
+	if bytesInFlight >= o.congestionWindow {
+		return true
+	}
+	availableBytes := o.congestionWindow - bytesInFlight
+	slowStartLimited := o.inSlowStartLocked() && bytesInFlight > o.congestionWindow/2
+	return slowStartLimited || availableBytes <= oliaMaxBurstPackets*o.maxDatagramSize
 }
 
 // OnPacketLost is called when a packet is declared lost.
@@ -422,59 +567,122 @@ func (o *OLIACongestionControl) OnRetransmissionTimeout(packetsRetransmitted boo
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
-	// Reduce window to minimum
-	o.slowStartThreshold = o.congestionWindow / 2
-	o.congestionWindow = o.minCongestionWindow
-	o.sndCwndCnt = 0
+	o.largestSentAtLastCutback = protocol.InvalidPacketNumber
+	if !packetsRetransmitted {
+		return
+	}
+	o.hybridSlowStart.Restart()
+	o.recordLossLocked()
+	minWindow := o.minWindowLocked()
+	o.slowStartThreshold = max(o.congestionWindow/2, minWindow)
+	o.congestionWindow = minWindow
+	o.cwndRemainder = 0
+	o.publishLocked()
 }
 
-// SmoothedBytesBetweenLosses returns smoothed bytes between losses.
+// SmoothedBytesBetweenLosses returns ℓ_r: the number of bytes acknowledged between the last two
+// losses, or since the last loss if that is larger.
 func (o *OLIACongestionControl) SmoothedBytesBetweenLosses() protocol.ByteCount {
-	if o.loss3 > o.loss2 && o.loss3-o.loss2 > o.loss2-o.loss1 {
-		return o.loss3 - o.loss2
-	}
-	return o.loss2 - o.loss1
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.ellLocked()
+}
+
+func (o *OLIACongestionControl) ellLocked() protocol.ByteCount {
+	return max(o.bytesBetweenLosses, o.bytesSinceLoss)
 }
 
 // UpdateRTT updates the RTT estimate for this path.
+// Controllers created by NewOLIACongestionControlFactory read the RTT from the path's RTT statistics
+// on every ACK and loss, which overrides values set here.
 func (o *OLIACongestionControl) UpdateRTT(rtt, minRTT time.Duration) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.rtt = rtt
+	if rtt > 0 {
+		o.rtt = rtt
+	}
 	if minRTT > 0 && (o.minRTT == 0 || minRTT < o.minRTT) {
 		o.minRTT = minRTT
 	}
-	o.updateRTT = true
+	o.publishLocked()
+}
+
+// refreshRTTLocked reads the RTT from the RTT statistics, if set.
+// It uses the smoothed RTT, or the latest RTT if there is no smoothed RTT.
+func (o *OLIACongestionControl) refreshRTTLocked() {
+	if o.rttStats == nil {
+		return
+	}
+	rtt := o.rttStats.SmoothedRTT()
+	if rtt <= 0 {
+		rtt = o.rttStats.LatestRTT()
+	}
+	if rtt > 0 {
+		o.rtt = rtt
+	}
+	if minRTT := o.rttStats.MinRTT(); minRTT > 0 {
+		o.minRTT = minRTT
+	}
 }
 
 // SetMaxDatagramSize updates the maximum datagram size.
 func (o *OLIACongestionControl) SetMaxDatagramSize(size protocol.ByteCount) {
+	if size <= 0 {
+		return
+	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.maxDatagramSize = size
+
+	cwndIsMinCwnd := o.congestionWindow == o.minWindowLocked()
+	o.maxDatagramSize = min(size, oliaMaxDatagramSize)
+	if cwndIsMinCwnd {
+		o.congestionWindow = o.minWindowLocked()
+	}
+	o.congestionWindow = min(max(o.congestionWindow, o.minWindowLocked()), o.maxWindowLocked())
+	o.publishLocked()
 }
 
-// Reset resets the congestion control state.
+// takeOverState continues with the state of another congestion controller,
+// e.g. the controller that path 0 used before IETF Multipath QUIC became active.
+// A reduced congestion window and the recovery period are kept (section 7.3.2 of RFC 9002).
+func (o *OLIACongestionControl) takeOverState(s congestion.State) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	o.congestionWindow = min(max(s.CongestionWindow, o.minWindowLocked()), o.maxWindowLocked())
+	o.slowStartThreshold = s.SlowStartThreshold
+	o.cwndRemainder = 0
+	o.largestSentPacketNumber = s.LargestSentPacketNumber
+	o.largestAckedPacketNumber = s.LargestAckedPacketNumber
+	o.largestSentAtLastCutback = s.LargestSentAtLastCutback
+	o.publishLocked()
+}
+
+// Reset resets the congestion control state. The RTT estimate is kept.
 func (o *OLIACongestionControl) Reset() {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
-	o.congestionWindow = o.initialWindow
-	o.slowStartThreshold = o.maxCongestionWindow
-	o.loss1 = 0
-	o.loss2 = 0
-	o.loss3 = 0
+	o.congestionWindow = min(max(o.initialWindow, o.minWindowLocked()), o.maxWindowLocked())
+	o.slowStartThreshold = protocol.MaxByteCount
+	o.cwndRemainder = 0
+	o.bytesBetweenLosses = 0
+	o.bytesSinceLoss = 0
 	o.epsilonNum = 0
 	o.epsilonDen = 1
-	o.sndCwndCnt = 0
-	o.ackedBytes = 0
+	o.largestSentPacketNumber = protocol.InvalidPacketNumber
+	o.largestAckedPacketNumber = protocol.InvalidPacketNumber
+	o.largestSentAtLastCutback = protocol.InvalidPacketNumber
+	o.hybridSlowStart.Restart()
+	o.publishLocked()
 }
 
 // Unregister removes this path from shared state.
+// It should be called when the path is closed. It is safe to call it multiple times.
 func (o *OLIACongestionControl) Unregister() {
-	o.sharedState.mu.Lock()
-	defer o.sharedState.mu.Unlock()
-	delete(o.sharedState.pathOLIA, o.pathID)
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.sharedState.unregister(o, o.pathID)
 }
 
 // GetStatistics returns congestion control statistics.
@@ -487,11 +695,39 @@ func (o *OLIACongestionControl) GetStatistics() OLIAStatistics {
 		CongestionWindow:   o.congestionWindow,
 		SlowStartThreshold: o.slowStartThreshold,
 		BytesInFlight:      0, // Would need to be tracked separately
-		InSlowStart:        o.InSlowStart(),
+		InSlowStart:        o.inSlowStartLocked(),
+		InRecovery:         o.inRecoveryLocked(),
 		EpsilonNum:         o.epsilonNum,
 		EpsilonDen:         o.epsilonDen,
 		RTT:                o.rtt,
 	}
+}
+
+// pathStateLocked returns the path's state as seen by the other paths.
+func (o *OLIACongestionControl) pathStateLocked() oliaPathState {
+	rtt := o.rtt
+	if rtt <= 0 {
+		rtt = utils.DefaultInitialRTT
+	}
+	return oliaPathState{
+		cwnd: o.congestionWindow,
+		mss:  o.maxDatagramSize,
+		rtt:  rtt,
+		ell:  o.ellLocked(),
+	}
+}
+
+// publishLocked copies the path's state to the shared state.
+func (o *OLIACongestionControl) publishLocked() {
+	o.sharedState.update(o, o.pathID, o.pathStateLocked())
+}
+
+func (o *OLIACongestionControl) minWindowLocked() protocol.ByteCount {
+	return oliaMinWindowPackets * o.maxDatagramSize
+}
+
+func (o *OLIACongestionControl) maxWindowLocked() protocol.ByteCount {
+	return oliaMaxWindowPackets * o.maxDatagramSize
 }
 
 // OLIAStatistics contains statistics for OLIA congestion control.
@@ -501,12 +737,16 @@ type OLIAStatistics struct {
 	SlowStartThreshold protocol.ByteCount
 	BytesInFlight      protocol.ByteCount
 	InSlowStart        bool
-	EpsilonNum         int
-	EpsilonDen         uint32
-	RTT                time.Duration
+	InRecovery         bool
+	// α_r = EpsilonNum / EpsilonDen, from the last congestion avoidance update.
+	EpsilonNum int
+	EpsilonDen uint32
+	RTT        time.Duration
 }
 
-// oliaScale64 scales a uint64 value by a given scale factor.
-func oliaScale64(val uint64, scale uint) uint64 {
-	return val << scale
+func saturatingAddByteCount(a, b protocol.ByteCount) protocol.ByteCount {
+	if b > protocol.MaxByteCount-a {
+		return protocol.MaxByteCount
+	}
+	return a + b
 }

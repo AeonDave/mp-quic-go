@@ -39,9 +39,7 @@ func TestDefaultMultipathController_RegisterPath(t *testing.T) {
 	controller.mu.RUnlock()
 
 	require.True(t, exists)
-	require.Equal(t, pathInfo.ID, state.info.ID)
 	require.True(t, state.sendingAllowed)
-	require.False(t, state.validated)
 }
 
 func TestDefaultMultipathController_RegisterPath_Duplicate(t *testing.T) {
@@ -72,12 +70,10 @@ func TestDefaultMultipathController_UpdatePathState(t *testing.T) {
 
 	// Update state
 	sendingAllowed := false
-	validated := true
 	rtt := 50 * time.Millisecond
 
 	update := PathStateUpdate{
 		SendingAllowed: &sendingAllowed,
-		Validated:      &validated,
 		SmoothedRTT:    &rtt,
 	}
 
@@ -89,7 +85,6 @@ func TestDefaultMultipathController_UpdatePathState(t *testing.T) {
 	controller.mu.RUnlock()
 
 	require.False(t, state.sendingAllowed)
-	require.True(t, state.validated)
 	require.Equal(t, 50*time.Millisecond, state.smoothedRTT)
 }
 
@@ -172,16 +167,20 @@ func TestDefaultMultipathController_SelectPath(t *testing.T) {
 
 	controller.RegisterPath(path1)
 	controller.RegisterPath(path2)
+	// the controller selects one of the paths passed in the context
+	_, ok := controller.SelectPath(PathSelectionContext{Now: time.Now()})
+	require.False(t, ok)
 
 	// Select path
 	ctx := PathSelectionContext{
 		Now:     time.Now(),
 		AckOnly: false,
+		Paths:   []PathInfo{path1, path2},
 	}
 
 	info, ok := controller.SelectPath(ctx)
 	require.True(t, ok)
-	require.Contains(t, []PathID{1, 2}, info.ID)
+	require.Contains(t, []PathInfo{path1, path2}, info)
 
 	// Track quota
 	controller.OnPacketSent(info.ID, 1200)
@@ -213,6 +212,7 @@ func TestDefaultMultipathController_SelectPath_AllBlocked(t *testing.T) {
 	ctx := PathSelectionContext{
 		Now:               time.Now(),
 		HasRetransmission: false,
+		Paths:             []PathInfo{pathInfo},
 	}
 
 	_, ok := controller.SelectPath(ctx)
@@ -222,115 +222,6 @@ func TestDefaultMultipathController_SelectPath_AllBlocked(t *testing.T) {
 	ctx.HasRetransmission = true
 	_, ok = controller.SelectPath(ctx)
 	require.True(t, ok)
-}
-
-func TestDefaultMultipathController_PathIDForPacket(t *testing.T) {
-	controller := NewDefaultMultipathController(nil)
-
-	localAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1234}
-	remoteAddr := &net.UDPAddr{IP: net.IPv4(192, 168, 1, 1), Port: 5678}
-
-	pathInfo := PathInfo{
-		ID:         1,
-		LocalAddr:  localAddr,
-		RemoteAddr: remoteAddr,
-	}
-
-	controller.RegisterPath(pathInfo)
-
-	// Should find the path
-	pathID, ok := controller.PathIDForPacket(remoteAddr, localAddr)
-	require.True(t, ok)
-	require.Equal(t, PathID(1), pathID)
-
-	// Wrong addresses
-	wrongAddr := &net.UDPAddr{IP: net.IPv4(192, 168, 1, 2), Port: 9999}
-	_, ok = controller.PathIDForPacket(wrongAddr, localAddr)
-	require.False(t, ok)
-}
-
-func TestDefaultMultipathController_EnablePacketDuplication(t *testing.T) {
-	controller := NewDefaultMultipathController(nil)
-
-	require.False(t, controller.enableDuplication)
-
-	controller.EnablePacketDuplication(true)
-	require.True(t, controller.enableDuplication)
-
-	controller.EnablePacketDuplication(false)
-	require.False(t, controller.enableDuplication)
-}
-
-func TestDefaultMultipathController_SetDuplicationParameters(t *testing.T) {
-	controller := NewDefaultMultipathController(nil)
-
-	require.True(t, controller.duplicationUnprobed)
-	require.Equal(t, uint64(10), controller.duplicationQuota)
-
-	controller.SetDuplicationParameters(false, 20)
-	require.False(t, controller.duplicationUnprobed)
-	require.Equal(t, uint64(20), controller.duplicationQuota)
-}
-
-func TestDefaultMultipathController_ShouldDuplicatePacket(t *testing.T) {
-	scheduler := NewMinRTTScheduler(0.5)
-	controller := NewDefaultMultipathController(scheduler)
-	controller.EnablePacketDuplication(true)
-
-	// Register two paths
-	path1 := PathInfo{ID: 1}
-	path2 := PathInfo{ID: 2}
-	controller.RegisterPath(path1)
-	controller.RegisterPath(path2)
-
-	// Path 2 is unprobed (RTT = 0)
-	rtt := 50 * time.Millisecond
-	controller.UpdatePathState(1, PathStateUpdate{SmoothedRTT: &rtt})
-
-	// Send some packets on path 1
-	for i := 0; i < 5; i++ {
-		controller.OnPacketSent(1, 1200)
-	}
-
-	// Should duplicate on path 2 (unprobed)
-	dupPathID, shouldDup := controller.ShouldDuplicatePacket(1)
-	require.True(t, shouldDup)
-	require.Equal(t, PathID(2), dupPathID)
-}
-
-func TestDefaultMultipathController_ShouldDuplicatePacket_Disabled(t *testing.T) {
-	controller := NewDefaultMultipathController(nil)
-	// Duplication disabled by default
-
-	path1 := PathInfo{ID: 1}
-	path2 := PathInfo{ID: 2}
-	controller.RegisterPath(path1)
-	controller.RegisterPath(path2)
-
-	_, shouldDup := controller.ShouldDuplicatePacket(1)
-	require.False(t, shouldDup)
-}
-
-func TestDefaultMultipathController_ShouldDuplicatePacket_OnlyProbed(t *testing.T) {
-	scheduler := NewMinRTTScheduler(0.5)
-	controller := NewDefaultMultipathController(scheduler)
-	controller.EnablePacketDuplication(true)
-	controller.SetDuplicationParameters(true, 10) // Only on unprobed
-
-	// Register two paths, both probed
-	path1 := PathInfo{ID: 1}
-	path2 := PathInfo{ID: 2}
-	controller.RegisterPath(path1)
-	controller.RegisterPath(path2)
-
-	rtt1 := 50 * time.Millisecond
-	rtt2 := 100 * time.Millisecond
-	controller.UpdatePathState(1, PathStateUpdate{SmoothedRTT: &rtt1})
-	controller.UpdatePathState(2, PathStateUpdate{SmoothedRTT: &rtt2})
-
-	// Should not duplicate (both paths are probed)
-	_, shouldDup := controller.ShouldDuplicatePacket(1)
-	require.False(t, shouldDup)
 }
 
 func TestDefaultMultipathController_GetStatistics(t *testing.T) {
@@ -368,6 +259,7 @@ func TestDefaultMultipathController_ConcurrentAccess(t *testing.T) {
 	controller := NewDefaultMultipathController(nil)
 
 	// Register paths
+	var paths []PathInfo
 	for i := 1; i <= 5; i++ {
 		pathInfo := PathInfo{
 			ID:         PathID(i),
@@ -375,14 +267,15 @@ func TestDefaultMultipathController_ConcurrentAccess(t *testing.T) {
 			RemoteAddr: &net.UDPAddr{IP: net.IPv4(192, 168, 1, byte(i)), Port: 5000 + i},
 		}
 		controller.RegisterPath(pathInfo)
+		paths = append(paths, pathInfo)
 	}
 
 	done := make(chan bool)
 
 	// Concurrent selections
 	go func() {
-		for i := 0; i < 100; i++ {
-			ctx := PathSelectionContext{Now: time.Now()}
+		for range 100 {
+			ctx := PathSelectionContext{Now: time.Now(), Paths: paths}
 			if info, ok := controller.SelectPath(ctx); ok {
 				controller.OnPacketSent(info.ID, 1200)
 			}
@@ -392,7 +285,7 @@ func TestDefaultMultipathController_ConcurrentAccess(t *testing.T) {
 
 	// Concurrent updates
 	go func() {
-		for i := 0; i < 100; i++ {
+		for i := range 100 {
 			rtt := time.Duration(50+i) * time.Millisecond
 			controller.UpdatePathState(PathID((i%5)+1), PathStateUpdate{SmoothedRTT: &rtt})
 		}
@@ -401,33 +294,22 @@ func TestDefaultMultipathController_ConcurrentAccess(t *testing.T) {
 
 	// Concurrent statistics
 	go func() {
-		for i := 0; i < 100; i++ {
+		for range 100 {
 			_ = controller.GetStatistics()
 		}
 		done <- true
 	}()
 
 	// Wait for all
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		<-done
 	}
-}
-
-func TestAddrsEqual(t *testing.T) {
-	addr1 := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1234}
-	addr2 := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1234}
-	addr3 := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5678}
-
-	require.True(t, addrsEqual(addr1, addr2))
-	require.False(t, addrsEqual(addr1, addr3))
-	require.True(t, addrsEqual(nil, nil))
-	require.False(t, addrsEqual(addr1, nil))
-	require.False(t, addrsEqual(nil, addr1))
 }
 
 func BenchmarkDefaultMultipathController_SelectPath(b *testing.B) {
 	controller := NewDefaultMultipathController(nil)
 
+	var paths []PathInfo
 	for i := 1; i <= 3; i++ {
 		pathInfo := PathInfo{
 			ID:         PathID(i),
@@ -435,12 +317,13 @@ func BenchmarkDefaultMultipathController_SelectPath(b *testing.B) {
 			RemoteAddr: &net.UDPAddr{IP: net.IPv4(192, 168, 1, byte(i)), Port: 5000 + i},
 		}
 		controller.RegisterPath(pathInfo)
+		paths = append(paths, pathInfo)
 
 		rtt := time.Duration(50*i) * time.Millisecond
 		controller.UpdatePathState(PathID(i), PathStateUpdate{SmoothedRTT: &rtt})
 	}
 
-	ctx := PathSelectionContext{Now: time.Now()}
+	ctx := PathSelectionContext{Now: time.Now(), Paths: paths}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -448,4 +331,21 @@ func BenchmarkDefaultMultipathController_SelectPath(b *testing.B) {
 			controller.OnPacketSent(info.ID, 1200)
 		}
 	}
+}
+
+func TestDefaultMultipathController_AllPathsPotentiallyFailed(t *testing.T) {
+	controller := NewDefaultMultipathController(NewRoundRobinScheduler())
+	path0 := PathInfo{
+		ID:         0,
+		LocalAddr:  &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1111},
+		RemoteAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 2222},
+	}
+	controller.RegisterPath(path0)
+	failed := true
+	controller.UpdatePathState(0, PathStateUpdate{PotentiallyFailed: &failed})
+
+	// If all paths are potentially failed, they're still used.
+	path, ok := controller.SelectPath(PathSelectionContext{Paths: []PathInfo{path0}})
+	require.True(t, ok)
+	require.Equal(t, PathID(0), path.ID)
 }

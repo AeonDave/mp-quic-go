@@ -14,11 +14,13 @@ var errUnknownFrameType = errors.New("unknown frame type")
 
 // The FrameParser parses QUIC frames, one by one.
 type FrameParser struct {
-	ackDelayExponent      uint8
-	supportsDatagrams     bool
-	supportsResetStreamAt bool
-	supportsAckFrequency  bool
-	supportsMultipath     bool
+	ackDelayExponent        uint8
+	supportsDatagrams       bool
+	supportsResetStreamAt   bool
+	supportsAckFrequency    bool
+	supportsMultipath       bool
+	supportsAddAddress      bool
+	supportsObservedAddress bool
 
 	// To avoid allocating when parsing, keep a single ACK frame struct.
 	// It is used over and over again.
@@ -56,8 +58,19 @@ func (p *FrameParser) ParseType(b []byte, encLevel protocol.EncryptionLevel) (Fr
 		}
 		ft := FrameType(typ)
 		valid := p.IsKnownFrameType(ft)
+		// DATAGRAM frames received without having advertised support are a PROTOCOL_VIOLATION
+		// (section 3 of RFC 9221).
+		if !valid && ft.IsDatagramFrameType() {
+			return 0, parsed, &qerr.TransportError{
+				ErrorCode:    qerr.ProtocolViolation,
+				FrameType:    typ,
+				ErrorMessage: "received a DATAGRAM frame, but datagram support was not advertised",
+			}
+		}
 		if !valid {
-			if p.allowUnknownFrameTypes {
+			// Unknown frame types are only handed to the extension frame handler for 0-RTT and 1-RTT packets.
+			// Initial and Handshake packets are not authenticated against on-path attackers.
+			if p.allowUnknownFrameTypes && (encLevel == protocol.Encryption0RTT || encLevel == protocol.Encryption1RTT) {
 				return ft, parsed, nil
 			}
 			return 0, parsed, &qerr.TransportError{
@@ -67,8 +80,13 @@ func (p *FrameParser) ParseType(b []byte, encLevel protocol.EncryptionLevel) (Fr
 			}
 		}
 		if !ft.isAllowedAtEncLevel(encLevel) {
+			// Receiving a frame in a packet type that doesn't permit it is a PROTOCOL_VIOLATION
+			// (section 12.4 of RFC 9000). This includes the frames of IETF Multipath QUIC and the ADD_ADDRESS frame
+			// in packets other than 1-RTT packets (section 4 of draft-ietf-quic-multipath), and the OBSERVED_ADDRESS
+			// frames outside of the application data packet number space (section 4.1 of
+			// draft-ietf-quic-address-discovery-01).
 			return 0, parsed, &qerr.TransportError{
-				ErrorCode:    qerr.FrameEncodingError,
+				ErrorCode:    qerr.ProtocolViolation,
 				FrameType:    typ,
 				ErrorMessage: fmt.Sprintf("%d not allowed at encryption level %s", ft, encLevel),
 			}
@@ -83,9 +101,29 @@ func (p *FrameParser) AllowUnknownFrameTypes() {
 	p.allowUnknownFrameTypes = true
 }
 
-// EnableMultipath enables parsing of multipath extension frames.
+// EnableMultipath enables parsing of the frames of the multipath extension (draft-ietf-quic-multipath).
+// It needs to be called when advertising the initial_max_path_id transport parameter, before the peer's
+// transport parameters are known, so that these frames are a PROTOCOL_VIOLATION in all packets other than
+// 1-RTT packets (section 4 of the draft).
+// In 1-RTT packets, they are accepted even if the peer didn't advertise the extension.
 func (p *FrameParser) EnableMultipath() {
 	p.supportsMultipath = true
+}
+
+// EnableAddAddress enables parsing of the ADD_ADDRESS frame.
+// It is called once both endpoints advertised the address advertisement extension and IETF Multipath QUIC.
+// The frame is only accepted in 1-RTT packets.
+func (p *FrameParser) EnableAddAddress() {
+	p.supportsAddAddress = true
+}
+
+// EnableObservedAddress enables parsing of the OBSERVED_ADDRESS frames of QUIC Address Discovery
+// (draft-ietf-quic-address-discovery-01).
+// It needs to be called when sending the address_discovery transport parameter, before the peer's transport
+// parameters are known, so that these frames are a PROTOCOL_VIOLATION in Initial and Handshake packets.
+// The frames are accepted in 0-RTT and 1-RTT packets.
+func (p *FrameParser) EnableObservedAddress() {
+	p.supportsObservedAddress = true
 }
 
 // IsKnownFrameType reports if the frame type is supported by the parser.
@@ -94,7 +132,9 @@ func (p *FrameParser) IsKnownFrameType(frameType FrameType) bool {
 		(p.supportsDatagrams && frameType.IsDatagramFrameType()) ||
 		(p.supportsResetStreamAt && frameType == FrameTypeResetStreamAt) ||
 		(p.supportsAckFrequency && (frameType == FrameTypeAckFrequency || frameType == FrameTypeImmediateAck)) ||
-		(p.supportsMultipath && (frameType == FrameTypeAddAddress || frameType == FrameTypePaths || frameType == FrameTypeClosePath))
+		(p.supportsMultipath && frameType.IsMultipathFrameType()) ||
+		(p.supportsAddAddress && frameType == FrameTypeAddAddress) ||
+		(p.supportsObservedAddress && frameType.IsObservedAddressFrameType())
 }
 
 func (p *FrameParser) ParseStreamFrame(frameType FrameType, data []byte, v protocol.Version) (*StreamFrame, int, error) {
@@ -109,6 +149,8 @@ func (p *FrameParser) ParseStreamFrame(frameType FrameType, data []byte, v proto
 	return frame, n, nil
 }
 
+// ParseAckFrame parses an ACK or a PATH_ACK frame.
+// The returned frame is only valid until the next call to ParseAckFrame.
 func (p *FrameParser) ParseAckFrame(frameType FrameType, data []byte, encLevel protocol.EncryptionLevel, v protocol.Version) (*AckFrame, int, error) {
 	ackDelayExponent := p.ackDelayExponent
 	if encLevel != protocol.Encryption1RTT {
@@ -139,7 +181,7 @@ func (p *FrameParser) ParseDatagramFrame(frameType FrameType, data []byte, v pro
 	return f, l, nil
 }
 
-// ParseLessCommonFrame parses everything except STREAM, ACK or DATAGRAM.
+// ParseLessCommonFrame parses everything except STREAM, ACK, PATH_ACK or DATAGRAM.
 // These cases should be handled separately for performance reasons.
 func (p *FrameParser) ParseLessCommonFrame(frameType FrameType, data []byte, v protocol.Version) (Frame, int, error) {
 	var frame Frame
@@ -187,12 +229,24 @@ func (p *FrameParser) ParseLessCommonFrame(frameType FrameType, data []byte, v p
 		frame, l, err = parseAckFrequencyFrame(data, v)
 	case FrameTypeImmediateAck:
 		frame = &ImmediateAckFrame{}
+	case FrameTypePathAbandon:
+		frame, l, err = parsePathAbandonFrame(data, v)
+	case FrameTypePathStatusBackup, FrameTypePathStatusAvailable:
+		frame, l, err = parsePathStatusFrame(data, frameType, v)
+	case FrameTypePathNewConnectionID:
+		frame, l, err = parsePathNewConnectionIDFrame(data, v)
+	case FrameTypePathRetireConnectionID:
+		frame, l, err = parsePathRetireConnectionIDFrame(data, v)
+	case FrameTypeMaxPathID:
+		frame, l, err = parseMaxPathIDFrame(data, v)
+	case FrameTypePathsBlocked:
+		frame, l, err = parsePathsBlockedFrame(data, v)
+	case FrameTypePathCIDsBlocked:
+		frame, l, err = parsePathCIDsBlockedFrame(data, v)
 	case FrameTypeAddAddress:
 		frame, l, err = parseAddAddressFrame(data, v)
-	case FrameTypePaths:
-		frame, l, err = parsePathsFrame(data, v)
-	case FrameTypeClosePath:
-		frame, l, err = parseClosePathFrame(data, v)
+	case FrameTypeObservedAddressIPv4, FrameTypeObservedAddressIPv6:
+		frame, l, err = parseObservedAddressFrame(data, frameType, v)
 	default:
 		err = errUnknownFrameType
 	}

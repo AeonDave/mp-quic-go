@@ -15,7 +15,7 @@ import (
 
 	_ "net/http/pprof"
 
-	"github.com/AeonDave/mp-quic-go"
+	quic "github.com/AeonDave/mp-quic-go"
 	"github.com/AeonDave/mp-quic-go/http3"
 	"github.com/AeonDave/mp-quic-go/http3/qlog"
 	"github.com/AeonDave/mp-quic-go/internal/testdata"
@@ -41,7 +41,7 @@ type Size interface {
 func generatePRData(l int) []byte {
 	res := make([]byte, l)
 	seed := uint64(1)
-	for i := 0; i < l; i++ {
+	for i := range l {
 		seed = seed * 48271 % 2147483647
 		res[i] = byte(seed)
 	}
@@ -81,7 +81,7 @@ func setupHandler(www string) http.Handler {
 
 	mux.HandleFunc("/demo/tiles", func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, "<html><head><style>img{width:40px;height:40px;}</style></head><body>")
-		for i := 0; i < 200; i++ {
+		for i := range 200 {
 			fmt.Fprintf(w, `<img src="/demo/tile?cachebust=%d">`, i)
 		}
 		io.WriteString(w, "</body></html>")
@@ -149,7 +149,6 @@ func main() {
 	handler := setupHandler(*www)
 
 	var wg sync.WaitGroup
-	wg.Add(len(bs))
 	var certFile, keyFile string
 	if *key != "" && *cert != "" {
 		keyFile = *key
@@ -160,7 +159,7 @@ func main() {
 	for _, b := range bs {
 		fmt.Println("listening on", b)
 		bCap := b
-		go func() {
+		wg.Go(func() {
 			var err error
 			if *tcp {
 				err = http3.ListenAndServeTLS(bCap, certFile, keyFile, handler)
@@ -177,8 +176,7 @@ func main() {
 			if err != nil {
 				fmt.Println(err)
 			}
-			wg.Done()
-		}()
+		})
 	}
 	wg.Wait()
 }

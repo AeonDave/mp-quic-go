@@ -15,7 +15,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AeonDave/mp-quic-go/internal/protocol"
 	"github.com/stretchr/testify/require"
 )
 
@@ -31,7 +30,7 @@ func TestMultipath_E2E_BasicConnection(t *testing.T) {
 
 	tlsConf := generateTLSConfig()
 	serverConfig := &Config{
-		MultipathController: createTestMultipathController(protocol.PerspectiveServer),
+		MultipathController: createTestMultipathController(),
 	}
 
 	earlyListener, err := serverTransport.ListenEarly(tlsConf, serverConfig)
@@ -41,9 +40,7 @@ func TestMultipath_E2E_BasicConnection(t *testing.T) {
 	// Start server handler
 	var wg sync.WaitGroup
 	serverErr := make(chan error, 1)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		conn, err := earlyListener.Accept(ctx)
@@ -71,7 +68,7 @@ func TestMultipath_E2E_BasicConnection(t *testing.T) {
 			return
 		}
 		serverErr <- nil
-	}()
+	})
 
 	// Setup client
 	clientConn, err := net.ListenPacket("udp", "127.0.0.1:0")
@@ -81,7 +78,7 @@ func TestMultipath_E2E_BasicConnection(t *testing.T) {
 	clientTransport := &Transport{Conn: clientConn}
 	clientTLS := generateTLSConfigWithServerName("localhost")
 	clientConfig := &Config{
-		MultipathController: createTestMultipathController(protocol.PerspectiveClient),
+		MultipathController: createTestMultipathController(),
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -90,6 +87,7 @@ func TestMultipath_E2E_BasicConnection(t *testing.T) {
 	conn, err := clientTransport.Dial(ctx, listener.LocalAddr(), clientTLS, clientConfig)
 	require.NoError(t, err)
 	defer conn.CloseWithError(0, "")
+	requireIETFMultipath(t, conn)
 
 	// Open stream and send data
 	stream, err := conn.OpenStreamSync(ctx)
@@ -160,7 +158,7 @@ func TestMultipath_E2E_PathSwitching(t *testing.T) {
 		serverController.setConn(conn)
 		defer conn.CloseWithError(0, "")
 
-		for i := 0; i < 2; i++ {
+		for range 2 {
 			stream, err := conn.AcceptStream(ctx)
 			if err != nil {
 				serverErr <- err
@@ -256,9 +254,7 @@ func testSchedulerPolicy(t *testing.T, policy SchedulingPolicy) {
 	serverTransport := &Transport{Conn: listener}
 	tlsConf := generateTLSConfig()
 
-	pathManager := NewMultipathPathManager(protocol.PerspectiveServer)
-	pathManager.EnableMultipath()
-	scheduler := NewMultipathScheduler(pathManager, policy)
+	scheduler := NewMultipathScheduler(policy)
 
 	serverConfig := &Config{
 		MultipathController: scheduler,
@@ -270,9 +266,7 @@ func testSchedulerPolicy(t *testing.T, policy SchedulingPolicy) {
 
 	// Server handler
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		conn, err := earlyListener.Accept(ctx)
@@ -296,7 +290,7 @@ func testSchedulerPolicy(t *testing.T, policy SchedulingPolicy) {
 				break
 			}
 		}
-	}()
+	})
 
 	// Client
 	clientConn, err := net.ListenPacket("udp", "127.0.0.1:0")
@@ -306,9 +300,7 @@ func testSchedulerPolicy(t *testing.T, policy SchedulingPolicy) {
 	clientTransport := &Transport{Conn: clientConn}
 	clientTLS := generateTLSConfigWithServerName("localhost")
 
-	clientPathManager := NewMultipathPathManager(protocol.PerspectiveClient)
-	clientPathManager.EnableMultipath()
-	clientScheduler := NewMultipathScheduler(clientPathManager, policy)
+	clientScheduler := NewMultipathScheduler(policy)
 
 	clientConfig := &Config{
 		MultipathController: clientScheduler,
@@ -320,6 +312,7 @@ func testSchedulerPolicy(t *testing.T, policy SchedulingPolicy) {
 	conn, err := clientTransport.Dial(ctx, listener.LocalAddr(), clientTLS, clientConfig)
 	require.NoError(t, err)
 	defer conn.CloseWithError(0, "")
+	requireIETFMultipath(t, conn)
 
 	// Send data
 	stream, err := conn.OpenStreamSync(ctx)
@@ -347,7 +340,7 @@ func TestMultipath_E2E_ConcurrentStreams(t *testing.T) {
 	serverTransport := &Transport{Conn: listener}
 	tlsConf := generateTLSConfig()
 	serverConfig := &Config{
-		MultipathController: createTestMultipathController(protocol.PerspectiveServer),
+		MultipathController: createTestMultipathController(),
 	}
 
 	earlyListener, err := serverTransport.ListenEarly(tlsConf, serverConfig)
@@ -356,9 +349,7 @@ func TestMultipath_E2E_ConcurrentStreams(t *testing.T) {
 
 	// Server handler for multiple streams
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		conn, err := earlyListener.Accept(ctx)
@@ -368,7 +359,7 @@ func TestMultipath_E2E_ConcurrentStreams(t *testing.T) {
 		defer conn.CloseWithError(0, "")
 
 		var streamWg sync.WaitGroup
-		for i := 0; i < 5; i++ {
+		for range 5 {
 			stream, err := conn.AcceptStream(ctx)
 			if err != nil {
 				return
@@ -382,7 +373,7 @@ func TestMultipath_E2E_ConcurrentStreams(t *testing.T) {
 			}(stream)
 		}
 		streamWg.Wait()
-	}()
+	})
 
 	// Client
 	clientConn, err := net.ListenPacket("udp", "127.0.0.1:0")
@@ -392,7 +383,7 @@ func TestMultipath_E2E_ConcurrentStreams(t *testing.T) {
 	clientTransport := &Transport{Conn: clientConn}
 	clientTLS := generateTLSConfigWithServerName("localhost")
 	clientConfig := &Config{
-		MultipathController: createTestMultipathController(protocol.PerspectiveClient),
+		MultipathController: createTestMultipathController(),
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -401,10 +392,11 @@ func TestMultipath_E2E_ConcurrentStreams(t *testing.T) {
 	conn, err := clientTransport.Dial(ctx, listener.LocalAddr(), clientTLS, clientConfig)
 	require.NoError(t, err)
 	defer conn.CloseWithError(0, "")
+	requireIETFMultipath(t, conn)
 
 	// Open 5 concurrent streams
 	var streamWg sync.WaitGroup
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		streamWg.Add(1)
 		go func(id int) {
 			defer streamWg.Done()
@@ -454,7 +446,7 @@ func TestMultipath_E2E_DuplicationPolicy(t *testing.T) {
 	serverTransport := &Transport{Conn: listener}
 	tlsConf := generateTLSConfig()
 
-	controller := createTestMultipathController(protocol.PerspectiveServer)
+	controller := createTestMultipathController()
 	serverConfig := &Config{
 		MultipathController: controller,
 	}
@@ -485,7 +477,7 @@ func TestMultipath_E2E_DuplicationPolicy(t *testing.T) {
 
 	clientTransport := &Transport{Conn: clientConn}
 	clientConfig := &Config{
-		MultipathController:        createTestMultipathController(protocol.PerspectiveClient),
+		MultipathController:        createTestMultipathController(),
 		MultipathDuplicationPolicy: duplicationPolicy,
 	}
 
@@ -496,6 +488,7 @@ func TestMultipath_E2E_DuplicationPolicy(t *testing.T) {
 	conn, err := clientTransport.Dial(ctx, listener.LocalAddr(), clientTLS, clientConfig)
 	require.NoError(t, err)
 	defer conn.CloseWithError(0, "")
+	requireIETFMultipath(t, conn)
 
 	stream, err := conn.OpenStreamSync(ctx)
 	require.NoError(t, err)
@@ -514,12 +507,16 @@ func TestMultipath_E2E_DuplicationPolicy(t *testing.T) {
 
 // Helper functions
 
-func createTestMultipathController(perspective protocol.Perspective) MultipathController {
-	pathManager := NewMultipathPathManager(perspective)
-	pathManager.EnableMultipath()
-	scheduler := NewMultipathScheduler(pathManager, SchedulingPolicyRoundRobin)
-	scheduler.EnableMultipath()
-	return scheduler
+// requireIETFMultipath checks that a connection whose endpoints configured a multipath controller uses
+// IETF Multipath QUIC.
+func requireIETFMultipath(t *testing.T, conn *Conn) {
+	t.Helper()
+	require.True(t, conn.ConnectionState().SupportsMultipath)
+	require.NotNil(t, conn.mp)
+}
+
+func createTestMultipathController() MultipathController {
+	return NewMultipathScheduler(SchedulingPolicyRoundRobin)
 }
 
 func generateTLSConfig() *tls.Config {
@@ -598,8 +595,4 @@ func (c *pathSwitchController) SelectPath(PathSelectionContext) (PathInfo, bool)
 		LocalAddr:  conn.LocalAddr(),
 		RemoteAddr: conn.RemoteAddr(),
 	}, true
-}
-
-func (c *pathSwitchController) PathIDForPacket(net.Addr, net.Addr) (PathID, bool) {
-	return 0, true
 }

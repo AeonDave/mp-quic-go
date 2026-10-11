@@ -2,6 +2,7 @@ package quic
 
 import (
 	"context"
+	"math"
 	"net"
 	"reflect"
 	"testing"
@@ -19,9 +20,6 @@ type testMultipathController struct{}
 
 func (testMultipathController) SelectPath(PathSelectionContext) (PathInfo, bool) {
 	return PathInfo{}, false
-}
-func (testMultipathController) PathIDForPacket(net.Addr, net.Addr) (PathID, bool) {
-	return 0, false
 }
 
 type testExtensionFrameHandler struct{}
@@ -63,6 +61,15 @@ func TestConfigValidation(t *testing.T) {
 		require.Equal(t, uint64(quicvarint.Max), conf.MaxConnectionReceiveWindow)
 	})
 
+	t.Run("initial version", func(t *testing.T) {
+		require.NoError(t, validateConfig(&Config{InitialVersion: Version1}))
+		require.NoError(t, validateConfig(&Config{Versions: []Version{Version2, Version1}, InitialVersion: Version1}))
+		require.EqualError(t,
+			validateConfig(&Config{Versions: []Version{Version2}, InitialVersion: Version1}),
+			"initial QUIC version v1 is not one of the versions ([v2])",
+		)
+	})
+
 	t.Run("initial packet size", func(t *testing.T) {
 		// not set
 		conf := &Config{InitialPacketSize: 0}
@@ -100,10 +107,12 @@ func configWithNonZeroNonFunctionFields(t *testing.T) *Config {
 		}
 
 		switch fn := typ.Field(i).Name; fn {
-		case "GetConfigForClient", "RequireAddressValidation", "GetLogWriter", "AllowConnectionWindowIncrease", "Tracer":
+		case "GetConfigForClient", "RequireAddressValidation", "GetLogWriter", "AllowConnectionWindowIncrease", "Tracer", "MultipathControllerFactory":
 			// Can't compare functions.
 		case "Versions":
 			f.Set(reflect.ValueOf([]Version{1, 2, 3}))
+		case "InitialVersion":
+			f.Set(reflect.ValueOf(Version(2)))
 		case "ConnectionIDLength":
 			f.Set(reflect.ValueOf(8))
 		case "ConnectionIDGenerator":
@@ -140,7 +149,15 @@ func configWithNonZeroNonFunctionFields(t *testing.T) *Config {
 			f.Set(reflect.ValueOf(true))
 		case "Allow0RTT":
 			f.Set(reflect.ValueOf(true))
+		case "ZeroRTTReplayCache":
+			f.Set(reflect.ValueOf(NewZeroRTTReplayCache(time.Minute, 10)))
 		case "EnableStreamResetPartialDelivery":
+			f.Set(reflect.ValueOf(true))
+		case "EnableQUICBitGreasing":
+			f.Set(reflect.ValueOf(true))
+		case "RequestObservedAddress":
+			f.Set(reflect.ValueOf(true))
+		case "ProvideObservedAddress":
 			f.Set(reflect.ValueOf(true))
 		case "MultipathController":
 			f.Set(reflect.ValueOf(&testMultipathController{}))
@@ -154,12 +171,16 @@ func configWithNonZeroNonFunctionFields(t *testing.T) *Config {
 			f.Set(reflect.ValueOf(policy))
 		case "MultipathAutoPaths":
 			f.Set(reflect.ValueOf(true))
+		case "EnableAddressAdvertisement":
+			f.Set(reflect.ValueOf(true))
 		case "MultipathAutoAdvertise":
 			f.Set(reflect.ValueOf(true))
 		case "MultipathAutoAddrs":
 			f.Set(reflect.ValueOf([]net.IP{net.IPv4(127, 0, 0, 1)}))
 		case "MaxPaths":
 			f.Set(reflect.ValueOf(5))
+		case "MultipathCongestionControl":
+			f.Set(reflect.ValueOf(MultipathCongestionControlOLIA))
 		case "ExtensionFrameHandler":
 			f.Set(reflect.ValueOf(&testExtensionFrameHandler{}))
 		default:
@@ -197,19 +218,23 @@ func TestConfigClone(t *testing.T) {
 	t.Run("returns a copy", func(t *testing.T) {
 		c1 := &Config{MaxIncomingStreams: 100}
 		c2 := c1.Clone()
-		c2.MaxIncomingStreams = 200
-		require.EqualValues(t, 100, c1.MaxIncomingStreams)
+		require.NotNil(t, c2)
+		require.NotSame(t, c1, c2)
 	})
 }
 
 func TestConfigDefaultValues(t *testing.T) {
 	// if set, the values should be copied
 	c := configWithNonZeroNonFunctionFields(t)
-	require.Equal(t, c, populateConfig(c))
+	populated := populateConfig(c)
+	require.True(t, populated.versionsConfigured)
+	c.versionsConfigured = true
+	require.Equal(t, c, populated)
 
 	// if not set, some fields use default values
 	c = populateConfig(&Config{})
 	require.Equal(t, protocol.SupportedVersions, c.Versions)
+	require.False(t, c.versionsConfigured)
 	require.Equal(t, protocol.DefaultHandshakeIdleTimeout, c.HandshakeIdleTimeout)
 	require.Equal(t, protocol.DefaultIdleTimeout, c.MaxIdleTimeout)
 	require.EqualValues(t, protocol.DefaultInitialMaxStreamData, c.InitialStreamReceiveWindow)
@@ -230,4 +255,19 @@ func TestConfigZeroLimits(t *testing.T) {
 	c := populateConfig(config)
 	require.Zero(t, c.MaxIncomingStreams)
 	require.Zero(t, c.MaxIncomingUniStreams)
+}
+
+// MaxPaths is limited when the config is populated,
+// since configs returned by GetConfigForClient are not validated.
+func TestConfigMaxPaths(t *testing.T) {
+	for _, tc := range []struct{ maxPaths, expected int }{
+		{0, 3}, // the default value
+		{-1, 1},
+		{1, 1},
+		{protocol.MaxMultipathPaths, protocol.MaxMultipathPaths},
+		{protocol.MaxMultipathPaths + 1, protocol.MaxMultipathPaths},
+		{math.MaxInt, protocol.MaxMultipathPaths},
+	} {
+		require.Equal(t, tc.expected, populateConfig(&Config{MaxPaths: tc.maxPaths}).MaxPaths, "MaxPaths: %d", tc.maxPaths)
+	}
 }

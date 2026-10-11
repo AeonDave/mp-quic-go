@@ -27,7 +27,10 @@ func LogFrame(logger utils.Logger, frame Frame, sent bool) {
 		logger.Debugf("\t%s &wire.ResetStreamFrame{StreamID: %d, ErrorCode: %#x, FinalSize: %d}", dir, f.StreamID, f.ErrorCode, f.FinalSize)
 	case *AckFrame:
 		hasECN := f.ECT0 > 0 || f.ECT1 > 0 || f.ECNCE > 0
-		var ecn string
+		var pathID, ecn string
+		if f.HasPathID {
+			pathID = fmt.Sprintf("PathID: %d, ", f.PathID)
+		}
 		if hasECN {
 			ecn = fmt.Sprintf(", ECT0: %d, ECT1: %d, CE: %d", f.ECT0, f.ECT1, f.ECNCE)
 		}
@@ -36,9 +39,9 @@ func LogFrame(logger utils.Logger, frame Frame, sent bool) {
 			for i, r := range f.AckRanges {
 				ackRanges[i] = fmt.Sprintf("{Largest: %d, Smallest: %d}", r.Largest, r.Smallest)
 			}
-			logger.Debugf("\t%s &wire.AckFrame{LargestAcked: %d, LowestAcked: %d, AckRanges: {%s}, DelayTime: %s%s}", dir, f.LargestAcked(), f.LowestAcked(), strings.Join(ackRanges, ", "), f.DelayTime.String(), ecn)
+			logger.Debugf("\t%s &wire.AckFrame{%sLargestAcked: %d, LowestAcked: %d, AckRanges: {%s}, DelayTime: %s%s}", dir, pathID, f.LargestAcked(), f.LowestAcked(), strings.Join(ackRanges, ", "), f.DelayTime.String(), ecn)
 		} else {
-			logger.Debugf("\t%s &wire.AckFrame{LargestAcked: %d, LowestAcked: %d, DelayTime: %s%s}", dir, f.LargestAcked(), f.LowestAcked(), f.DelayTime.String(), ecn)
+			logger.Debugf("\t%s &wire.AckFrame{%sLargestAcked: %d, LowestAcked: %d, DelayTime: %s%s}", dir, pathID, f.LargestAcked(), f.LowestAcked(), f.DelayTime.String(), ecn)
 		}
 	case *MaxDataFrame:
 		logger.Debugf("\t%s &wire.MaxDataFrame{MaximumData: %d}", dir, f.MaximumData)
@@ -68,6 +71,24 @@ func LogFrame(logger utils.Logger, frame Frame, sent bool) {
 		logger.Debugf("\t%s &wire.RetireConnectionIDFrame{SequenceNumber: %d}", dir, f.SequenceNumber)
 	case *NewTokenFrame:
 		logger.Debugf("\t%s &wire.NewTokenFrame{Token: %#x}", dir, f.Token)
+	case *PathAbandonFrame:
+		logger.Debugf("\t%s &wire.PathAbandonFrame{PathID: %d, ErrorCode: %#x}", dir, f.PathID, uint64(f.ErrorCode))
+	case *PathStatusFrame:
+		status := "available"
+		if f.Backup {
+			status = "backup"
+		}
+		logger.Debugf("\t%s &wire.PathStatusFrame{PathID: %d, SequenceNumber: %d, Status: %s}", dir, f.PathID, f.SequenceNumber, status)
+	case *PathNewConnectionIDFrame:
+		logger.Debugf("\t%s &wire.PathNewConnectionIDFrame{PathID: %d, SequenceNumber: %d, RetirePriorTo: %d, ConnectionID: %s, StatelessResetToken: %#x}", dir, f.PathID, f.SequenceNumber, f.RetirePriorTo, f.ConnectionID, f.StatelessResetToken)
+	case *PathRetireConnectionIDFrame:
+		logger.Debugf("\t%s &wire.PathRetireConnectionIDFrame{PathID: %d, SequenceNumber: %d}", dir, f.PathID, f.SequenceNumber)
+	case *MaxPathIDFrame:
+		logger.Debugf("\t%s &wire.MaxPathIDFrame{MaximumPathID: %d}", dir, f.MaximumPathID)
+	case *PathsBlockedFrame:
+		logger.Debugf("\t%s &wire.PathsBlockedFrame{MaximumPathID: %d}", dir, f.MaximumPathID)
+	case *PathCIDsBlockedFrame:
+		logger.Debugf("\t%s &wire.PathCIDsBlockedFrame{PathID: %d, NextSequenceNumber: %d}", dir, f.PathID, f.NextSequenceNumber)
 	default:
 		logger.Debugf("\t%s %#v", dir, frame)
 	}

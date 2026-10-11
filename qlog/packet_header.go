@@ -29,6 +29,10 @@ type PacketHeader struct {
 	SrcConnectionID  ConnectionID
 	DestConnectionID ConnectionID
 	Token            *Token
+	// PathID is the path of a 1-RTT packet on a connection that uses the multipath extension.
+	// It is only logged if HasPathID is set.
+	PathID    PathID
+	HasPathID bool
 }
 
 func (h PacketHeader) encode(enc *jsontext.Encoder) error {
@@ -40,6 +44,10 @@ func (h PacketHeader) encode(enc *jsontext.Encoder) error {
 		h.PacketNumber != protocol.InvalidPacketNumber {
 		helper.WriteToken(jsontext.String("packet_number"))
 		helper.WriteToken(jsontext.Int(int64(h.PacketNumber)))
+	}
+	if h.HasPathID {
+		helper.WriteToken(jsontext.String("path_id"))
+		helper.WriteToken(jsontext.Uint(uint64(h.PathID)))
 	}
 	if h.Version != 0 {
 		helper.WriteToken(jsontext.String("version"))

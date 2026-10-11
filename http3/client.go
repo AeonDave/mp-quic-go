@@ -6,13 +6,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptrace"
 	"net/textproto"
 	"sync"
 	"time"
 
-	"github.com/AeonDave/mp-quic-go"
+	quic "github.com/AeonDave/mp-quic-go"
 	"github.com/AeonDave/mp-quic-go/http3/qlog"
 	"github.com/AeonDave/mp-quic-go/qlogwriter"
 	"github.com/quic-go/qpack"
@@ -70,7 +71,8 @@ type ClientConn struct {
 
 	streamMx     sync.Mutex
 	maxStreamID  quic.StreamID // set once a GOAWAY frame is received
-	lastStreamID quic.StreamID // the highest stream ID that was opened
+	goAwayCtx    context.Context
+	goAwayCancel context.CancelFunc
 
 	qlogger qlogwriter.Recorder
 	logger  *slog.Logger
@@ -97,11 +99,11 @@ func newClientConn(
 		additionalSettings: additionalSettings,
 		disableCompression: disableCompression,
 		maxStreamID:        invalidStreamID,
-		lastStreamID:       invalidStreamID,
 		logger:             logger,
 		qlogger:            qlogger,
 		decoder:            qpack.NewDecoder(),
 	}
+	c.goAwayCtx, c.goAwayCancel = context.WithCancel(context.Background())
 	if maxResponseHeaderBytes <= 0 {
 		c.maxResponseHeaderBytes = defaultMaxResponseHeaderBytes
 	} else {
@@ -116,6 +118,7 @@ func newClientConn(
 		qlogger,
 		c.logger,
 	)
+	c.rawConn.isClient = true
 	// send the SETTINGs frame, using 0-RTT data, if possible
 	go func() {
 		_, err := c.rawConn.openControlStream(&settingsFrame{
@@ -146,38 +149,27 @@ func (c *ClientConn) openRequestStream(
 	disableCompression bool,
 	maxHeaderBytes int,
 ) (*RequestStream, error) {
-	c.streamMx.Lock()
-	maxStreamID := c.maxStreamID
-	var nextStreamID quic.StreamID
-	if c.lastStreamID == invalidStreamID {
-		nextStreamID = 0
-	} else {
-		nextStreamID = c.lastStreamID + 4
-	}
-	c.streamMx.Unlock()
-	// Streams with stream ID equal to or greater than the stream ID carried in the GOAWAY frame
-	// will be rejected, see section 5.2 of RFC 9114.
-	if maxStreamID != invalidStreamID && nextStreamID >= maxStreamID {
+	// RFC 9114 Section 5.2 prohibits opening any new request streams after GOAWAY.
+	// The stream ID only identifies requests that were already in flight and might still be processed.
+	if c.goAwayCtx.Err() != nil {
 		return nil, errGoAway
 	}
 
-	str, err := c.conn.OpenStreamSync(ctx)
+	openCtx, cancel := context.WithCancelCause(ctx)
+	// A request blocked in OpenStreamSync has no request stream yet, so it is not in flight.
+	stop := context.AfterFunc(c.goAwayCtx, func() { cancel(errGoAway) })
+	str, err := c.conn.OpenStreamSync(openCtx)
+	stop()
+	cancel(nil)
 	if err != nil {
-		return nil, err
+		if context.Cause(openCtx) == errGoAway {
+			return nil, errGoAway
+		}
+		return nil, maybeReplaceError(err)
 	}
 
-	c.streamMx.Lock()
-	// take the maximum here, as multiple OpenStreamSync calls might have returned concurrently
-	if c.lastStreamID == invalidStreamID {
-		c.lastStreamID = str.StreamID()
-	} else {
-		c.lastStreamID = max(c.lastStreamID, str.StreamID())
-	}
-	// check again, in case a (or another) GOAWAY frame was received
-	maxStreamID = c.maxStreamID
-	c.streamMx.Unlock()
-
-	if maxStreamID != invalidStreamID && str.StreamID() >= maxStreamID {
+	// Check again in case GOAWAY raced with OpenStreamSync.
+	if c.goAwayCtx.Err() != nil {
 		str.CancelRead(quic.StreamErrorCode(ErrCodeRequestCanceled))
 		str.CancelWrite(quic.StreamErrorCode(ErrCodeRequestCanceled))
 		return nil, errGoAway
@@ -212,16 +204,22 @@ func (c *ClientConn) handleControlStream(str *quic.ReceiveStream, fp *frameParse
 	for {
 		f, err := fp.ParseNext(c.qlogger)
 		if err != nil {
-			var serr *quic.StreamError
-			if err == io.EOF || errors.As(err, &serr) {
-				c.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeClosedCriticalStream), "")
+			if errors.Is(err, errPriorityUpdateForPush) {
+				c.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeFrameUnexpected), "")
 				return
 			}
-			c.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeFrameError), "")
+			c.conn.CloseWithError(quic.ApplicationErrorCode(controlStreamErrorCode(err)), "")
 			return
 		}
-		// GOAWAY is the only frame allowed at this point:
-		// * unexpected frames are ignored by the frame parser
+		// We never send a MAX_PUSH_ID frame, so every push ID is larger than the maximum push ID,
+		// and a CANCEL_PUSH frame is an ID error (section 7.2.3 of RFC 9114).
+		if _, ok := f.(*cancelPushFrame); ok {
+			c.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeIDError), "")
+			return
+		}
+		// GOAWAY is the only other frame allowed at this point:
+		// * unknown frame types are ignored by the frame parser
+		// * a server must not send MAX_PUSH_ID frames, and PUSH_PROMISE frames are only sent on request streams
 		// * we don't support any extension that might add support for more frames
 		goaway, ok := f.(*goAwayFrame)
 		if !ok {
@@ -240,6 +238,7 @@ func (c *ClientConn) handleControlStream(str *quic.ReceiveStream, fp *frameParse
 			return
 		}
 		c.maxStreamID = goaway.StreamID
+		c.goAwayCancel()
 		c.streamMx.Unlock()
 
 		hasActiveStreams := c.rawConn.hasActiveStreams()
@@ -273,17 +272,20 @@ func (c *ClientConn) RoundTrip(req *http.Request) (*http.Response, error) {
 
 func (c *ClientConn) roundTrip(req *http.Request) (*http.Response, error) {
 	// Immediately send out this request, if this is a 0-RTT request.
+	var is0RTT bool
 	switch req.Method {
 	case MethodGet0RTT:
 		// don't modify the original request
 		reqCopy := *req
 		req = &reqCopy
 		req.Method = http.MethodGet
+		is0RTT = true
 	case MethodHead0RTT:
 		// don't modify the original request
 		reqCopy := *req
 		req = &reqCopy
 		req.Method = http.MethodHead
+		is0RTT = true
 	default:
 		// wait for the handshake to complete
 		select {
@@ -338,19 +340,25 @@ func (c *ClientConn) roundTrip(req *http.Request) (*http.Response, error) {
 	if err != nil { // if any error occurred
 		close(reqDone)
 		<-done
-		return nil, maybeReplaceError(err)
+		return nil, err
 	}
-	return rsp, maybeReplaceError(err)
+	// A request that might have been sent in 0-RTT and was rejected with a 425 (Too Early) response is retried
+	// once the handshake completed (section 4.2 of RFC 8470).
+	if is0RTT && rsp.StatusCode == http.StatusTooEarly && (req.Body == nil || req.Body == http.NoBody) {
+		rsp.Body.Close()
+		return c.roundTrip(req)
+	}
+	return rsp, nil
 }
 
 // ReceivedSettings returns a channel that is closed once the server's HTTP/3 settings were received.
-// Settings can be obtained from the Settings method after the channel was closed.
+// The settings can be obtained from [ClientConn.Settings] after the channel is closed.
 func (c *ClientConn) ReceivedSettings() <-chan struct{} {
 	return c.rawConn.ReceivedSettings()
 }
 
 // Settings returns the HTTP/3 settings for this connection.
-// It is only valid to call this function after the channel returned by ReceivedSettings was closed.
+// It is only valid to call this method after the channel returned by [ClientConn.ReceivedSettings] is closed.
 func (c *ClientConn) Settings() *Settings {
 	return c.rawConn.Settings()
 }
@@ -364,6 +372,16 @@ func (c *ClientConn) CloseWithError(code quic.ApplicationErrorCode, msg string) 
 // Context returns a context that is cancelled when the connection is closed.
 func (c *ClientConn) Context() context.Context {
 	return c.conn.Context()
+}
+
+// LocalAddr returns the local address of the underlying QUIC connection.
+func (c *ClientConn) LocalAddr() net.Addr {
+	return c.conn.LocalAddr()
+}
+
+// RemoteAddr returns the remote address of the underlying QUIC connection.
+func (c *ClientConn) RemoteAddr() net.Addr {
+	return c.conn.RemoteAddr()
 }
 
 // cancelingReader reads from the io.Reader.

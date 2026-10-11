@@ -5,7 +5,7 @@ RUN echo "TARGETPLATFORM: ${TARGETPLATFORM}"
 
 RUN apt-get update && apt-get install -y wget tar git && rm -rf /var/lib/apt/lists/*
 
-ENV GOVERSION=1.25.0
+ENV GOVERSION=1.27.0
 
 RUN platform=$(echo ${TARGETPLATFORM} | tr '/' '-') && \
   filename="go${GOVERSION}.${platform}.tar.gz" && \
@@ -22,8 +22,8 @@ COPY . /quic-go
 WORKDIR /quic-go
 
 RUN git rev-parse HEAD | tee commit.txt
-RUN go build -o server -ldflags="-X github.com/quic-go/quic-go/qlog.quicGoVersion=$(git describe --always --long --dirty)" interop/server/main.go
-RUN go build -o client -ldflags="-X github.com/quic-go/quic-go/qlog.quicGoVersion=$(git describe --always --long --dirty)" interop/client/main.go
+RUN go build -o server -ldflags="-X github.com/AeonDave/mp-quic-go/qlogwriter.quicGoVersion=$(git describe --always --long --dirty)" interop/server/main.go
+RUN go build -o client -ldflags="-X github.com/AeonDave/mp-quic-go/qlogwriter.quicGoVersion=$(git describe --always --long --dirty)" interop/client/main.go
 
 
 FROM martenseemann/quic-network-simulator-endpoint:latest

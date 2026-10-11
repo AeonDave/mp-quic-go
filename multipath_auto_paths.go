@@ -4,100 +4,93 @@ import (
 	"net"
 	"net/netip"
 
-	"github.com/AeonDave/mp-quic-go/internal/wire"
+	"github.com/AeonDave/mp-quic-go/internal/protocol"
 )
 
+// maybeStartAutoPaths opens paths from the local addresses once IETF Multipath QUIC is active,
+// if Config.MultipathAutoPaths is set (see maybeOpenAutoPaths).
 func (c *Conn) maybeStartAutoPaths() {
-	if c.autoPathsStarted || c.multipathController == nil || !c.multipathEnabled {
-		return
+	// The server address that paths are opened to is known once the validation of the server's preferred
+	// address completed.
+	if c.mp != nil && !c.prefAddrMigration.inProgress() {
+		c.maybeOpenAutoPaths()
 	}
-	if !c.config.MultipathAutoPaths && !c.config.MultipathAutoAdvertise {
+}
+
+// maybeOpenAutoPaths opens paths of IETF Multipath QUIC from the local addresses (client only):
+// from the addresses in Config.MultipathAutoAddrs, or the addresses of the local interfaces, of the address family
+// used by path 0, except for the local address of path 0. Up to Config.MaxPaths-1 paths are opened, to the server
+// address of path 0, including the paths opened to addresses advertised by the server (see
+// maybeOpenPathToAdvertisedAddr). Paths can only be opened once the handshake is confirmed (section 9 of RFC 9000).
+// The paths are opened like paths opened by the application using AddPathFromAddr and Path.Probe.
+// If the server sent the disable_active_migration transport parameter, no paths to its handshake address are opened
+// (section 2.2 of draft-ietf-quic-multipath-21).
+func (c *Conn) maybeOpenAutoPaths() {
+	if c.autoPathsStarted || !c.config.MultipathAutoPaths || c.perspective != protocol.PerspectiveClient ||
+		!c.mp.active || !c.handshakeConfirmed {
 		return
 	}
 	c.autoPathsStarted = true
 
-	localAddrs := c.autoPathAddrs()
-	if len(localAddrs) == 0 {
+	remoteAddr := c.conn.RemoteAddr()
+	if c.peerParams.DisableActiveMigration && peerAddrsEqual(remoteAddr, c.peerHandshakeAddr) {
+		c.logger.Debugf("Not opening paths: the server disabled active migration to its handshake address.")
 		return
 	}
 	localPort, ok := udpPortFromAddr(c.conn.LocalAddr())
 	if !ok {
 		return
 	}
-	remoteAddr := c.conn.RemoteAddr()
-	if remoteAddr == nil {
+	primaryIP := normalizeAutoIP(ipFromAddr(c.conn.LocalAddr()))
+	if primaryIP != nil && !c.hasMultipleSockets() {
+		// The socket is bound to a specific address. It doesn't receive packets sent to other local addresses.
 		return
 	}
-	primaryIP := normalizeAutoIP(ipFromAddr(c.conn.LocalAddr()))
-	if c.config.MultipathAutoAddrs == nil {
-		localAddrs = filterIPFamily(localAddrs, remoteAddr)
+	if primaryIP == nil {
+		// The socket is bound to an unspecified address.
+		// Use the address that the peer sent packets to.
+		primaryIP = normalizeAutoIP(c.primaryLocalIP)
 	}
-	if c.nextAddAddressID == 0 {
-		c.nextAddAddressID = 1
-	}
-
+	// Paths can only be opened from addresses of the address family of the server address.
+	localAddrs := filterIPFamily(c.autoPathAddrs(), remoteAddr)
+	maxPaths := int(localInitialMaxPathID(c.config))
 	for _, ip := range localAddrs {
+		if c.autoPathsOpened >= maxPaths {
+			break
+		}
 		addr := normalizeAutoIP(ip)
-		if addr == nil {
+		if addr == nil || (primaryIP != nil && addr.Equal(primaryIP)) {
 			continue
 		}
-		if primaryIP != nil && addr.Equal(primaryIP) {
-			continue
-		}
-
 		key := addr.String()
-		if c.config.MultipathAutoAdvertise {
-			if c.autoAdvertisedAddrs == nil {
-				c.autoAdvertisedAddrs = make(map[string]bool)
-			}
-			if !c.autoAdvertisedAddrs[key] {
-				c.queueControlFrame(newAddAddressFrame(addr, localPort, c.nextAddAddressID))
-				c.autoAdvertisedAddrs[key] = true
-				c.nextAddAddressID++
-			}
+		if c.autoAddedPaths[key] {
+			continue
 		}
+		if c.autoAddedPaths == nil {
+			c.autoAddedPaths = make(map[string]bool)
+		}
+		c.autoAddedPaths[key] = true
+		c.autoPathsOpened++
 
-		if c.config.MultipathAutoPaths {
-			if c.autoAddedPaths == nil {
-				c.autoAddedPaths = make(map[string]bool)
-			}
-			if c.autoAddedPaths[key] {
-				continue
-			}
-			localAddr := &net.UDPAddr{IP: addr, Port: localPort}
-			pathInfo := PathInfo{
-				ID:         InvalidPathID,
-				LocalAddr:  localAddr,
-				RemoteAddr: remoteAddr,
-			}
-			pathID, ok := c.addAutoPath(pathInfo)
-			if ok {
-				c.autoAddedPaths[key] = true
-				if validator, ok := c.multipathController.(multipathPathValidator); ok {
-					if pathID != InvalidPathID {
-						validator.ValidatePath(pathID)
-					}
-				}
-			}
+		info := packetInfoFromPathInfo(PathInfo{LocalAddr: &net.UDPAddr{IP: addr, Port: localPort}})
+		h := newMPPathHandle(c, func() sendConn { return c.conn.newPathConn(remoteAddr, info) })
+		h.state = mpPathHandleProbing
+		if c.logger.Debug() {
+			c.logger.Debugf("Opening a path from %s.", addr)
 		}
+		// The path is opened when a path ID can be used, see maybeOpenPaths.
+		c.mp.pendingOpens = append(c.mp.pendingOpens, h)
 	}
+	c.scheduleSending()
 }
 
-func (c *Conn) addAutoPath(info PathInfo) (PathID, bool) {
-	if creator, ok := c.multipathController.(multipathPathCreator); ok {
-		pathID, ok := creator.AddPath(info)
-		return pathID, ok
+// hasMultipleSockets says if the connection sends from multiple sockets, i.e. if it uses a MultiSocketManager.
+func (c *Conn) hasMultipleSockets() bool {
+	if sc, ok := c.conn.(*sconn); ok {
+		_, ok := sc.rawConn.(interface{ LocalAddrs() []net.IP })
+		return ok
 	}
-	if registrar, ok := c.multipathController.(multipathPathRegistrar); ok {
-		if c.nextAutoPathID == 0 {
-			c.nextAutoPathID = 1
-		}
-		info.ID = PathID(c.nextAutoPathID)
-		c.nextAutoPathID++
-		registrar.RegisterPath(info)
-		return info.ID, true
-	}
-	return InvalidPathID, false
+	return false
 }
 
 func (c *Conn) autoPathAddrs() []net.IP {
@@ -172,21 +165,4 @@ func filterIPFamily(addrs []net.IP, remote net.Addr) []net.IP {
 		}
 	}
 	return filtered
-}
-
-func newAddAddressFrame(ip net.IP, port int, id uint64) *wire.AddAddressFrame {
-	ipVersion := uint8(6)
-	if v4 := ip.To4(); v4 != nil {
-		ipVersion = 4
-		ip = v4
-	} else {
-		ip = ip.To16()
-	}
-	return &wire.AddAddressFrame{
-		AddressID:      id,
-		SequenceNumber: id,
-		IPVersion:      ipVersion,
-		Address:        append([]byte(nil), ip...),
-		Port:           uint16(port),
-	}
 }

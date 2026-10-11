@@ -149,3 +149,75 @@ func TestVersionGreasing(t *testing.T) {
 	require.NotZero(t, greasedVersionLast)
 	require.NotZero(t, greasedVersionMiddle)
 }
+
+func TestCompatibleVersions(t *testing.T) {
+	// section 4 of RFC 9369: version 1 and version 2 are compatible with each other
+	require.True(t, IsCompatibleVersion(Version1, Version1))
+	require.True(t, IsCompatibleVersion(Version1, Version2))
+	require.True(t, IsCompatibleVersion(Version2, Version1))
+	require.True(t, IsCompatibleVersion(Version2, Version2))
+	// section 2.2 of RFC 9368: versions are not compatible unless explicitly specified
+	require.True(t, IsCompatibleVersion(0x1234, 0x1234))
+	require.False(t, IsCompatibleVersion(Version1, 0x1234))
+	require.False(t, IsCompatibleVersion(0x1234, Version2))
+	require.False(t, IsCompatibleVersion(Version1, versionDraft29))
+
+	require.Equal(t, []Version{Version1, Version2}, CompatibleVersions([]Version{Version1, Version2}, Version1))
+	require.Equal(t, []Version{Version2, Version1}, CompatibleVersions([]Version{Version2, Version1}, Version1))
+	require.Equal(t, []Version{Version1}, CompatibleVersions([]Version{Version1}, Version1))
+	require.Equal(t, []Version{Version2, Version1}, CompatibleVersions([]Version{0x1234, Version2, Version1}, Version1))
+	// the chosen version is always included
+	require.Equal(t, []Version{Version1, Version2}, CompatibleVersions([]Version{Version2}, Version1))
+	require.Equal(t, []Version{0x1234}, CompatibleVersions([]Version{Version1, Version2}, 0x1234))
+}
+
+func TestChooseCompatibleVersion(t *testing.T) {
+	tests := []struct {
+		name      string
+		ours      []Version
+		chosen    Version
+		available []Version
+		expected  Version
+	}{
+		{
+			name:      "server prefers version 2",
+			ours:      []Version{Version2, Version1},
+			chosen:    Version1,
+			available: []Version{Version1, Version2},
+			expected:  Version2,
+		},
+		{
+			name:      "server prefers version 1",
+			ours:      []Version{Version1, Version2},
+			chosen:    Version2,
+			available: []Version{Version2, Version1},
+			expected:  Version1,
+		},
+		{
+			name:      "client doesn't offer the preferred version",
+			ours:      []Version{Version2, Version1},
+			chosen:    Version1,
+			available: []Version{Version1},
+			expected:  Version1,
+		},
+		{
+			name:      "incompatible version offered",
+			ours:      []Version{0x1234, Version1},
+			chosen:    Version1,
+			available: []Version{Version1, 0x1234},
+			expected:  Version1,
+		},
+		{
+			name:      "no overlap",
+			ours:      []Version{Version2},
+			chosen:    Version1,
+			available: []Version{Version1},
+			expected:  Version1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.expected, ChooseCompatibleVersion(tt.ours, tt.chosen, tt.available))
+		})
+	}
+}

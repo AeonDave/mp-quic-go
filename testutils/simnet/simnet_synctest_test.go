@@ -1,12 +1,10 @@
 package simnet
 
 import (
-	"math"
 	"net"
 	"testing"
+	"testing/synctest"
 	"time"
-
-	"github.com/AeonDave/mp-quic-go/internal/synctest"
 
 	"github.com/stretchr/testify/require"
 )
@@ -50,11 +48,7 @@ func TestSimpleSimNet(t *testing.T) {
 		observedLatency := time.Since(start)
 
 		// Only downlink has latency now (uplink is instant)
-		expectedLatency := latency
-		percentDiff := math.Abs(float64(observedLatency-expectedLatency) / float64(expectedLatency))
-		t.Logf("observed latency: %v, expected latency: %v, percent diff: %v", observedLatency, expectedLatency, percentDiff)
-		if percentDiff > 0.30 {
-			t.Fatalf("latency is wrong: %v. percent off: %v", observedLatency, percentDiff)
-		}
+		t.Logf("observed latency: %v, expected latency: %v", observedLatency, latency)
+		require.InEpsilon(t, latency, observedLatency, 0.30)
 	})
 }

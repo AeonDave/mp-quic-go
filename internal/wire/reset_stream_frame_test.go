@@ -32,7 +32,21 @@ func TestParseResetStreamAt(t *testing.T) {
 	require.Equal(t, protocol.ByteCount(0x123456789), frame.FinalSize)
 	require.Equal(t, qerr.StreamErrorCode(0x2468), frame.ErrorCode)
 	require.Equal(t, protocol.ByteCount(0x789abc), frame.ReliableSize)
+	require.True(t, frame.IsResetStreamAt)
 	require.Equal(t, len(data), l)
+
+	// a RESET_STREAM_AT frame with a reliable size of 0
+	data = encodeVarInt(0xabcdef12)                   // stream ID
+	data = append(data, encodeVarInt(0x2468)...)      // error code
+	data = append(data, encodeVarInt(0x123456789)...) // byte offset
+	data = append(data, encodeVarInt(0)...)           // reliable size
+	frame, _, err = parseResetStreamFrame(data, true, protocol.Version1)
+	require.NoError(t, err)
+	require.Zero(t, frame.ReliableSize)
+	require.True(t, frame.IsResetStreamAt)
+	frame, _, err = parseResetStreamFrame(data[:len(data)-1], false, protocol.Version1)
+	require.NoError(t, err)
+	require.False(t, frame.IsResetStreamAt)
 }
 
 func TestParseResetStreamAtSizeTooLarge(t *testing.T) {

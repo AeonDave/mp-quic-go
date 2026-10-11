@@ -19,7 +19,8 @@ import (
 	"github.com/AeonDave/mp-quic-go/qlogwriter"
 )
 
-// ErrServerClosed is returned by the [Listener] or [EarlyListener]'s Accept method after a call to Close.
+// ErrServerClosed is returned by [Listener.Accept] or [EarlyListener.Accept]
+// after [Listener.Close] or [EarlyListener.Close] is called, respectively.
 var ErrServerClosed = errServerClosed{}
 
 type errServerClosed struct{}
@@ -54,6 +55,8 @@ type baseServer struct {
 	config  *Config
 
 	conn rawConn
+	// the preferred address sent to clients (section 9.6 of RFC 9000), nil if none is sent
+	preferredAddr *serverPreferredAddr
 
 	tokenGenerator *handshake.TokenGenerator
 	maxTokenAge    time.Duration
@@ -87,6 +90,7 @@ type baseServer struct {
 		*handshake.TokenGenerator,
 		bool, /* client address validated by an address validation token */
 		time.Duration,
+		*serverPreferredAddr,
 		qlogwriter.Trace,
 		utils.Logger,
 		protocol.Version,
@@ -132,7 +136,7 @@ func (l *Listener) Accept(ctx context.Context) (*Conn, error) {
 }
 
 // Close closes the listener.
-// Accept will return [ErrServerClosed] as soon as all connections in the accept queue have been accepted.
+// [Listener.Accept] will return [ErrServerClosed] as soon as all connections in the accept queue have been accepted.
 // QUIC handshakes that are still in flight will be rejected with a CONNECTION_REFUSED error.
 // Already established (accepted) connections will be unaffected.
 func (l *Listener) Close() error {
@@ -164,7 +168,7 @@ func (l *EarlyListener) Accept(ctx context.Context) (*Conn, error) {
 }
 
 // Close closes the listener.
-// Accept will return [ErrServerClosed] as soon as all connections in the accept queue have been accepted.
+// [EarlyListener.Accept] will return [ErrServerClosed] as soon as all connections in the accept queue have been accepted.
 // Early connections that are still in flight will be rejected with a CONNECTION_REFUSED error.
 // Already established (accepted) connections will be unaffected.
 func (l *EarlyListener) Close() error {
@@ -211,15 +215,15 @@ func listenUDP(addr string) (*net.UDPConn, error) {
 	return net.ListenUDP("udp", udpAddr)
 }
 
-// Listen listens for QUIC connections on a given net.PacketConn.
+// Listen listens for QUIC connections on a given [net.PacketConn].
 // If the PacketConn satisfies the [OOBCapablePacketConn] interface (as a [net.UDPConn] does),
-// ECN and packet info support will be enabled. In this case, ReadMsgUDP and WriteMsgUDP
-// will be used instead of ReadFrom and WriteTo to read/write packets.
-// A single net.PacketConn can only be used for a single call to Listen.
+// ECN and packet info support will be enabled. In this case, packets will be read in batches,
+// and [OOBCapablePacketConn.WriteMsgUDP] will be used instead of [net.PacketConn.WriteTo].
+// A single [net.PacketConn] can only be used for a single call to Listen.
 //
-// The tls.Config must not be nil and must contain a certificate configuration.
-// Furthermore, it must define an application control (using [NextProtos]).
-// The quic.Config may be nil, in that case the default values will be used.
+// The [tls.Config] must not be nil and must contain a certificate configuration.
+// Furthermore, it must define an application protocol using [tls.Config.NextProtos].
+// The [Config] may be nil, in which case the default values will be used.
 //
 // This is a convenience function. More advanced use cases should instantiate a [Transport],
 // which offers configuration options for a more fine-grained control of the connection establishment,
@@ -251,9 +255,11 @@ func newServer(
 	verifySourceAddress func(net.Addr) bool,
 	disableVersionNegotiation bool,
 	acceptEarly bool,
+	preferredAddr *serverPreferredAddr,
 ) *baseServer {
 	s := &baseServer{
 		conn:                      conn,
+		preferredAddr:             preferredAddr,
 		connContext:               connContext,
 		tr:                        tr,
 		tlsConf:                   tlsConf,
@@ -485,7 +491,13 @@ func (s *baseServer) handlePacketImpl(p receivedPacket) bool /* is the buffer st
 
 	// If we're creating a new connection, the packet will be passed to the connection.
 	// The header will then be parsed again.
-	hdr, _, _, err := wire.ParsePacket(p.data)
+	// A client only sets the QUIC Bit of an Initial packet to 0 if the server sent the grease_quic_bit transport
+	// parameter in a previous connection (section 3.1 of RFC 9287).
+	parsePacket := wire.ParsePacket
+	if s.config.EnableQUICBitGreasing {
+		parsePacket = wire.ParsePacketWithGreasedQUICBit
+	}
+	hdr, _, _, err := parsePacket(p.data)
 	if err != nil {
 		if s.qlogger != nil {
 			s.qlogger.RecordEvent(qlog.PacketDropped{
@@ -660,11 +672,18 @@ func (s *baseServer) cleanupZeroRTTQueues(now monotime.Time) {
 //   - address is invalid
 //   - token is expired
 //   - token is null
-func (s *baseServer) validateToken(token *handshake.Token, addr net.Addr) bool {
+//   - token was issued for another QUIC version
+func (s *baseServer) validateToken(token *handshake.Token, addr net.Addr, v protocol.Version) bool {
 	if token == nil {
 		return false
 	}
 	if !token.ValidateRemoteAddr(addr) {
+		return false
+	}
+	// Tokens are specific to a QUIC version (section 5 of RFC 9369).
+	// The client must not switch versions between the Retry and the Initial packet carrying the token
+	// (section 4.1 of RFC 9369).
+	if token.Version != v {
 		return false
 	}
 	if !token.IsRetryToken && time.Since(token.SentTime) > s.maxTokenAge {
@@ -718,7 +737,7 @@ func (s *baseServer) handleInitialImpl(p receivedPacket, hdr *wire.Header) error
 		}
 	}
 	if token != nil {
-		clientAddrVerified = s.validateToken(token, p.remoteAddr)
+		clientAddrVerified = s.validateToken(token, p.remoteAddr, hdr.Version)
 		if !clientAddrVerified {
 			// For invalid and expired non-retry tokens, we don't send an INVALID_TOKEN error.
 			// We just ignore them, and act as if there was no token on this packet at all.
@@ -771,6 +790,10 @@ func (s *baseServer) handleInitialImpl(p receivedPacket, hdr *wire.Header) error
 			return nil
 		}
 		config = populateConfig(conf)
+		config.zeroRTTReplayCache = config.ZeroRTTReplayCache
+		if config.zeroRTTReplayCache == nil {
+			config.zeroRTTReplayCache = s.config.zeroRTTReplayCache
+		}
 	}
 
 	var conn *wrappedConn
@@ -809,7 +832,10 @@ func (s *baseServer) handleInitialImpl(p receivedPacket, hdr *wire.Header) error
 		}
 		qlogTrace = config.Tracer(ctx, false, connID)
 	}
-	connID, err := s.connIDGenerator.GenerateConnectionID()
+	connID, err := generateUnusedConnID(s.connIDGenerator, func(id protocol.ConnectionID) bool {
+		_, ok := s.tr.Get(id)
+		return ok
+	})
 	if err != nil {
 		return err
 	}
@@ -831,6 +857,7 @@ func (s *baseServer) handleInitialImpl(p receivedPacket, hdr *wire.Header) error
 		s.tokenGenerator,
 		clientAddrVerified,
 		rtt,
+		s.preferredAddr,
 		qlogTrace,
 		s.logger,
 		hdr.Version,
@@ -853,11 +880,7 @@ func (s *baseServer) handleInitialImpl(p receivedPacket, hdr *wire.Header) error
 		delete(s.zeroRTTQueues, hdr.DestConnectionID)
 	}
 
-	s.handshakingCount.Add(1)
-	go func() {
-		defer s.handshakingCount.Done()
-		s.handleNewConn(conn)
-	}()
+	s.handshakingCount.Go(func() { s.handleNewConn(conn) })
 	go conn.run()
 	return nil
 }
@@ -917,7 +940,7 @@ func (s *baseServer) sendRetryPacket(p rejectedPacket) error {
 	if err != nil {
 		return err
 	}
-	token, err := s.tokenGenerator.NewRetryToken(p.remoteAddr, hdr.DestConnectionID, srcConnID)
+	token, err := s.tokenGenerator.NewRetryToken(p.remoteAddr, hdr.DestConnectionID, srcConnID, hdr.Version)
 	if err != nil {
 		return err
 	}

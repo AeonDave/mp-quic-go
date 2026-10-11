@@ -10,12 +10,16 @@ import (
 	"github.com/AeonDave/mp-quic-go/quicvarint"
 )
 
-// AddAddressFrame is an ADD_ADDRESS frame used to announce a new address to the peer.
-// This is part of multipath QUIC extensions.
+var errVarintTooLarge = errors.New("value doesn't fit into a varint")
+
+// AddAddressFrame is an ADD_ADDRESS frame used to announce an address to the peer.
+// It belongs to the address advertisement extension of this module (see FrameTypeAddAddress), which is negotiated
+// using the add_address transport parameter. The frame parser only accepts it after EnableAddAddress was called.
 type AddAddressFrame struct {
-	// AddressID uniquely identifies this address
+	// AddressID identifies the address
 	AddressID uint64
-	// SequenceNumber for this announcement
+	// SequenceNumber orders the announcements of an address ID: the announcement with the largest
+	// sequence number is the current address of the address ID
 	SequenceNumber uint64
 	// IPVersion is 4 for IPv4, 6 for IPv6
 	IPVersion uint8
@@ -84,16 +88,26 @@ func parseAddAddressFrame(b []byte, _ protocol.Version) (*AddAddressFrame, int, 
 }
 
 func (f *AddAddressFrame) Append(b []byte, _ protocol.Version) ([]byte, error) {
+	if f.AddressID > quicvarint.Max || f.SequenceNumber > quicvarint.Max {
+		return nil, errVarintTooLarge
+	}
 	b = quicvarint.Append(b, uint64(FrameTypeAddAddress))
 	b = quicvarint.Append(b, f.AddressID)
 	b = quicvarint.Append(b, f.SequenceNumber)
 	b = append(b, f.IPVersion)
 
-	if f.IPVersion == 4 && len(f.Address) != 4 {
-		return nil, errors.New("IPv4 address must be 4 bytes")
-	}
-	if f.IPVersion == 6 && len(f.Address) != 16 {
-		return nil, errors.New("IPv6 address must be 16 bytes")
+	switch f.IPVersion {
+	case 4:
+		if len(f.Address) != 4 {
+			return nil, errors.New("IPv4 address must be 4 bytes")
+		}
+	case 6:
+		if len(f.Address) != 16 {
+			return nil, errors.New("IPv6 address must be 16 bytes")
+		}
+	default:
+		// the peer would fail to parse this frame
+		return nil, fmt.Errorf("invalid IP version: %d", f.IPVersion)
 	}
 
 	b = append(b, f.Address...)
@@ -106,8 +120,8 @@ func (f *AddAddressFrame) Append(b []byte, _ protocol.Version) ([]byte, error) {
 func (f *AddAddressFrame) Length(_ protocol.Version) protocol.ByteCount {
 	addrLen := protocol.ByteCount(len(f.Address))
 	return protocol.ByteCount(quicvarint.Len(uint64(FrameTypeAddAddress))) +
-		protocol.ByteCount(quicvarint.Len(f.AddressID)) +
-		protocol.ByteCount(quicvarint.Len(f.SequenceNumber)) +
+		protocol.ByteCount(varintLen(f.AddressID)) +
+		protocol.ByteCount(varintLen(f.SequenceNumber)) +
 		1 + // IP version
 		addrLen +
 		2 // port
@@ -124,4 +138,13 @@ func (f *AddAddressFrame) GetUDPAddr() *net.UDPAddr {
 		IP:   f.GetIPAddress(),
 		Port: int(f.Port),
 	}
+}
+
+// varintLen returns the length of a varint.
+// Unlike quicvarint.Len, it doesn't panic for values that are too large: Append returns an error for those.
+func varintLen(v uint64) int {
+	if v > quicvarint.Max {
+		return 8
+	}
+	return quicvarint.Len(v)
 }

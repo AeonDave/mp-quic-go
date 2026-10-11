@@ -4,11 +4,11 @@ import (
 	"context"
 	"math/rand/v2"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/AeonDave/mp-quic-go/internal/protocol"
 	"github.com/AeonDave/mp-quic-go/internal/qerr"
-	"github.com/AeonDave/mp-quic-go/internal/synctest"
 	"github.com/AeonDave/mp-quic-go/internal/wire"
 
 	"github.com/stretchr/testify/assert"
@@ -123,7 +123,7 @@ func TestStreamsMapIncomingAcceptingStreams(t *testing.T) {
 		synctest.Wait()
 		select {
 		case err := <-errChan:
-			require.Equal(t, context.Canceled, err)
+			require.ErrorIs(t, err, context.Canceled)
 		default:
 			t.Fatal("timeout")
 		}

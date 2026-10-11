@@ -5,23 +5,27 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
+	"slices"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/AeonDave/mp-quic-go/internal/ackhandler"
-	"github.com/AeonDave/mp-quic-go/internal/flowcontrol"
 	"github.com/AeonDave/mp-quic-go/internal/handshake"
 	"github.com/AeonDave/mp-quic-go/internal/mocks"
 	mockackhandler "github.com/AeonDave/mp-quic-go/internal/mocks/ackhandler"
 	"github.com/AeonDave/mp-quic-go/internal/monotime"
 	"github.com/AeonDave/mp-quic-go/internal/protocol"
 	"github.com/AeonDave/mp-quic-go/internal/qerr"
-	"github.com/AeonDave/mp-quic-go/internal/synctest"
 	"github.com/AeonDave/mp-quic-go/internal/utils"
 	"github.com/AeonDave/mp-quic-go/internal/wire"
 	"github.com/AeonDave/mp-quic-go/qlog"
@@ -39,7 +43,7 @@ func connectionOptCryptoSetup(cs *mocks.MockCryptoSetup) testConnectionOpt {
 	return func(conn *Conn) { conn.cryptoStreamHandler = cs }
 }
 
-func connectionOptConnFlowController(cfc flowcontrol.ConnectionFlowController) testConnectionOpt {
+func connectionOptConnFlowController(cfc *connectionFlowController) testConnectionOpt {
 	return func(conn *Conn) { conn.connFlowController = cfc }
 }
 
@@ -97,12 +101,29 @@ func newServerTestConnection(
 	gso bool,
 	opts ...testConnectionOpt,
 ) *testConnection {
+	return newServerTestConnectionWithPreferredAddr(t, mockCtrl, config, gso, nil, opts...)
+}
+
+// newServerTestConnectionWithPreferredAddr creates a server connection that sends the preferred address,
+// if preferredAddr is set.
+func newServerTestConnectionWithPreferredAddr(
+	t *testing.T,
+	mockCtrl *gomock.Controller,
+	config *Config,
+	gso bool,
+	preferredAddr *serverPreferredAddr,
+	opts ...testConnectionOpt,
+) *testConnection {
 	if mockCtrl == nil {
 		mockCtrl = gomock.NewController(t)
 	}
 	remoteAddr := &net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 4321}
 	localAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1234}
 	connRunner := NewMockConnRunner(mockCtrl)
+	// the connection ID sent in the preferred_address transport parameter is added when the connection is created
+	if preferredAddr != nil {
+		connRunner.EXPECT().Add(gomock.Any(), gomock.Any()).AnyTimes()
+	}
 	sendConn := NewMockSendConn(mockCtrl)
 	sendConn.EXPECT().capabilities().Return(connCapabilities{GSO: gso}).AnyTimes()
 	sendConn.EXPECT().RemoteAddr().Return(remoteAddr).AnyTimes()
@@ -116,6 +137,11 @@ func newServerTestConnection(
 	if config == nil {
 		config = &Config{DisablePathMTUDiscovery: true}
 	}
+	// A server that sends a preferred address uses connection IDs of non-zero length.
+	connIDGenerator := &protocol.DefaultConnectionIDGenerator{}
+	if preferredAddr != nil {
+		connIDGenerator.ConnLen = srcConnID.Len()
+	}
 	wc := newConnection(
 		ctx,
 		cancel,
@@ -123,16 +149,17 @@ func newServerTestConnection(
 		connRunner,
 		origDestConnID,
 		nil,
-		protocol.ConnectionID{},
+		origDestConnID,
 		protocol.ConnectionID{},
 		srcConnID,
-		&protocol.DefaultConnectionIDGenerator{},
+		connIDGenerator,
 		newStatelessResetter(nil),
 		populateConfig(config),
 		&tls.Config{},
 		handshake.NewTokenGenerator(handshake.TokenProtectorKey{}),
 		false,
 		1337*time.Millisecond,
+		preferredAddr,
 		nil,
 		utils.DefaultLogger,
 		protocol.Version1,
@@ -161,6 +188,19 @@ func newClientTestConnection(
 	enable0RTT bool,
 	opts ...testConnectionOpt,
 ) *testConnection {
+	b := make([]byte, 6)
+	rand.Read(b)
+	return newClientTestConnectionWithSrcConnID(t, mockCtrl, config, enable0RTT, protocol.ParseConnectionID(b), opts...)
+}
+
+func newClientTestConnectionWithSrcConnID(
+	t *testing.T,
+	mockCtrl *gomock.Controller,
+	config *Config,
+	enable0RTT bool,
+	srcConnID protocol.ConnectionID,
+	opts ...testConnectionOpt,
+) *testConnection {
 	if mockCtrl == nil {
 		mockCtrl = gomock.NewController(t)
 	}
@@ -172,10 +212,9 @@ func newClientTestConnection(
 	sendConn.EXPECT().RemoteAddr().Return(remoteAddr).AnyTimes()
 	sendConn.EXPECT().LocalAddr().Return(localAddr).AnyTimes()
 	packer := NewMockPacker(mockCtrl)
-	b := make([]byte, 12)
+	b := make([]byte, 6)
 	rand.Read(b)
-	destConnID := protocol.ParseConnectionID(b[:6])
-	srcConnID := protocol.ParseConnectionID(b[6:12])
+	destConnID := protocol.ParseConnectionID(b)
 	if config == nil {
 		config = &Config{DisablePathMTUDiscovery: true}
 	}
@@ -231,7 +270,7 @@ func TestConnectionHandleStreamRelatedFrames(t *testing.T) {
 			tc := newServerTestConnection(t, gomock.NewController(t), nil, false)
 			data, err := test.frame.Append(nil, protocol.Version1)
 			require.NoError(t, err)
-			_, _, _, err = tc.conn.handleFrames(data, connID, protocol.Encryption1RTT, nil, monotime.Now(), protocol.InvalidPathID)
+			_, _, _, err = tc.conn.handleFrames(data, connID, protocol.Encryption1RTT, nil, monotime.Now())
 			require.ErrorIs(t, err, &qerr.TransportError{ErrorCode: qerr.StreamStateError})
 		})
 	}
@@ -239,7 +278,7 @@ func TestConnectionHandleStreamRelatedFrames(t *testing.T) {
 
 func TestConnectionHandleConnectionFlowControlFrames(t *testing.T) {
 	mockCtrl := gomock.NewController(t)
-	connFC := flowcontrol.NewConnectionFlowController(0, 0, nil, utils.NewRTTStats(), utils.DefaultLogger)
+	connFC := newConnectionFlowController(0, 0, nil, utils.NewRTTStats(), utils.DefaultLogger)
 	require.Zero(t, connFC.SendWindowSize())
 	tc := newServerTestConnection(t, mockCtrl, nil, false, connectionOptConnFlowController(connFC))
 	now := monotime.Now()
@@ -301,9 +340,9 @@ func testConnectionClose(t *testing.T, useApplicationClose bool, expectedErr err
 		b := getPacketBuffer()
 		b.Data = append(b.Data, []byte("connection close")...)
 		if useApplicationClose {
-			tc.packer.EXPECT().PackApplicationClose(expectedErr, gomock.Any(), protocol.Version1).Return(&coalescedPacket{buffer: b}, nil)
+			tc.packer.EXPECT().PackApplicationClose(expectedErr, gomock.Any(), protocol.Version1, gomock.Any()).Return(&coalescedPacket{buffer: b}, nil)
 		} else {
-			tc.packer.EXPECT().PackConnectionClose(expectedErr, gomock.Any(), protocol.Version1).Return(&coalescedPacket{buffer: b}, nil)
+			tc.packer.EXPECT().PackConnectionClose(expectedErr, gomock.Any(), protocol.Version1, gomock.Any()).Return(&coalescedPacket{buffer: b}, nil)
 		}
 		tc.sendConn.EXPECT().Write([]byte("connection close"), gomock.Any(), gomock.Any())
 		tc.connRunner.EXPECT().ReplaceWithClosed(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
@@ -366,6 +405,135 @@ func TestConnectionStatelessReset(t *testing.T) {
 			eventRecorder.Events(qlog.ConnectionClosed{}),
 		)
 	})
+}
+
+// A stateless reset received by the connection itself (and not by the Transport, as happens with a zero-length
+// connection ID) closes the connection without sending any further packets (section 10.3.1 of RFC 9000).
+func TestConnectionStatelessResetReceived(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		mockCtrl := gomock.NewController(t)
+		unpacker := NewMockUnpacker(mockCtrl)
+		var eventRecorder events.Recorder
+		tc := newClientTestConnectionWithSrcConnID(t,
+			mockCtrl,
+			nil,
+			false,
+			protocol.ConnectionID{},
+			connectionOptHandshakeConfirmed(),
+			connectionOptUnpacker(unpacker),
+			connectionOptTracer(&eventRecorder),
+		)
+		tc.conn.sentFirstPacket = true
+		token := protocol.StatelessResetToken{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+		tc.connRunner.EXPECT().AddResetToken(token, gomock.Any())
+		tc.conn.connIDManager.SetStatelessResetToken(token)
+
+		unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any(), gomock.Any()).Return(
+			protocol.PacketNumber(0), protocol.PacketNumberLen(0), protocol.KeyPhaseBit(0), nil, handshake.ErrDecryptionFailed,
+		)
+		// No packet is packed or sent: neither the packer nor the send conn expect any calls.
+		tc.connRunner.EXPECT().RemoveResetToken(token)
+		tc.connRunner.EXPECT().ReplaceWithClosed(gomock.Any(), nil, gomock.Any())
+
+		errChan := make(chan error, 1)
+		go func() { errChan <- tc.conn.run() }()
+
+		data := make([]byte, 30)
+		data[0] = 0b01000000
+		copy(data[len(data)-16:], token[:])
+		tc.conn.handlePacket(receivedPacket{
+			remoteAddr: tc.remoteAddr,
+			data:       data,
+			buffer:     getPacketBuffer(),
+			rcvTime:    monotime.Now(),
+		})
+		synctest.Wait()
+
+		select {
+		case err := <-errChan:
+			var statelessResetErr *StatelessResetError
+			require.ErrorAs(t, err, &statelessResetErr)
+		default:
+			t.Fatal("connection was not closed")
+		}
+		require.Equal(t,
+			[]qlogwriter.Event{qlog.ConnectionClosed{Initiator: qlog.InitiatorLocal, Trigger: qlog.ConnectionCloseTriggerStatelessReset}},
+			eventRecorder.Events(qlog.ConnectionClosed{}),
+		)
+	})
+}
+
+// Any datagram ending in a valid stateless reset token is a stateless reset, also if it starts with a long header
+// that can't be processed (section 10.3 of RFC 9000).
+func TestConnectionStatelessResetLongHeader(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		mockCtrl := gomock.NewController(t)
+		tc := newClientTestConnectionWithSrcConnID(t,
+			mockCtrl,
+			nil,
+			false,
+			protocol.ConnectionID{},
+			connectionOptHandshakeConfirmed(),
+		)
+		tc.conn.sentFirstPacket = true
+		token := protocol.StatelessResetToken{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+		tc.connRunner.EXPECT().AddResetToken(token, gomock.Any())
+		tc.conn.connIDManager.SetStatelessResetToken(token)
+
+		// No packet is packed or sent: neither the packer nor the send conn expect any calls.
+		tc.connRunner.EXPECT().RemoveResetToken(token)
+		tc.connRunner.EXPECT().ReplaceWithClosed(gomock.Any(), nil, gomock.Any())
+
+		errChan := make(chan error, 1)
+		go func() { errChan <- tc.conn.run() }()
+
+		data := make([]byte, 40)
+		data[0] = 0xc0                                   // long header
+		binary.BigEndian.PutUint32(data[1:], 0x1a2a3a4a) // unknown version
+		copy(data[len(data)-16:], token[:])
+		tc.conn.handlePacket(receivedPacket{
+			remoteAddr: tc.remoteAddr,
+			data:       data,
+			buffer:     getPacketBuffer(),
+			rcvTime:    monotime.Now(),
+		})
+		synctest.Wait()
+
+		select {
+		case err := <-errChan:
+			var statelessResetErr *StatelessResetError
+			require.ErrorAs(t, err, &statelessResetErr)
+		default:
+			t.Fatal("connection was not closed")
+		}
+	})
+}
+
+// The client only switches to a connection ID that the server provided in a NEW_CONNECTION_ID frame once the
+// handshake is confirmed. Until then, it might still send Initial and Handshake packets, and some servers drop long
+// header packets that don't use the connection ID chosen during the handshake.
+func TestConnectionClientConnIDChangeAfterHandshakeConfirmation(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	cs := mocks.NewMockCryptoSetup(mockCtrl)
+	tc := newClientTestConnection(t, mockCtrl, nil, false, connectionOptCryptoSetup(cs))
+	c := tc.conn
+	c.peerParams = &wire.TransportParameters{ActiveConnectionIDLimit: 2}
+	tc.connRunner.EXPECT().AddResetToken(gomock.Any(), gomock.Any()).AnyTimes()
+	tc.connRunner.EXPECT().RemoveResetToken(gomock.Any()).AnyTimes()
+	newConnID := protocol.ParseConnectionID([]byte{1, 2, 3, 4})
+	require.NoError(t, c.connIDManager.Add(&wire.NewConnectionIDFrame{
+		SequenceNumber:      1,
+		ConnectionID:        newConnID,
+		StatelessResetToken: protocol.StatelessResetToken{1},
+	}))
+
+	require.NoError(t, c.handleHandshakeComplete(monotime.Now()))
+	require.Equal(t, tc.destConnID, c.connIDManager.Get())
+
+	cs.EXPECT().DiscardInitialKeys().AnyTimes()
+	cs.EXPECT().SetHandshakeConfirmed()
+	require.NoError(t, c.handleHandshakeConfirmed(monotime.Now()))
+	require.Equal(t, newConnID, c.connIDManager.Get())
 }
 
 func getLongHeaderPacket(t *testing.T, remoteAddr net.Addr, extHdr *wire.ExtendedHeader, data []byte) receivedPacket {
@@ -473,10 +641,10 @@ func TestConnectionServerInvalidPackets(t *testing.T) {
 		require.Equal(t,
 			[]qlogwriter.Event{
 				qlog.PacketDropped{
-					Header:     qlog.PacketHeader{Version: 1234},
-					Raw:        qlog.RawInfo{Length: int(p.Size())},
-					DatagramID: 42,
-					Trigger:    qlog.PacketDropUnsupportedVersion,
+					Header:                  qlog.PacketHeader{Version: 1234},
+					Raw:                     qlog.RawInfo{Length: int(p.Size())},
+					DatagramPayloadChecksum: 42,
+					Trigger:                 qlog.PacketDropUnsupportedVersion,
 				},
 			},
 			eventRecorder.Events(qlog.PacketDropped{}),
@@ -503,10 +671,10 @@ func TestConnectionServerInvalidPackets(t *testing.T) {
 		require.Equal(t,
 			[]qlogwriter.Event{
 				qlog.PacketDropped{
-					Header:     qlog.PacketHeader{},
-					Raw:        qlog.RawInfo{Length: int(p.Size())},
-					DatagramID: 42,
-					Trigger:    qlog.PacketDropHeaderParseError,
+					Header:                  qlog.PacketHeader{},
+					Raw:                     qlog.RawInfo{Length: int(p.Size())},
+					DatagramPayloadChecksum: 42,
+					Trigger:                 qlog.PacketDropHeaderParseError,
 				},
 			},
 			eventRecorder.Events(qlog.PacketDropped{}),
@@ -537,13 +705,133 @@ func TestConnectionClientDrop0RTT(t *testing.T) {
 					PacketType:   qlog.PacketType0RTT,
 					PacketNumber: protocol.InvalidPacketNumber,
 				},
-				Raw:        qlog.RawInfo{Length: int(p.Size())},
-				DatagramID: 1234,
-				Trigger:    qlog.PacketDropUnexpectedPacket,
+				Raw:                     qlog.RawInfo{Length: int(p.Size())},
+				DatagramPayloadChecksum: 1234,
+				Trigger:                 qlog.PacketDropUnexpectedPacket,
 			},
 		},
 		eventRecorder.Events(qlog.PacketDropped{}),
 	)
+}
+
+func TestConnectionClientDropsInvalidInitialPackets(t *testing.T) {
+	t.Run("token", func(t *testing.T) {
+		mockCtrl := gomock.NewController(t)
+		var eventRecorder events.Recorder
+		tc := newClientTestConnection(t, mockCtrl, nil, false, connectionOptTracer(&eventRecorder))
+
+		// Initial packets sent by the server must have an empty token (section 17.2.2 of RFC 9000)
+		p := getLongHeaderPacket(t,
+			tc.remoteAddr,
+			&wire.ExtendedHeader{
+				Header: wire.Header{
+					Type:             protocol.PacketTypeInitial,
+					DestConnectionID: tc.srcConnID,
+					SrcConnectionID:  tc.destConnID,
+					Token:            []byte("token"),
+					Length:           2,
+					Version:          protocol.Version1,
+				},
+				PacketNumberLen: protocol.PacketNumberLen2,
+			},
+			nil,
+		)
+		wasProcessed, err := tc.conn.handleOnePacket(p, 1234)
+		require.NoError(t, err)
+		require.False(t, wasProcessed)
+		require.Equal(t,
+			[]qlogwriter.Event{
+				qlog.PacketDropped{
+					Header: qlog.PacketHeader{
+						PacketType:   qlog.PacketTypeInitial,
+						PacketNumber: protocol.InvalidPacketNumber,
+					},
+					Raw:                     qlog.RawInfo{Length: int(p.Size())},
+					DatagramPayloadChecksum: 1234,
+					Trigger:                 qlog.PacketDropUnexpectedPacket,
+				},
+			},
+			eventRecorder.Events(qlog.PacketDropped{}),
+		)
+	})
+
+	t.Run("source connection ID", func(t *testing.T) {
+		mockCtrl := gomock.NewController(t)
+		var eventRecorder events.Recorder
+		tc := newClientTestConnection(t, mockCtrl, nil, false, connectionOptTracer(&eventRecorder))
+		tc.conn.receivedFirstPacket = true
+		tc.conn.handshakeDestConnID = tc.destConnID
+
+		// once a packet was received, Initial packets with another source connection ID are dropped
+		// (section 7.2 of RFC 9000)
+		p := getLongHeaderPacket(t,
+			tc.remoteAddr,
+			&wire.ExtendedHeader{
+				Header: wire.Header{
+					Type:             protocol.PacketTypeInitial,
+					DestConnectionID: tc.srcConnID,
+					SrcConnectionID:  protocol.ParseConnectionID([]byte{1, 2, 3, 4, 5, 6, 7, 8}),
+					Length:           2,
+					Version:          protocol.Version1,
+				},
+				PacketNumberLen: protocol.PacketNumberLen2,
+			},
+			nil,
+		)
+		wasProcessed, err := tc.conn.handleOnePacket(p, 1234)
+		require.NoError(t, err)
+		require.False(t, wasProcessed)
+		require.Equal(t,
+			[]qlogwriter.Event{
+				qlog.PacketDropped{
+					Header: qlog.PacketHeader{
+						PacketType:   qlog.PacketTypeInitial,
+						PacketNumber: protocol.InvalidPacketNumber,
+					},
+					Raw:                     qlog.RawInfo{Length: int(p.Size())},
+					DatagramPayloadChecksum: 1234,
+					Trigger:                 qlog.PacketDropUnknownConnectionID,
+				},
+			},
+			eventRecorder.Events(qlog.PacketDropped{}),
+		)
+	})
+}
+
+// When the packet numbers are exhausted, the connection is closed without sending any further packets,
+// not even a CONNECTION_CLOSE (section 12.3 of RFC 9000).
+func TestConnectionPacketNumberExhaustion(t *testing.T) {
+	testConnectionStopSending(t, errPacketNumbersExhausted)
+}
+
+// When the confidentiality limit is reached and the keys can't be updated, the connection is closed without sending
+// any further packets (section 6.6 of RFC 9001).
+func TestConnectionConfidentialityLimitReached(t *testing.T) {
+	testConnectionStopSending(t, handshake.ErrConfidentialityLimitReached)
+}
+
+func testConnectionStopSending(t *testing.T, packErr error) {
+	synctest.Test(t, func(t *testing.T) {
+		mockCtrl := gomock.NewController(t)
+		tc := newClientTestConnection(t, mockCtrl, nil, false, connectionOptHandshakeConfirmed())
+		tc.connRunner.EXPECT().Remove(gomock.Any()).AnyTimes()
+		tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(
+			shortHeaderPacket{}, packErr,
+		)
+		// No CONNECTION_CLOSE is packed or sent: neither the packer nor the send conn expect any further calls.
+
+		errChan := make(chan error, 1)
+		go func() { errChan <- tc.conn.run() }()
+		tc.conn.queueControlFrame(&wire.PingFrame{})
+		synctest.Wait()
+
+		select {
+		case err := <-errChan:
+			require.ErrorIs(t, err, packErr)
+		default:
+			t.Fatal("connection was not closed")
+		}
+	})
 }
 
 func TestConnectionUnpacking(t *testing.T) {
@@ -593,10 +881,10 @@ func TestConnectionUnpacking(t *testing.T) {
 					PacketNumber:     protocol.PacketNumber(0x1337),
 					Version:          protocol.Version1,
 				},
-				Frames:     []qlog.Frame{},
-				ECN:        qlog.ECNCE,
-				Raw:        qlog.RawInfo{Length: int(packet.Size()), PayloadLength: 1},
-				DatagramID: 42,
+				Frames:                  []qlog.Frame{},
+				ECN:                     qlog.ECNCE,
+				Raw:                     qlog.RawInfo{Length: int(packet.Size()), PayloadLength: 1},
+				DatagramPayloadChecksum: 42,
 			},
 		},
 		eventRecorder.Events(qlog.PacketReceived{}, qlog.PacketDropped{}),
@@ -622,9 +910,9 @@ func TestConnectionUnpacking(t *testing.T) {
 					PacketNumber:     protocol.PacketNumber(0x1337),
 					Version:          protocol.Version1,
 				},
-				Raw:        qlog.RawInfo{Length: int(packet.Size()), PayloadLength: 1},
-				DatagramID: 43,
-				Trigger:    qlog.PacketDropDuplicate,
+				Raw:                     qlog.RawInfo{Length: int(packet.Size()), PayloadLength: 1},
+				DatagramPayloadChecksum: 43,
+				Trigger:                 qlog.PacketDropDuplicate,
 			},
 		},
 		eventRecorder.Events(qlog.PacketReceived{}, qlog.PacketDropped{}),
@@ -635,7 +923,7 @@ func TestConnectionUnpacking(t *testing.T) {
 	packet = getShortHeaderPacket(t, tc.remoteAddr, tc.srcConnID, 0x37, nil)
 	packet.ecn = protocol.ECT1
 	packet.rcvTime = rcvTime
-	unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any()).Return(
+	unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any(), gomock.Any()).Return(
 		protocol.PacketNumber(0x1337), protocol.PacketNumberLen2, protocol.KeyPhaseZero, []byte{0} /* PADDING */, nil,
 	)
 	wasProcessed, err = tc.conn.handleOnePacket(packet, 0)
@@ -740,10 +1028,10 @@ func TestConnectionUnpackCoalescedPacket(t *testing.T) {
 					PacketNumber:     protocol.PacketNumber(1337),
 					Version:          protocol.Version1,
 				},
-				Raw:        qlog.RawInfo{Length: int(firstPacketLen), PayloadLength: 1},
-				DatagramID: 42,
-				Frames:     []qlog.Frame{},
-				ECN:        qlog.ECT1,
+				Raw:                     qlog.RawInfo{Length: int(firstPacketLen), PayloadLength: 1},
+				DatagramPayloadChecksum: 42,
+				Frames:                  []qlog.Frame{},
+				ECN:                     qlog.ECT1,
 			},
 			qlog.PacketReceived{
 				Header: qlog.PacketHeader{
@@ -752,16 +1040,16 @@ func TestConnectionUnpackCoalescedPacket(t *testing.T) {
 					PacketNumber:     protocol.PacketNumber(1338),
 					Version:          protocol.Version1,
 				},
-				Raw:        qlog.RawInfo{Length: int(packet2.Size()), PayloadLength: 1},
-				DatagramID: 42,
-				Frames:     []qlog.Frame{{Frame: &wire.PingFrame{}}},
-				ECN:        qlog.ECT1,
+				Raw:                     qlog.RawInfo{Length: int(packet2.Size()), PayloadLength: 1},
+				DatagramPayloadChecksum: 42,
+				Frames:                  []qlog.Frame{{Frame: &wire.PingFrame{}}},
+				ECN:                     qlog.ECT1,
 			},
 			qlog.PacketDropped{
-				Header:     qlog.PacketHeader{DestConnectionID: incorrectSrcConnID},
-				Raw:        qlog.RawInfo{Length: int(packet3.Size())},
-				DatagramID: 42,
-				Trigger:    qlog.PacketDropUnknownConnectionID,
+				Header:                  qlog.PacketHeader{DestConnectionID: incorrectSrcConnID},
+				Raw:                     qlog.RawInfo{Length: int(packet3.Size())},
+				DatagramPayloadChecksum: 42,
+				Trigger:                 qlog.PacketDropUnknownConnectionID,
 			},
 		},
 		eventRecorder.Events(qlog.PacketReceived{}, qlog.PacketDropped{}),
@@ -795,8 +1083,8 @@ func testConnectionUnpackFailureFatal(t *testing.T, unpackErr error) error {
 	)
 
 	tc.connRunner.EXPECT().ReplaceWithClosed(gomock.Any(), gomock.Any(), gomock.Any())
-	unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any()).Return(protocol.PacketNumber(0), protocol.PacketNumberLen(0), protocol.KeyPhaseBit(0), nil, unpackErr)
-	tc.packer.EXPECT().PackConnectionClose(gomock.Any(), gomock.Any(), protocol.Version1).Return(&coalescedPacket{buffer: getPacketBuffer()}, nil)
+	unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any(), gomock.Any()).Return(protocol.PacketNumber(0), protocol.PacketNumberLen(0), protocol.KeyPhaseBit(0), nil, unpackErr)
+	tc.packer.EXPECT().PackConnectionClose(gomock.Any(), gomock.Any(), protocol.Version1, gomock.Any()).Return(&coalescedPacket{buffer: getPacketBuffer()}, nil)
 	errChan := make(chan error, 1)
 	go func() { errChan <- tc.conn.run() }()
 
@@ -840,7 +1128,7 @@ func testConnectionUnpackFailureDropped(t *testing.T, unpackErr error, packetDro
 			connectionOptTracer(&eventRecorder),
 		)
 
-		unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any()).Return(protocol.PacketNumber(0), protocol.PacketNumberLen(0), protocol.KeyPhaseBit(0), nil, unpackErr)
+		unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any(), gomock.Any()).Return(protocol.PacketNumber(0), protocol.PacketNumberLen(0), protocol.KeyPhaseBit(0), nil, unpackErr)
 		errChan := make(chan error, 1)
 		go func() { errChan <- tc.conn.run() }()
 
@@ -920,7 +1208,7 @@ func TestConnectionRemoteClose(t *testing.T) {
 			ReasonPhrase: "foobar",
 		}).Append(nil, protocol.Version1)
 		require.NoError(t, err)
-		unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any()).Return(protocol.PacketNumber(1), protocol.PacketNumberLen2, protocol.KeyPhaseBit(0), ccf, nil)
+		unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any(), gomock.Any()).Return(protocol.PacketNumber(1), protocol.PacketNumberLen2, protocol.KeyPhaseBit(0), ccf, nil)
 
 		tc.connRunner.EXPECT().ReplaceWithClosed(gomock.Any(), gomock.Any(), gomock.Any())
 
@@ -1033,7 +1321,7 @@ func TestConnectionHandshakeIdleTimeout(t *testing.T) {
 func TestConnectionTransportParameters(t *testing.T) {
 	mockCtrl := gomock.NewController(t)
 	var eventRecorder events.Recorder
-	connFC := flowcontrol.NewConnectionFlowController(0, 0, nil, utils.NewRTTStats(), utils.DefaultLogger)
+	connFC := newConnectionFlowController(0, 0, nil, utils.NewRTTStats(), utils.DefaultLogger)
 	require.Zero(t, connFC.SendWindowSize())
 	tc := newServerTestConnection(t,
 		mockCtrl,
@@ -1086,7 +1374,7 @@ func TestConnectionTransportParameters(t *testing.T) {
 func TestConnectionHandleMaxStreamsFrame(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		mockCtrl := gomock.NewController(t)
-		connFC := flowcontrol.NewConnectionFlowController(0, 0, nil, utils.NewRTTStats(), utils.DefaultLogger)
+		connFC := newConnectionFlowController(0, 0, nil, utils.NewRTTStats(), utils.DefaultLogger)
 		tc := newServerTestConnection(t, mockCtrl, nil, false, connectionOptConnFlowController(connFC))
 		tc.conn.handleTransportParameters(&wire.TransportParameters{})
 
@@ -1310,6 +1598,31 @@ func TestConnectionHandshakeServer(t *testing.T) {
 	}
 }
 
+func TestConnectionFinishesCryptoStreamWhenReadKeysBecomeAvailable(t *testing.T) {
+	for _, test := range []struct {
+		event    handshake.EventKind
+		previous protocol.EncryptionLevel
+	}{
+		{handshake.EventReceivedHandshakeReadKeys, protocol.EncryptionInitial},
+		{handshake.EventReceived1RTTReadKeys, protocol.EncryptionHandshake},
+	} {
+		t.Run(test.event.String(), func(t *testing.T) {
+			mockCtrl := gomock.NewController(t)
+			cs := mocks.NewMockCryptoSetup(mockCtrl)
+			tc := newServerTestConnection(t, mockCtrl, nil, false, connectionOptCryptoSetup(cs))
+			require.NoError(t, tc.conn.cryptoStreamManager.HandleCryptoFrame(
+				&wire.CryptoFrame{Offset: 1, Data: []byte("foo")},
+				test.previous,
+			))
+
+			cs.EXPECT().NextEvent().Return(handshake.Event{Kind: test.event})
+			err := tc.conn.handleHandshakeEvents(monotime.Now())
+			require.ErrorIs(t, err, &qerr.TransportError{ErrorCode: qerr.ProtocolViolation})
+			require.ErrorContains(t, err, "encryption level changed, but crypto stream has more data to read")
+		})
+	}
+}
+
 func TestConnectionHandshakeClient(t *testing.T) {
 	t.Run("without preferred address", func(t *testing.T) {
 		testConnectionHandshakeClient(t, false)
@@ -1327,8 +1640,13 @@ func testConnectionHandshakeClient(t *testing.T, usePreferredAddress bool) {
 	tc.sendConn.EXPECT().Write(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
 
 	// the state transition is driven by processing of a CRYPTO frame
+	serverConnID := protocol.ParseConnectionID([]byte{0xde, 0xca, 0xfb, 0xad})
 	hdr := &wire.ExtendedHeader{
-		Header:          wire.Header{Type: protocol.PacketTypeHandshake, Version: protocol.Version1},
+		Header: wire.Header{
+			Type:            protocol.PacketTypeHandshake,
+			SrcConnectionID: serverConnID,
+			Version:         protocol.Version1,
+		},
 		PacketNumberLen: protocol.PacketNumberLen2,
 	}
 	data, err := (&wire.CryptoFrame{Data: []byte("foobar")}).Append(nil, protocol.Version1)
@@ -1336,13 +1654,14 @@ func testConnectionHandshakeClient(t *testing.T, usePreferredAddress bool) {
 
 	tp := &wire.TransportParameters{
 		OriginalDestinationConnectionID: tc.destConnID,
+		InitialSourceConnectionID:       serverConnID,
 		MaxIdleTimeout:                  time.Hour,
 	}
 	preferredAddressConnID := protocol.ParseConnectionID([]byte{10, 8, 6, 4})
 	preferredAddressResetToken := protocol.StatelessResetToken{16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1}
 	if usePreferredAddress {
 		tp.PreferredAddress = &wire.PreferredAddress{
-			IPv4:                netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), 42),
+			IPv4:                netip.AddrPortFrom(netip.AddrFrom4([4]byte{192, 0, 2, 1}), 42),
 			IPv6:                netip.AddrPortFrom(netip.AddrFrom16([16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}), 13),
 			ConnectionID:        preferredAddressConnID,
 			StatelessResetToken: preferredAddressResetToken,
@@ -1371,6 +1690,11 @@ func testConnectionHandshakeClient(t *testing.T, usePreferredAddress bool) {
 		cs.EXPECT().NextEvent().Return(handshake.Event{Kind: handshake.EventNoEvent}),
 	)
 	tc.packer.EXPECT().PackCoalescedPacket(false, gomock.Any(), gomock.Any(), protocol.Version1, gomock.Any()).Return(nil, nil).AnyTimes()
+	// The connection ID from the preferred_address transport parameter is used for migrating to the preferred
+	// address. Its stateless reset token is active.
+	if usePreferredAddress {
+		tc.connRunner.EXPECT().AddResetToken(preferredAddressResetToken, gomock.Any())
+	}
 
 	errChan := make(chan error, 1)
 	go func() { errChan <- tc.conn.run() }()
@@ -1413,6 +1737,27 @@ func testConnectionHandshakeClient(t *testing.T, usePreferredAddress bool) {
 		),
 	)
 	tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(shortHeaderPacket{}, errNothingToPack).AnyTimes()
+	// Once the handshake is confirmed, the client validates the preferred address,
+	// using the connection ID from the preferred_address transport parameter.
+	probeSent := make(chan struct{})
+	if usePreferredAddress {
+		tc.packer.EXPECT().PackPathProbePacket(preferredAddressConnID, gomock.Any(), gomock.Any(), protocol.Version1, protocol.PathID(0)).DoAndReturn(
+			func(_ protocol.ConnectionID, frames []ackhandler.Frame, _ protocol.ByteCount, _ protocol.Version, _ protocol.PathID) (shortHeaderPacket, *packetBuffer, error) {
+				require.IsType(t, &wire.PathChallengeFrame{}, frames[0].Frame)
+				return shortHeaderPacket{IsPathProbePacket: true, Frames: frames}, getPacketBuffer(), nil
+			},
+		).MinTimes(1)
+		tc.sendConn.EXPECT().WriteTo(gomock.Any(), net.UDPAddrFromAddrPort(tp.PreferredAddress.IPv4), packetInfo{}).DoAndReturn(
+			func([]byte, net.Addr, packetInfo) error {
+				select {
+				case <-probeSent:
+				default:
+					close(probeSent)
+				}
+				return nil
+			},
+		).MinTimes(1)
+	}
 	p = getLongHeaderPacket(t, tc.remoteAddr, hdr, nil)
 	tc.conn.handlePacket(receivedPacket{data: p.data, buffer: p.buffer, rcvTime: monotime.Now()})
 
@@ -1421,13 +1766,12 @@ func testConnectionHandshakeClient(t *testing.T, usePreferredAddress bool) {
 	case <-time.After(time.Second):
 		t.Fatal("timeout")
 	}
-
 	if usePreferredAddress {
-		tc.connRunner.EXPECT().AddResetToken(preferredAddressResetToken, gomock.Any())
-	}
-	nextConnID := tc.conn.connIDManager.Get()
-	if usePreferredAddress {
-		require.Equal(t, preferredAddressConnID, nextConnID)
+		select {
+		case <-probeSent:
+		case <-time.After(time.Second):
+			t.Fatal("timeout")
+		}
 	}
 
 	// test teardown
@@ -1497,7 +1841,7 @@ func TestConnection0RTTTransportParameters(t *testing.T) {
 		cs.EXPECT().Close(),
 	)
 	tc.packer.EXPECT().PackCoalescedPacket(false, gomock.Any(), gomock.Any(), protocol.Version1, gomock.Any()).Return(nil, nil).AnyTimes()
-	tc.packer.EXPECT().PackConnectionClose(gomock.Any(), gomock.Any(), protocol.Version1).Return(&coalescedPacket{buffer: getPacketBuffer()}, nil)
+	tc.packer.EXPECT().PackConnectionClose(gomock.Any(), gomock.Any(), protocol.Version1, gomock.Any()).Return(&coalescedPacket{buffer: getPacketBuffer()}, nil)
 	tc.connRunner.EXPECT().ReplaceWithClosed(gomock.Any(), gomock.Any(), gomock.Any())
 
 	errChan := make(chan error, 1)
@@ -1543,8 +1887,8 @@ func testConnectionReceivePrioritization(t *testing.T, handshakeComplete bool, n
 	var counter int
 	var testDone bool
 	done := make(chan struct{})
-	unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any()).DoAndReturn(
-		func(rcvTime monotime.Time, data []byte) (protocol.PacketNumber, protocol.PacketNumberLen, protocol.KeyPhaseBit, []byte, error) {
+	unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(rcvTime monotime.Time, data []byte, _ protocol.PathID) (protocol.PacketNumber, protocol.PacketNumberLen, protocol.KeyPhaseBit, []byte, error) {
 			counter++
 			if counter == numPackets {
 				testDone = true
@@ -1642,11 +1986,11 @@ func TestConnectionPacketBuffering(t *testing.T) {
 		hdrs := make(map[string]*wire.ExtendedHeader)
 
 		packet1 := getLongHeaderPacket(t, tc.remoteAddr, &hdr1, []byte("packet1"))
-		datagramID1 := qlog.CalculateDatagramID(packet1.data)
+		datagramPayloadChecksum1 := qlog.CalculateDatagramPayloadChecksum(packet1.data)
 		hdrs["packet1"] = &hdr1
 		tc.conn.handlePacket(packet1)
 		packet2 := getLongHeaderPacket(t, tc.remoteAddr, &hdr2, []byte("packet2"))
-		datagramID2 := qlog.CalculateDatagramID(packet2.data)
+		datagramPayloadChecksum2 := qlog.CalculateDatagramPayloadChecksum(packet2.data)
 		hdrs["packet2"] = &hdr2
 		tc.conn.handlePacket(packet2)
 		synctest.Wait()
@@ -1658,16 +2002,16 @@ func TestConnectionPacketBuffering(t *testing.T) {
 						PacketType:   qlog.PacketTypeHandshake,
 						PacketNumber: protocol.InvalidPacketNumber,
 					},
-					Raw:        qlog.RawInfo{Length: int(packet1.Size())},
-					DatagramID: datagramID1,
+					Raw:                     qlog.RawInfo{Length: int(packet1.Size())},
+					DatagramPayloadChecksum: datagramPayloadChecksum1,
 				},
 				qlog.PacketBuffered{
 					Header: qlog.PacketHeader{
 						PacketType:   qlog.PacketTypeHandshake,
 						PacketNumber: protocol.InvalidPacketNumber,
 					},
-					Raw:        qlog.RawInfo{Length: int(packet2.Size())},
-					DatagramID: datagramID2,
+					Raw:                     qlog.RawInfo{Length: int(packet2.Size())},
+					DatagramPayloadChecksum: datagramPayloadChecksum2,
 				},
 			},
 			eventRecorder.Events(qlog.PacketBuffered{}),
@@ -1683,7 +2027,7 @@ func TestConnectionPacketBuffering(t *testing.T) {
 		hdr3.PacketNumber = 3
 		hdrs["packet3"] = &hdr3
 		tc.packer.EXPECT().PackCoalescedPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
-		cs.EXPECT().NextEvent().Return(handshake.Event{Kind: handshake.EventReceivedReadKeys})
+		cs.EXPECT().NextEvent().Return(handshake.Event{Kind: handshake.EventReceived1RTTReadKeys})
 		cs.EXPECT().NextEvent().Return(handshake.Event{Kind: handshake.EventNoEvent})
 
 		gomock.InOrder(
@@ -1716,7 +2060,7 @@ func TestConnectionPacketBuffering(t *testing.T) {
 		)
 
 		packet3 := getLongHeaderPacket(t, tc.remoteAddr, &hdr3, []byte("packet3"))
-		datagramID3 := qlog.CalculateDatagramID(packet3.data)
+		datagramPayloadChecksum3 := qlog.CalculateDatagramPayloadChecksum(packet3.data)
 		tc.conn.handlePacket(packet3)
 
 		synctest.Wait()
@@ -1735,9 +2079,9 @@ func TestConnectionPacketBuffering(t *testing.T) {
 						PacketNumber:     3,
 						Version:          protocol.Version1,
 					},
-					Raw:        qlog.RawInfo{Length: int(packet3.Size()), PayloadLength: 8},
-					DatagramID: datagramID3,
-					Frames:     []qlog.Frame{{Frame: &qlog.CryptoFrame{Length: 6}}},
+					Raw:                     qlog.RawInfo{Length: int(packet3.Size()), PayloadLength: 8},
+					DatagramPayloadChecksum: datagramPayloadChecksum3,
+					Frames:                  []qlog.Frame{{Frame: &qlog.CryptoFrame{Length: 6}}},
 				},
 				qlog.PacketReceived{
 					Header: qlog.PacketHeader{
@@ -1747,9 +2091,9 @@ func TestConnectionPacketBuffering(t *testing.T) {
 						PacketNumber:     1,
 						Version:          protocol.Version1,
 					},
-					Raw:        qlog.RawInfo{Length: int(packet1.Size()), PayloadLength: 8},
-					DatagramID: datagramID1,
-					Frames:     []qlog.Frame{},
+					Raw:                     qlog.RawInfo{Length: int(packet1.Size()), PayloadLength: 8},
+					DatagramPayloadChecksum: datagramPayloadChecksum1,
+					Frames:                  []qlog.Frame{},
 				},
 				qlog.PacketReceived{
 					Header: qlog.PacketHeader{
@@ -1759,9 +2103,9 @@ func TestConnectionPacketBuffering(t *testing.T) {
 						PacketNumber:     2,
 						Version:          protocol.Version1,
 					},
-					Raw:        qlog.RawInfo{Length: int(packet1.Size()), PayloadLength: 8},
-					DatagramID: datagramID2,
-					Frames:     []qlog.Frame{},
+					Raw:                     qlog.RawInfo{Length: int(packet1.Size()), PayloadLength: 8},
+					DatagramPayloadChecksum: datagramPayloadChecksum2,
+					Frames:                  []qlog.Frame{},
 				},
 			},
 			eventRecorder.Events(qlog.PacketReceived{}, qlog.PacketBuffered{}),
@@ -1901,7 +2245,7 @@ func TestConnectionPacketPacing(t *testing.T) {
 }
 
 // When the send queue blocks, we need to reset the pacing timer, otherwise the run loop might busy-loop.
-// See https://github.com/AeonDave/mp-quic-go/pull/4943 for more details.
+// See https://github.com/quic-go/quic-go/pull/4943 for more details.
 func TestConnectionPacingAndSendQueue(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		mockCtrl := gomock.NewController(t)
@@ -2053,8 +2397,8 @@ func testConnectionKeepAlive(t *testing.T, enable, expectKeepAlive bool) {
 
 		var unpackTime, packTime monotime.Time
 		done := make(chan struct{})
-		unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any()).DoAndReturn(
-			func(t monotime.Time, bytes []byte) (protocol.PacketNumber, protocol.PacketNumberLen, protocol.KeyPhaseBit, []byte, error) {
+		unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+			func(t monotime.Time, bytes []byte, _ protocol.PathID) (protocol.PacketNumber, protocol.PacketNumberLen, protocol.KeyPhaseBit, []byte, error) {
 				unpackTime = monotime.Now()
 				return protocol.PacketNumber(1), protocol.PacketNumberLen1, protocol.KeyPhaseZero, []byte{0} /* PADDING */, nil
 			},
@@ -2125,7 +2469,7 @@ func TestConnectionACKTimer(t *testing.T) {
 		tc.sendConn.EXPECT().Write(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
 
 		// Set initial alarm timeout far in the future
-		_ = tc.receivedPacketHandler().ReceivedPacket(1, protocol.ECNNon, protocol.Encryption1RTT, monotime.Now().Add(time.Hour), true, protocol.InvalidPathID)
+		_ = tc.receivedPacketHandler().ReceivedPacket(1, protocol.ECNNon, protocol.Encryption1RTT, monotime.Now().Add(time.Hour), true, 0)
 
 		var times []monotime.Time
 		done := make(chan struct{}, 5)
@@ -2140,13 +2484,13 @@ func TestConnectionACKTimer(t *testing.T) {
 					if len(times) == 1 {
 						// After first packet is sent, set alarm timeout for the next iteration
 						// Get the ACK frame to reset state, then receive a new packet to set alarm
-						_ = rph.GetAckFrame(protocol.Encryption1RTT, monotime.Now(), false, protocol.InvalidPathID)
+						_ = rph.GetAckFrame(protocol.Encryption1RTT, monotime.Now(), false, 0)
 						alarmRcvTime := monotime.Now().Add(alarmTimeout - protocol.MaxAckDelay)
-						_ = rph.ReceivedPacket(2, protocol.ECNNon, protocol.Encryption1RTT, alarmRcvTime, true, protocol.InvalidPathID)
+						_ = rph.ReceivedPacket(2, protocol.ECNNon, protocol.Encryption1RTT, alarmRcvTime, true, 0)
 					} else {
 						// After second packet is sent, set alarm timeout far in the future
-						_ = rph.GetAckFrame(protocol.Encryption1RTT, monotime.Now(), false, protocol.InvalidPathID)
-						_ = rph.ReceivedPacket(3, protocol.ECNNon, protocol.Encryption1RTT, monotime.Now().Add(time.Hour), true, protocol.InvalidPathID)
+						_ = rph.GetAckFrame(protocol.Encryption1RTT, monotime.Now(), false, 0)
+						_ = rph.ReceivedPacket(3, protocol.ECNNon, protocol.Encryption1RTT, monotime.Now().Add(time.Hour), true, 0)
 					}
 					return shortHeaderPacket{Frames: []ackhandler.Frame{{Frame: &wire.PingFrame{}}}, Length: 6}, nil
 				},
@@ -2686,6 +3030,283 @@ func testConnectionSendQueue(t *testing.T, enableGSO bool) {
 	})
 }
 
+// A client discards packets from server addresses other than the one it sent the handshake to (section 9 of RFC 9000).
+func TestConnectionClientDropsPacketsFromUnknownServerAddress(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	unpacker := NewMockUnpacker(mockCtrl)
+	var eventRecorder events.Recorder
+	tc := newClientTestConnection(t, mockCtrl, nil, false,
+		connectionOptHandshakeConfirmed(),
+		connectionOptUnpacker(unpacker),
+		connectionOptTracer(&eventRecorder),
+	)
+	c := tc.conn
+	unknownAddr := &net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 4322}
+
+	t.Run("1-RTT packet", func(t *testing.T) {
+		eventRecorder.Clear()
+		wasProcessed, err := c.handleOnePacket(getShortHeaderPacket(t, unknownAddr, tc.srcConnID, 1, []byte("foobar")), 0)
+		require.NoError(t, err)
+		require.False(t, wasProcessed)
+		require.Equal(t,
+			[]qlogwriter.Event{qlog.PacketDropped{Raw: qlog.RawInfo{Length: 1 + tc.srcConnID.Len() + 2 + 6}, Trigger: qlog.PacketDropUnexpectedPacket}},
+			eventRecorder.Events(qlog.PacketDropped{}),
+		)
+	})
+
+	t.Run("Handshake packet", func(t *testing.T) {
+		eventRecorder.Clear()
+		p := getLongHeaderPacket(t, unknownAddr, &wire.ExtendedHeader{
+			Header: wire.Header{
+				Type:             protocol.PacketTypeHandshake,
+				DestConnectionID: tc.srcConnID,
+				SrcConnectionID:  tc.destConnID,
+				Length:           8,
+				Version:          protocol.Version1,
+			},
+			PacketNumberLen: protocol.PacketNumberLen2,
+		}, make([]byte, 6))
+		wasProcessed, err := c.handleOnePacket(p, 0)
+		require.NoError(t, err)
+		require.False(t, wasProcessed)
+		require.Len(t, eventRecorder.Events(qlog.PacketDropped{}), 1)
+	})
+
+	// IPv4-mapped IPv6 addresses are equal to the corresponding IPv4 addresses
+	t.Run("IPv4-mapped server address", func(t *testing.T) {
+		eventRecorder.Clear()
+		addr := &net.UDPAddr{IP: net.IPv4(1, 2, 3, 4).To16(), Port: 4321}
+		require.Len(t, addr.IP, net.IPv6len)
+		unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any(), gomock.Any()).Return(
+			protocol.PacketNumber(2), protocol.PacketNumberLen2, protocol.KeyPhaseZero, []byte{1} /* PING */, nil,
+		)
+		wasProcessed, err := c.handleOnePacket(getShortHeaderPacket(t, addr, tc.srcConnID, 2, []byte("foobar")), 0)
+		require.NoError(t, err)
+		require.True(t, wasProcessed)
+		require.Empty(t, eventRecorder.Events(qlog.PacketDropped{}))
+	})
+
+	// A net.PacketConn that doesn't use UDP addresses might not report the server address.
+	t.Run("address of another type", func(t *testing.T) {
+		eventRecorder.Clear()
+		unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any(), gomock.Any()).Return(
+			protocol.PacketNumber(3), protocol.PacketNumberLen2, protocol.KeyPhaseZero, []byte{1} /* PING */, nil,
+		)
+		wasProcessed, err := c.handleOnePacket(getShortHeaderPacket(t, &mockAddr{str: "relay"}, tc.srcConnID, 3, []byte("foobar")), 0)
+		require.NoError(t, err)
+		require.True(t, wasProcessed)
+		require.Empty(t, eventRecorder.Events(qlog.PacketDropped{}))
+	})
+}
+
+// With IETF Multipath QUIC, the client discards long header packets from unknown server addresses as well.
+func TestConnectionClientDropsLongHeaderPacketsFromUnknownServerAddressMultipath(t *testing.T) {
+	var eventRecorder events.Recorder
+	tc := newIETFMultipathTestConnection(t, protocol.PerspectiveClient, 2, 2, true, connectionOptTracer(&eventRecorder))
+	p := getLongHeaderPacket(t, &net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 4322}, &wire.ExtendedHeader{
+		Header: wire.Header{
+			Type:             protocol.PacketTypeHandshake,
+			DestConnectionID: tc.srcConnID,
+			SrcConnectionID:  tc.destConnID,
+			Length:           8,
+			Version:          protocol.Version1,
+		},
+		PacketNumberLen: protocol.PacketNumberLen2,
+	}, make([]byte, 6))
+	wasProcessed, err := tc.conn.handleOnePacket(p, 0)
+	require.NoError(t, err)
+	require.False(t, wasProcessed)
+	require.Len(t, eventRecorder.Events(qlog.PacketDropped{}), 1)
+}
+
+// sourceRewritingConn reports a wrong source address for every third datagram received while rewrite is set.
+type sourceRewritingConn struct {
+	net.PacketConn
+	addr    net.Addr
+	rewrite atomic.Bool
+	count   atomic.Int64
+}
+
+func (c *sourceRewritingConn) ReadFrom(b []byte) (int, net.Addr, error) {
+	n, addr, err := c.PacketConn.ReadFrom(b)
+	if err == nil && c.rewrite.Load() && c.count.Add(1)%3 == 0 {
+		return n, c.addr, nil
+	}
+	return n, addr, err
+}
+
+// Packets that appear to come from another server address are discarded. The connection recovers from the loss.
+func TestConnectionClientDropsPacketsFromUnknownServerAddressEndToEnd(t *testing.T) {
+	serverTr := &Transport{Conn: newUDPConnLocalhost(t)}
+	defer serverTr.Close()
+	ln, err := serverTr.Listen(generateTLSConfig(), nil)
+	require.NoError(t, err)
+	defer ln.Close()
+	clientConn := &sourceRewritingConn{
+		PacketConn: newUDPConnLocalhost(t),
+		addr:       &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: ln.Addr().(*net.UDPAddr).Port + 1},
+	}
+	clientTr := &Transport{Conn: clientConn}
+	defer clientTr.Close()
+
+	var recorder events.Recorder
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := clientTr.Dial(ctx, ln.Addr(), generateTLSConfigWithServerName("localhost"), &Config{Tracer: multipathTestTracer(&recorder)})
+	require.NoError(t, err)
+	defer conn.CloseWithError(0, "")
+	sconn, err := ln.Accept(ctx)
+	require.NoError(t, err)
+	defer sconn.CloseWithError(0, "")
+
+	clientConn.rewrite.Store(true)
+	data := make([]byte, 50_000)
+	rand.Read(data)
+	go func() {
+		str, err := sconn.OpenUniStream()
+		if err != nil {
+			return
+		}
+		str.Write(data)
+		str.Close()
+	}()
+	str, err := conn.AcceptUniStream(ctx)
+	require.NoError(t, err)
+	received, err := io.ReadAll(str)
+	require.NoError(t, err)
+	require.Equal(t, data, received)
+
+	var dropped int
+	for _, ev := range recorder.Events(qlog.PacketDropped{}) {
+		if ev.(qlog.PacketDropped).Trigger == qlog.PacketDropUnexpectedPacket {
+			dropped++
+		}
+	}
+	require.NotZero(t, dropped)
+}
+
+// If the client dialed an unspecified IP address, the operating system chooses the server address.
+// The client learns it from the first packet that is processed, and discards packets from other addresses after that.
+func TestConnectionClientDialedUnspecifiedAddress(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	unpacker := NewMockUnpacker(mockCtrl)
+	var eventRecorder events.Recorder
+	tc := newClientTestConnection(t, mockCtrl, nil, false,
+		connectionOptHandshakeConfirmed(),
+		connectionOptUnpacker(unpacker),
+		connectionOptTracer(&eventRecorder),
+	)
+	c := tc.conn
+	c.peerHandshakeAddr = &net.UDPAddr{IP: net.IPv6unspecified, Port: 4321}
+
+	// before the first packet was processed, packets from other ports are discarded
+	wasProcessed, err := c.handleOnePacket(getShortHeaderPacket(t, &net.UDPAddr{IP: net.IPv6loopback, Port: 4322}, tc.srcConnID, 1, []byte("foobar")), 0)
+	require.NoError(t, err)
+	require.False(t, wasProcessed)
+	require.Len(t, eventRecorder.Events(qlog.PacketDropped{}), 1)
+	require.Nil(t, c.unspecifiedServerAddr)
+
+	// a packet that can't be decrypted doesn't determine the server address
+	eventRecorder.Clear()
+	unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any(), gomock.Any()).Return(
+		protocol.PacketNumber(0), protocol.PacketNumberLen(0), protocol.KeyPhaseBit(0), nil, handshake.ErrDecryptionFailed,
+	)
+	wasProcessed, err = c.handleOnePacket(getShortHeaderPacket(t, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 2), Port: 4321}, tc.srcConnID, 2, []byte("foobar")), 0)
+	require.NoError(t, err)
+	require.False(t, wasProcessed)
+	require.Nil(t, c.unspecifiedServerAddr)
+
+	serverAddr := &net.UDPAddr{IP: net.IPv6loopback, Port: 4321}
+	unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any(), gomock.Any()).Return(
+		protocol.PacketNumber(3), protocol.PacketNumberLen2, protocol.KeyPhaseZero, []byte{1} /* PING */, nil,
+	)
+	wasProcessed, err = c.handleOnePacket(getShortHeaderPacket(t, serverAddr, tc.srcConnID, 3, []byte("foobar")), 0)
+	require.NoError(t, err)
+	require.True(t, wasProcessed)
+	require.Equal(t, serverAddr, c.unspecifiedServerAddr)
+
+	unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any(), gomock.Any()).Return(
+		protocol.PacketNumber(4), protocol.PacketNumberLen2, protocol.KeyPhaseZero, []byte{1} /* PING */, nil,
+	)
+	wasProcessed, err = c.handleOnePacket(getShortHeaderPacket(t, &net.UDPAddr{IP: net.IPv6loopback, Port: 4321}, tc.srcConnID, 4, []byte("foobar")), 0)
+	require.NoError(t, err)
+	require.True(t, wasProcessed)
+
+	// packets from other addresses are discarded now
+	eventRecorder.Clear()
+	wasProcessed, err = c.handleOnePacket(getShortHeaderPacket(t, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 2), Port: 4321}, tc.srcConnID, 5, []byte("foobar")), 0)
+	require.NoError(t, err)
+	require.False(t, wasProcessed)
+	require.Len(t, eventRecorder.Events(qlog.PacketDropped{}), 1)
+}
+
+// A client can dial the address of a listener on an unspecified IP address, e.g. "0.0.0.0:1234".
+func TestConnectionClientDialUnspecifiedAddressEndToEnd(t *testing.T) {
+	for _, multipath := range []bool{false, true} {
+		t.Run(fmt.Sprintf("multipath: %t", multipath), func(t *testing.T) {
+			t.Run("IPv4", func(t *testing.T) {
+				testConnectionClientDialUnspecifiedAddressEndToEnd(t, "udp4", &net.UDPAddr{IP: net.IPv4zero}, "udp4", multipath)
+			})
+			t.Run("IPv6", func(t *testing.T) {
+				testConnectionClientDialUnspecifiedAddressEndToEnd(t, "udp6", &net.UDPAddr{IP: net.IPv6unspecified}, "udp6", multipath)
+			})
+			// ListenAddr("0.0.0.0:0") and DialAddr use dual-stack sockets
+			t.Run("dual-stack", func(t *testing.T) {
+				testConnectionClientDialUnspecifiedAddressEndToEnd(t, "udp", &net.UDPAddr{IP: net.IPv4zero}, "", multipath)
+			})
+		})
+	}
+}
+
+func testConnectionClientDialUnspecifiedAddressEndToEnd(t *testing.T, network string, addr *net.UDPAddr, clientNetwork string, multipath bool) {
+	udpConn, err := net.ListenUDP(network, addr)
+	if err != nil {
+		t.Skipf("can't listen on %s: %s", addr, err)
+	}
+	newConfig := func() *Config {
+		if !multipath {
+			return nil
+		}
+		return &Config{MultipathControllerFactory: func() MultipathController { return NewDefaultMultipathController(nil) }}
+	}
+	serverTr := &Transport{Conn: udpConn}
+	defer serverTr.Close()
+	ln, err := serverTr.Listen(generateTLSConfig(), newConfig())
+	require.NoError(t, err)
+	defer ln.Close()
+	require.True(t, ln.Addr().(*net.UDPAddr).IP.IsUnspecified())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var conn *Conn
+	if clientNetwork == "" {
+		conn, err = DialAddr(ctx, ln.Addr().String(), generateTLSConfigWithServerName("localhost"), newConfig())
+	} else {
+		clientConn, lerr := net.ListenUDP(clientNetwork, nil)
+		require.NoError(t, lerr)
+		clientTr := &Transport{Conn: clientConn}
+		defer clientTr.Close()
+		conn, err = clientTr.Dial(ctx, ln.Addr(), generateTLSConfigWithServerName("localhost"), newConfig())
+	}
+	require.NoError(t, err)
+	defer conn.CloseWithError(0, "")
+	sconn, err := ln.Accept(ctx)
+	require.NoError(t, err)
+	defer sconn.CloseWithError(0, "")
+	require.Equal(t, multipath, conn.ConnectionState().SupportsMultipath)
+
+	str, err := sconn.OpenUniStream()
+	require.NoError(t, err)
+	_, err = str.Write([]byte("foobar"))
+	require.NoError(t, err)
+	require.NoError(t, str.Close())
+	rstr, err := conn.AcceptUniStream(ctx)
+	require.NoError(t, err)
+	data, err := io.ReadAll(rstr)
+	require.NoError(t, err)
+	require.Equal(t, []byte("foobar"), data)
+}
+
 func getVersionNegotiationPacket(src, dest protocol.ConnectionID, versions []protocol.Version) receivedPacket {
 	b := wire.ComposeVersionNegotiation(
 		protocol.ArbitraryLenConnectionID(src.Bytes()),
@@ -2997,6 +3618,45 @@ func TestConnectionRetryAfterReceivedPacket(t *testing.T) {
 	eventRecorder.Clear()
 }
 
+// A client that advertised the initial_max_path_id transport parameter can't use a zero-length connection ID
+// after a Retry (section 2.1 of draft-ietf-quic-multipath-21).
+func TestConnectionRetryZeroLengthConnIDMultipath(t *testing.T) {
+	t.Run("multipath advertised", func(t *testing.T) {
+		testConnectionRetryZeroLengthConnIDMultipath(t, true)
+	})
+	t.Run("multipath not advertised", func(t *testing.T) {
+		testConnectionRetryZeroLengthConnIDMultipath(t, false)
+	})
+}
+
+func testConnectionRetryZeroLengthConnIDMultipath(t *testing.T, advertisedMultipath bool) {
+	mockCtrl := gomock.NewController(t)
+	tc := newClientTestConnection(t, mockCtrl, nil, false)
+	tc.conn.advertisedMultipath = advertisedMultipath
+
+	retry := getRetryPacket(t, protocol.ConnectionID{}, tc.srcConnID, tc.destConnID, []byte("foobar"))
+	if !advertisedMultipath {
+		tc.packer.EXPECT().SetToken([]byte("foobar"))
+	}
+	wasProcessed, err := tc.conn.handleOnePacket(retry, 0)
+	require.NoError(t, err)
+	require.Equal(t, !advertisedMultipath, wasProcessed)
+	if !advertisedMultipath {
+		require.Nil(t, tc.conn.closeErr.Load())
+		require.True(t, tc.conn.receivedRetry)
+		require.Zero(t, tc.conn.handshakeDestConnID.Len())
+		return
+	}
+	// The server didn't create any state for the connection, so no CONNECTION_CLOSE is sent.
+	closeErr := tc.conn.closeErr.Load()
+	require.NotNil(t, closeErr)
+	require.True(t, closeErr.immediate)
+	require.ErrorIs(t, closeErr.err, &qerr.TransportError{ErrorCode: qerr.ProtocolViolation})
+	require.False(t, tc.conn.receivedRetry)
+	require.Equal(t, tc.destConnID, tc.conn.handshakeDestConnID)
+	require.Nil(t, tc.conn.retrySrcConnID)
+}
+
 func TestConnectionConnectionIDChanges(t *testing.T) {
 	t.Run("with retry", func(t *testing.T) {
 		testConnectionConnectionIDChanges(t, true)
@@ -3102,9 +3762,9 @@ func testConnectionConnectionIDChanges(t *testing.T, sendRetry bool) {
 						PacketNumber:     1,
 						Version:          protocol.Version1,
 					},
-					Raw:        qlog.RawInfo{Length: int(packet1.Size()), PayloadLength: int(hdr1.Length)},
-					DatagramID: qlog.CalculateDatagramID(packet1.data),
-					Frames:     []qlog.Frame{},
+					Raw:                     qlog.RawInfo{Length: int(packet1.Size()), PayloadLength: int(hdr1.Length)},
+					DatagramPayloadChecksum: qlog.CalculateDatagramPayloadChecksum(packet1.data),
+					Frames:                  []qlog.Frame{},
 				},
 			},
 			eventRecorder.Events(qlog.PacketReceived{}, qlog.PacketDropped{}),
@@ -3124,9 +3784,9 @@ func testConnectionConnectionIDChanges(t *testing.T, sendRetry bool) {
 						PacketType:   qlog.PacketTypeInitial,
 						PacketNumber: protocol.InvalidPacketNumber,
 					},
-					Raw:        qlog.RawInfo{Length: int(packet2.Size())},
-					DatagramID: qlog.CalculateDatagramID(packet2.data),
-					Trigger:    qlog.PacketDropUnknownConnectionID,
+					Raw:                     qlog.RawInfo{Length: int(packet2.Size())},
+					DatagramPayloadChecksum: qlog.CalculateDatagramPayloadChecksum(packet2.data),
+					Trigger:                 qlog.PacketDropUnknownConnectionID,
 				},
 			},
 			eventRecorder.Events(qlog.PacketDropped{}, qlog.PacketReceived{}),
@@ -3182,7 +3842,6 @@ func TestConnectionEarlyClose(t *testing.T) {
 
 		select {
 		case err := <-errChan:
-			require.Error(t, err)
 			require.ErrorContains(t, err, "early error")
 			code := qerr.InternalError
 			require.Equal(t,
@@ -3211,6 +3870,111 @@ func TestConnectionPathValidation(t *testing.T) {
 	})
 }
 
+// If the PATH_RESPONSE is lost while the packet containing the PATH_CHALLENGE is acknowledged, the server sends
+// another PATH_CHALLENGE when it receives packets on the path after a PTO (section 8.2.1 of RFC 9000).
+// Otherwise, the path would never be validated, and the server would keep sending to the client's old address.
+func TestConnectionPathValidationRetry(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		mockCtrl := gomock.NewController(t)
+		unpacker := NewMockUnpacker(mockCtrl)
+		tc := newServerTestConnection(
+			t,
+			mockCtrl,
+			nil,
+			false,
+			connectionOptUnpacker(unpacker),
+			connectionOptHandshakeConfirmed(),
+			connectionOptRTT(time.Second),
+		)
+		require.NoError(t, tc.conn.handleTransportParameters(&wire.TransportParameters{MaxUDPPayloadSize: 1456}))
+		// the client's address was validated during the handshake
+		tc.conn.sentPacketHandler.ReceivedPacket(protocol.EncryptionHandshake, monotime.Now())
+
+		// the client's NAT rebinds to a new address
+		newRemoteAddr := &net.UDPAddr{IP: net.IPv4(192, 168, 1, 1), Port: 1234}
+		errChan := make(chan error, 1)
+		go func() { errChan <- tc.conn.run() }()
+
+		var pathChallenges []*wire.PathChallengeFrame
+		var sentPN protocol.PacketNumber
+		expectPathChallenge := func() []any {
+			return []any{
+				tc.packer.EXPECT().PackPathProbePacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+					func(_ protocol.ConnectionID, frames []ackhandler.Frame, maxSize protocol.ByteCount, _ protocol.Version, _ protocol.PathID) (shortHeaderPacket, *packetBuffer, error) {
+						require.Len(t, frames, 1)
+						pathChallenges = append(pathChallenges, frames[0].Frame.(*wire.PathChallengeFrame))
+						sentPN++
+						return shortHeaderPacket{PacketNumber: sentPN, IsPathProbePacket: true, Length: protocol.MinInitialPacketSize}, getPacketBuffer(), nil
+					},
+				),
+				tc.sendConn.EXPECT().WriteTo(gomock.Any(), newRemoteAddr, packetInfo{}),
+			}
+		}
+		start := monotime.Now()
+		receivePacket := func(pn protocol.PacketNumber, payload []byte, rcvTime monotime.Time) {
+			unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any(), gomock.Any()).Return(
+				pn, protocol.PacketNumberLen2, protocol.KeyPhaseZero, payload, nil,
+			)
+			tc.conn.handlePacket(receivedPacket{
+				data:       make([]byte, 400),
+				buffer:     getPacketBuffer(),
+				remoteAddr: newRemoteAddr,
+				rcvTime:    rcvTime,
+			})
+			synctest.Wait()
+		}
+		tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(
+			shortHeaderPacket{}, errNothingToPack,
+		).AnyTimes()
+
+		ping := []byte{1} // PING frame
+		gomock.InOrder(expectPathChallenge()...)
+		receivePacket(10, ping, start)
+		require.Len(t, pathChallenges, 1)
+
+		// The PATH_RESPONSE is lost. Packets received before the PTO expires don't trigger another PATH_CHALLENGE.
+		receivePacket(11, ping, start.Add(time.Second))
+		require.Len(t, pathChallenges, 1)
+		require.Equal(t, tc.remoteAddr, tc.conn.RemoteAddr())
+
+		// the PTO is a few seconds
+		gomock.InOrder(expectPathChallenge()...)
+		receivePacket(12, ping, start.Add(time.Minute))
+		require.Len(t, pathChallenges, 2)
+		require.NotEqual(t, pathChallenges[0].Data, pathChallenges[1].Data)
+
+		// the response to the second PATH_CHALLENGE validates the path, and the server migrates
+		migrated := make(chan struct{})
+		tc.sendConn.EXPECT().ChangeRemoteAddr(newRemoteAddr, gomock.Any()).Do(
+			func(net.Addr, packetInfo) { close(migrated) },
+		)
+		// after migrating, the server validates the previous path (section 9.3.3 of RFC 9000)
+		tc.packer.EXPECT().PackPathProbePacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(
+			shortHeaderPacket{PacketNumber: 3, IsPathProbePacket: true, Length: protocol.MinInitialPacketSize}, getPacketBuffer(), nil,
+		)
+		tc.sendConn.EXPECT().WriteTo(gomock.Any(), tc.remoteAddr, packetInfo{})
+		payload, err := (&wire.PathResponseFrame{Data: pathChallenges[1].Data}).Append(nil, protocol.Version1)
+		require.NoError(t, err)
+		receivePacket(13, payload, start.Add(time.Minute+time.Second))
+		select {
+		case <-migrated:
+		default:
+			t.Fatal("should have migrated")
+		}
+
+		// test teardown
+		tc.connRunner.EXPECT().Remove(gomock.Any()).AnyTimes()
+		tc.conn.destroy(nil)
+		synctest.Wait()
+		select {
+		case err := <-errChan:
+			require.NoError(t, err)
+		default:
+			t.Fatal("should have shut down")
+		}
+	})
+}
+
 func testConnectionPathValidation(t *testing.T, isNATRebinding bool) {
 	synctest.Test(t, func(t *testing.T) {
 		mockCtrl := gomock.NewController(t)
@@ -3225,6 +3989,8 @@ func testConnectionPathValidation(t *testing.T, isNATRebinding bool) {
 			connectionOptRTT(time.Second),
 		)
 		require.NoError(t, tc.conn.handleTransportParameters(&wire.TransportParameters{MaxUDPPayloadSize: 1456}))
+		// the client's address was validated during the handshake
+		tc.conn.sentPacketHandler.ReceivedPacket(protocol.EncryptionHandshake, monotime.Now())
 
 		newRemoteAddr := &net.UDPAddr{IP: net.IPv4(192, 168, 1, 1), Port: 1234}
 		require.NotEqual(t, tc.remoteAddr, newRemoteAddr)
@@ -3239,25 +4005,27 @@ func testConnectionPathValidation(t *testing.T, isNATRebinding bool) {
 			payload = []byte{1} // PING frame
 		}
 		gomock.InOrder(
-			unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any()).Return(
+			unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any(), gomock.Any()).Return(
 				protocol.PacketNumber(10), protocol.PacketNumberLen2, protocol.KeyPhaseZero, payload, nil,
 			),
-			tc.packer.EXPECT().PackPathProbePacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-				func(_ protocol.ConnectionID, frames []ackhandler.Frame, _ protocol.Version, _ protocol.PathID) (shortHeaderPacket, *packetBuffer, error) {
+			tc.packer.EXPECT().PackPathProbePacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+				func(_ protocol.ConnectionID, frames []ackhandler.Frame, maxSize protocol.ByteCount, _ protocol.Version, _ protocol.PathID) (shortHeaderPacket, *packetBuffer, error) {
+					require.Equal(t, protocol.ByteCount(protocol.MinInitialPacketSize), maxSize)
 					pathChallenge = frames[0].Frame.(*wire.PathChallengeFrame)
-					return shortHeaderPacket{IsPathProbePacket: true}, getPacketBuffer(), nil
+					return shortHeaderPacket{IsPathProbePacket: true, Length: protocol.MinInitialPacketSize}, getPacketBuffer(), nil
 				},
 			),
-			tc.sendConn.EXPECT().WriteTo(gomock.Any(), newRemoteAddr).DoAndReturn(
-				func([]byte, net.Addr) error { close(probeSent); return nil },
+			tc.sendConn.EXPECT().WriteTo(gomock.Any(), newRemoteAddr, packetInfo{}).DoAndReturn(
+				func([]byte, net.Addr, packetInfo) error { close(probeSent); return nil },
 			),
 			tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(
 				shortHeaderPacket{}, errNothingToPack,
 			),
 		)
 
+		// The datagram is large enough for the anti-amplification limit to allow a probe packet of 1200 bytes.
 		tc.conn.handlePacket(receivedPacket{
-			data:       make([]byte, 10),
+			data:       make([]byte, 400),
 			buffer:     getPacketBuffer(),
 			remoteAddr: newRemoteAddr,
 			rcvTime:    monotime.Now(),
@@ -3278,9 +4046,24 @@ func testConnectionPathValidation(t *testing.T, isNATRebinding bool) {
 		data, err := (&wire.PathResponseFrame{Data: pathChallenge.Data}).Append(nil, protocol.Version1)
 		require.NoError(t, err)
 		calls := []any{
-			unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any()).Return(
+			unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any(), gomock.Any()).Return(
 				protocol.PacketNumber(11), protocol.PacketNumberLen2, protocol.KeyPhaseZero, data, nil,
 			),
+		}
+		// After migrating, the server validates the previous path (section 9.3.3 of RFC 9000).
+		var prevPathChallenge *wire.PathChallengeFrame
+		expectPrevPathValidation := func() []any {
+			return []any{
+				tc.packer.EXPECT().PackPathProbePacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+					func(_ protocol.ConnectionID, frames []ackhandler.Frame, maxSize protocol.ByteCount, _ protocol.Version, _ protocol.PathID) (shortHeaderPacket, *packetBuffer, error) {
+						require.Equal(t, protocol.ByteCount(protocol.MinInitialPacketSize), maxSize)
+						require.Len(t, frames, 1)
+						prevPathChallenge = frames[0].Frame.(*wire.PathChallengeFrame)
+						return shortHeaderPacket{PacketNumber: 1, IsPathProbePacket: true, Length: protocol.MinInitialPacketSize}, getPacketBuffer(), nil
+					},
+				),
+				tc.sendConn.EXPECT().WriteTo(gomock.Any(), tc.remoteAddr, packetInfo{}),
+			}
 		}
 		if isNATRebinding {
 			calls = append(calls,
@@ -3288,6 +4071,7 @@ func testConnectionPathValidation(t *testing.T, isNATRebinding bool) {
 					func(net.Addr, packetInfo) { close(migrated) },
 				),
 			)
+			calls = append(calls, expectPrevPathValidation()...)
 		}
 		calls = append(calls,
 			tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(
@@ -3322,17 +4106,21 @@ func testConnectionPathValidation(t *testing.T, isNATRebinding bool) {
 			payload := []byte{1} // PING frame
 			payload, err = (&wire.PathResponseFrame{Data: pathChallenge.Data}).Append(payload, protocol.Version1)
 			require.NoError(t, err)
-			gomock.InOrder(
-				unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any()).Return(
+			calls := []any{
+				unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any(), gomock.Any()).Return(
 					protocol.PacketNumber(12), protocol.PacketNumberLen2, protocol.KeyPhaseZero, payload, nil,
 				),
 				tc.sendConn.EXPECT().ChangeRemoteAddr(newRemoteAddr, gomock.Any()).Do(
 					func(net.Addr, packetInfo) { close(migrated) },
 				),
+			}
+			calls = append(calls, expectPrevPathValidation()...)
+			calls = append(calls,
 				tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(
 					shortHeaderPacket{}, errNothingToPack,
 				).MaxTimes(1),
 			)
+			gomock.InOrder(calls...)
 			tc.conn.handlePacket(receivedPacket{
 				data:       make([]byte, 100),
 				buffer:     getPacketBuffer(),
@@ -3348,6 +4136,8 @@ func testConnectionPathValidation(t *testing.T, isNATRebinding bool) {
 		default:
 			t.Fatal("should have migrated")
 		}
+		require.NotNil(t, prevPathChallenge)
+		require.NotEqual(t, pathChallenge.Data, prevPathChallenge.Data)
 
 		// test teardown
 		tc.connRunner.EXPECT().Remove(gomock.Any()).AnyTimes()
@@ -3364,10 +4154,574 @@ func testConnectionPathValidation(t *testing.T, isNATRebinding bool) {
 	})
 }
 
+// recordingSendQueue records the destination address, the packet info and the ECN marking of the packets sent.
+type recordingSendQueue struct {
+	sent  []net.Addr
+	infos []packetInfo   // the packet info of each sent packet
+	ecns  []protocol.ECN // the ECN marking of each sent packet
+}
+
+var _ sender = &recordingSendQueue{}
+
+func (q *recordingSendQueue) Send(p *packetBuffer, _ uint16, ecn protocol.ECN) {
+	q.record(nil, packetInfo{}, ecn)
+	p.Release()
+}
+
+func (q *recordingSendQueue) SendOnConn(p *packetBuffer, _ uint16, ecn protocol.ECN, conn sendConn) {
+	q.record(conn.RemoteAddr(), packetInfo{}, ecn)
+	p.Release()
+}
+
+func (q *recordingSendQueue) SendProbe(p *packetBuffer, addr net.Addr, info packetInfo) {
+	q.record(addr, info, protocol.ECNUnsupported)
+	p.Release()
+}
+
+func (q *recordingSendQueue) record(addr net.Addr, info packetInfo, ecn protocol.ECN) {
+	q.sent = append(q.sent, addr)
+	q.infos = append(q.infos, info)
+	q.ecns = append(q.ecns, ecn)
+}
+
+func (q *recordingSendQueue) Run() error                 { return nil }
+func (q *recordingSendQueue) WouldBlock() bool           { return false }
+func (q *recordingSendQueue) Available() <-chan struct{} { return make(chan struct{}) }
+func (q *recordingSendQueue) Close()                     {}
+
+// receivePathChallenge makes the connection receive a 1-RTT packet containing a PATH_CHALLENGE.
+func receivePathChallenge(t *testing.T, tc *testConnection, unpacker *MockUnpacker, data [8]byte, p receivedPacket) {
+	t.Helper()
+	payload, err := (&wire.PathChallengeFrame{Data: data}).Append(nil, protocol.Version1)
+	require.NoError(t, err)
+	unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any(), gomock.Any()).Return(
+		tc.conn.largestRcvdAppData+1, protocol.PacketNumberLen2, protocol.KeyPhaseZero, payload, nil,
+	)
+	p.data = make([]byte, 10)
+	p.buffer = getPacketBuffer()
+	p.rcvTime = monotime.Now()
+	processed, err := tc.conn.handleShortHeaderPacket(p, false, 0)
+	require.NoError(t, err)
+	require.True(t, processed)
+}
+
+// The client can validate the current path at any time, see section 8.2 of RFC 9000.
+func TestConnectionServerPathChallengeOnCurrentPath(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	unpacker := NewMockUnpacker(mockCtrl)
+	sendQueue := &recordingSendQueue{}
+	tc := newServerTestConnection(t, mockCtrl, nil, false,
+		connectionOptHandshakeConfirmed(),
+		connectionOptSender(sendQueue),
+		connectionOptUnpacker(unpacker),
+	)
+	challenge := [8]byte{1, 2, 3, 4, 5, 6, 7, 8}
+	receivePathChallenge(t, tc, unpacker, challenge, receivedPacket{remoteAddr: tc.remoteAddr})
+	// the PATH_RESPONSE is queued, and sent with the next packet on the current path
+	require.Empty(t, sendQueue.sent)
+	frames, _, _ := tc.conn.framer.Append(nil, nil, protocol.MaxByteCount, monotime.Now(), protocol.Version1)
+	require.Len(t, frames, 1)
+	require.Equal(t, &wire.PathResponseFrame{Data: challenge}, frames[0].Frame)
+}
+
+// queuedPathResponses returns the data of the PATH_RESPONSE frames queued for path 0, in the order they are sent.
+func queuedPathResponses(c *Conn) [][8]byte {
+	var data [][8]byte
+	for c.mp != nil && c.mp.HasPathFrames(0) {
+		frames, _ := c.mp.AppendPathFrames(nil, 0, protocol.MaxByteCount, protocol.Version1)
+		for _, f := range frames {
+			data = append(data, f.Frame.(*wire.PathResponseFrame).Data)
+		}
+	}
+	// The framer packs a single PATH_RESPONSE frame per packet.
+	for {
+		var found bool
+		for _, f := range queuedFrames(c) {
+			if pr, ok := f.Frame.(*wire.PathResponseFrame); ok {
+				data = append(data, pr.Data)
+				found = true
+			}
+		}
+		if !found {
+			return data
+		}
+	}
+}
+
+// Every PATH_CHALLENGE frame is answered, even if a packet contains multiple PATH_CHALLENGE frames
+// (section 8.2.2 of RFC 9000).
+func TestConnectionPathChallengesInOnePacket(t *testing.T) {
+	for _, pers := range []protocol.Perspective{protocol.PerspectiveClient, protocol.PerspectiveServer} {
+		t.Run(pers.String(), func(t *testing.T) {
+			for _, mode := range []string{"without multipath", "IETF Multipath QUIC before activation", "IETF Multipath QUIC"} {
+				t.Run(mode, func(t *testing.T) {
+					mockCtrl := gomock.NewController(t)
+					unpacker := NewMockUnpacker(mockCtrl)
+					opts := []testConnectionOpt{connectionOptUnpacker(unpacker), connectionOptHandshakeConfirmed()}
+					var tc *testConnection
+					switch {
+					case mode != "without multipath":
+						tc = newIETFMultipathTestConnection(t, pers, 2, 2, mode == "IETF Multipath QUIC", opts...)
+					case pers == protocol.PerspectiveClient:
+						tc = newClientTestConnection(t, mockCtrl, nil, false, opts...)
+					default:
+						tc = newServerTestConnection(t, mockCtrl, nil, false, opts...)
+					}
+					c := tc.conn
+					queuedFrames(c)
+
+					var data []byte
+					for _, f := range []wire.Frame{
+						&wire.PathChallengeFrame{Data: [8]byte{1}},
+						&wire.PingFrame{},
+						&wire.PathChallengeFrame{Data: [8]byte{2}},
+						&wire.PathChallengeFrame{Data: [8]byte{3}},
+					} {
+						var err error
+						data, err = f.Append(data, protocol.Version1)
+						require.NoError(t, err)
+					}
+					unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any(), protocol.PathID(0)).Return(
+						protocol.PacketNumber(1), protocol.PacketNumberLen2, protocol.KeyPhaseZero, data, nil,
+					)
+					// With IETF Multipath QUIC, the client drops packets from unknown server addresses.
+					_, err := c.handleOnePacket(getShortHeaderPacket(t, c.conn.RemoteAddr(), tc.srcConnID, 1, []byte("encrypted")), 0)
+					require.NoError(t, err)
+
+					// With IETF Multipath QUIC, the PATH_RESPONSE frames are sent on path 0.
+					if mode == "IETF Multipath QUIC" {
+						require.True(t, c.mp.HasPathFrames(0))
+					}
+					require.Equal(t, [][8]byte{{1}, {2}, {3}}, queuedPathResponses(c))
+				})
+			}
+		})
+	}
+}
+
+// PATH_CHALLENGE frames are allowed in 0-RTT packets (section 12.4 of RFC 9000).
+func TestConnectionServerPathChallengeIn0RTTPacket(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	unpacker := NewMockUnpacker(mockCtrl)
+	tc := newServerTestConnection(t, mockCtrl, nil, false, connectionOptUnpacker(unpacker))
+	c := tc.conn
+	queuedFrames(c)
+
+	var data []byte
+	for _, f := range []wire.Frame{&wire.PathChallengeFrame{Data: [8]byte{1}}, &wire.PathChallengeFrame{Data: [8]byte{2}}} {
+		var err error
+		data, err = f.Append(data, protocol.Version1)
+		require.NoError(t, err)
+	}
+	hdr := &wire.ExtendedHeader{
+		Header: wire.Header{
+			Type:             protocol.PacketType0RTT,
+			DestConnectionID: tc.srcConnID,
+			Version:          protocol.Version1,
+			Length:           2,
+		},
+		PacketNumber:    1,
+		PacketNumberLen: protocol.PacketNumberLen2,
+	}
+	unpacker.EXPECT().UnpackLongHeader(gomock.Any(), gomock.Any()).Return(&unpackedPacket{
+		encryptionLevel: protocol.Encryption0RTT,
+		hdr:             hdr,
+		data:            data,
+	}, nil)
+	wasProcessed, err := c.handleOnePacket(getLongHeaderPacket(t, tc.remoteAddr, hdr, nil), 0)
+	require.NoError(t, err)
+	require.True(t, wasProcessed)
+	require.Equal(t, [][8]byte{{1}, {2}}, queuedPathResponses(c))
+}
+
+// The probe packet sent when the client probes a new path contains the PATH_RESPONSE.
+// It must be sent on the path that the PATH_CHALLENGE was received on (see section 8.2.2 of RFC 9000),
+// i.e. from the local address the packet was received on.
+func TestConnectionServerPathProbeFromArrivalAddress(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	unpacker := NewMockUnpacker(mockCtrl)
+	sendQueue := &recordingSendQueue{}
+	tc := newServerTestConnection(t, mockCtrl, nil, false,
+		connectionOptHandshakeConfirmed(),
+		connectionOptSender(sendQueue),
+		connectionOptUnpacker(unpacker),
+	)
+	newRemoteAddr := &net.UDPAddr{IP: net.IPv4(192, 168, 1, 1), Port: 1234}
+	localAddr := netip.MustParseAddr("127.0.0.2")
+
+	var sentFrames []wire.Frame
+	tc.packer.EXPECT().PackPathProbePacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), protocol.PathID(0)).DoAndReturn(
+		func(_ protocol.ConnectionID, frames []ackhandler.Frame, _ protocol.ByteCount, _ protocol.Version, _ protocol.PathID) (shortHeaderPacket, *packetBuffer, error) {
+			for _, f := range frames {
+				sentFrames = append(sentFrames, f.Frame)
+			}
+			return shortHeaderPacket{IsPathProbePacket: true, Frames: frames}, getPacketBuffer(), nil
+		},
+	)
+	challenge := [8]byte{1, 2, 3, 4, 5, 6, 7, 8}
+	receivePathChallenge(t, tc, unpacker, challenge, receivedPacket{remoteAddr: newRemoteAddr, info: packetInfo{addr: localAddr}})
+	require.Len(t, sentFrames, 2)
+	require.IsType(t, &wire.PathChallengeFrame{}, sentFrames[0])
+	require.Equal(t, &wire.PathResponseFrame{Data: challenge}, sentFrames[1])
+	require.Equal(t, []net.Addr{newRemoteAddr}, sendQueue.sent)
+	require.Equal(t, []packetInfo{{addr: localAddr}}, sendQueue.infos)
+	require.Equal(t, []protocol.ECN{protocol.ECNUnsupported}, sendQueue.ecns)
+	// only a single PATH_RESPONSE is sent
+	frames, _, _ := tc.conn.framer.Append(nil, nil, protocol.MaxByteCount, monotime.Now(), protocol.Version1)
+	require.Empty(t, frames)
+	require.Equal(t, tc.remoteAddr, tc.conn.RemoteAddr())
+}
+
+// The server limits the probe packets sent to a new client address to 3 times the size of the datagram received,
+// until the client's address is validated (sections 8 and 9.3 of RFC 9000). If the datagram containing the
+// PATH_CHALLENGE couldn't be expanded to 1200 bytes, the path MTU is validated with a second PATH_CHALLENGE in an
+// expanded datagram (section 8.2.1 of RFC 9000).
+func TestConnectionServerPathProbeAmplificationLimit(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	unpacker := NewMockUnpacker(mockCtrl)
+	sendQueue := &recordingSendQueue{}
+	tc := newServerTestConnection(t, mockCtrl, nil, false,
+		connectionOptHandshakeConfirmed(),
+		connectionOptSender(sendQueue),
+		connectionOptUnpacker(unpacker),
+	)
+	newRemoteAddr := &net.UDPAddr{IP: net.IPv4(192, 168, 1, 1), Port: 1234}
+	info := packetInfo{addr: netip.MustParseAddr("127.0.0.2")}
+
+	type probe struct {
+		frames  []wire.Frame
+		maxSize protocol.ByteCount
+	}
+	var probes []probe
+	var pn protocol.PacketNumber
+	tc.packer.EXPECT().PackPathProbePacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), protocol.PathID(0)).DoAndReturn(
+		func(_ protocol.ConnectionID, frames []ackhandler.Frame, maxSize protocol.ByteCount, _ protocol.Version, _ protocol.PathID) (shortHeaderPacket, *packetBuffer, error) {
+			pr := probe{maxSize: maxSize}
+			for _, f := range frames {
+				pr.frames = append(pr.frames, f.Frame)
+			}
+			probes = append(probes, pr)
+			pn++
+			return shortHeaderPacket{PacketNumber: pn, IsPathProbePacket: true, Frames: frames, Length: min(maxSize, protocol.MinInitialPacketSize)}, getPacketBuffer(), nil
+		},
+	).AnyTimes()
+
+	// The client probes a new path with a datagram of 10 bytes.
+	receivePathChallenge(t, tc, unpacker, [8]byte{1, 2, 3, 4, 5, 6, 7, 8}, receivedPacket{remoteAddr: newRemoteAddr, info: info})
+	require.Len(t, probes, 1)
+	require.Equal(t, protocol.ByteCount(30), probes[0].maxSize)
+	require.Len(t, probes[0].frames, 2)
+	require.Contains(t, probes[0].frames, &wire.PathResponseFrame{Data: [8]byte{1, 2, 3, 4, 5, 6, 7, 8}})
+	var challenge *wire.PathChallengeFrame
+	for _, f := range probes[0].frames {
+		if pc, ok := f.(*wire.PathChallengeFrame); ok {
+			challenge = pc
+		}
+	}
+	require.NotNil(t, challenge)
+	require.NoError(t, tc.conn.sendDuePathChallenges(monotime.Now()))
+	require.Len(t, probes, 1)
+
+	// The PATH_RESPONSE validates the client's address, but not the path MTU.
+	payload, err := (&wire.PathResponseFrame{Data: challenge.Data}).Append(nil, protocol.Version1)
+	require.NoError(t, err)
+	unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any(), gomock.Any()).Return(
+		tc.conn.largestRcvdAppData+1, protocol.PacketNumberLen2, protocol.KeyPhaseZero, payload, nil,
+	)
+	_, err = tc.conn.handleShortHeaderPacket(receivedPacket{
+		remoteAddr: newRemoteAddr,
+		info:       info,
+		data:       make([]byte, 10),
+		buffer:     getPacketBuffer(),
+		rcvTime:    monotime.Now(),
+	}, false, 0)
+	require.NoError(t, err)
+	require.Len(t, probes, 1)
+	require.NoError(t, tc.conn.sendDuePathChallenges(monotime.Now()))
+	require.Len(t, probes, 2)
+	require.Equal(t, protocol.ByteCount(protocol.MinInitialPacketSize), probes[1].maxSize)
+	require.Len(t, probes[1].frames, 1)
+	require.IsType(t, &wire.PathChallengeFrame{}, probes[1].frames[0])
+	require.NotEqual(t, challenge, probes[1].frames[0])
+	require.Equal(t, []net.Addr{newRemoteAddr, newRemoteAddr}, sendQueue.sent)
+	require.Equal(t, []packetInfo{info, info}, sendQueue.infos)
+
+	// The anti-amplification limit doesn't apply to the validated address anymore.
+	receivePathChallenge(t, tc, unpacker, [8]byte{8, 7, 6, 5, 4, 3, 2, 1}, receivedPacket{remoteAddr: newRemoteAddr, info: info})
+	require.Len(t, probes, 3)
+	require.Equal(t, protocol.ByteCount(protocol.MinInitialPacketSize), probes[2].maxSize)
+	require.Equal(t, []wire.Frame{&wire.PathResponseFrame{Data: [8]byte{8, 7, 6, 5, 4, 3, 2, 1}}}, probes[2].frames)
+	require.Equal(t, tc.remoteAddr, tc.conn.RemoteAddr())
+}
+
+// Every PATH_CHALLENGE frame received on a new path is answered, as far as the anti-amplification limit allows.
+// The frames are sent in as few probe packets as possible.
+func TestConnectionServerPathChallengesOnNewPath(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	unpacker := NewMockUnpacker(mockCtrl)
+	sendQueue := &recordingSendQueue{}
+	tc := newServerTestConnection(t, mockCtrl, nil, false,
+		connectionOptHandshakeConfirmed(),
+		connectionOptSender(sendQueue),
+		connectionOptUnpacker(unpacker),
+	)
+	newRemoteAddr := &net.UDPAddr{IP: net.IPv4(192, 168, 1, 1), Port: 1234}
+
+	var probes [][]wire.Frame
+	var maxSizes []protocol.ByteCount
+	var pn protocol.PacketNumber
+	tc.packer.EXPECT().PackPathProbePacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), protocol.PathID(0)).DoAndReturn(
+		func(_ protocol.ConnectionID, frames []ackhandler.Frame, maxSize protocol.ByteCount, _ protocol.Version, _ protocol.PathID) (shortHeaderPacket, *packetBuffer, error) {
+			maxSizes = append(maxSizes, maxSize)
+			// a packet of 100 bytes has room for 2 frames
+			if maxSize < 100 || len(frames) > 2 {
+				return shortHeaderPacket{}, nil, errNothingToPack
+			}
+			var probe []wire.Frame
+			for _, f := range frames {
+				probe = append(probe, f.Frame)
+			}
+			probes = append(probes, probe)
+			pn++
+			return shortHeaderPacket{PacketNumber: pn, IsPathProbePacket: true, Frames: frames, Length: 100}, getPacketBuffer(), nil
+		},
+	).AnyTimes()
+
+	var data []byte
+	for i := range 4 {
+		var err error
+		data, err = (&wire.PathChallengeFrame{Data: [8]byte{byte(i + 1)}}).Append(data, protocol.Version1)
+		require.NoError(t, err)
+	}
+	unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any(), gomock.Any()).Return(
+		protocol.PacketNumber(1), protocol.PacketNumberLen2, protocol.KeyPhaseZero, data, nil,
+	)
+	// 3 times 80 bytes allows two probe packets of 100 bytes
+	_, err := tc.conn.handleShortHeaderPacket(receivedPacket{
+		remoteAddr: newRemoteAddr,
+		data:       make([]byte, 80),
+		buffer:     getPacketBuffer(),
+		rcvTime:    monotime.Now(),
+	}, false, 0)
+	require.NoError(t, err)
+	require.Equal(t, []protocol.ByteCount{240, 240, 240, 140, 140, 40}, maxSizes)
+	require.Len(t, probes, 2)
+	require.IsType(t, &wire.PathChallengeFrame{}, probes[0][0])
+	require.Equal(t, &wire.PathResponseFrame{Data: [8]byte{1}}, probes[0][1])
+	require.Equal(t, []wire.Frame{
+		&wire.PathResponseFrame{Data: [8]byte{2}},
+		&wire.PathResponseFrame{Data: [8]byte{3}},
+	}, probes[1])
+	require.Len(t, sendQueue.sent, 2)
+}
+
+// A datagram with many PATH_CHALLENGE frames received from a validated client address that isn't the current
+// address (e.g. the previous path) is answered in as few probe packets as possible. The probe packets sent in response
+// are limited to 3 times the size of the datagram, or 1200 bytes for small datagrams.
+func TestConnectionServerPathChallengesFromValidatedAddress(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	unpacker := NewMockUnpacker(mockCtrl)
+	sendQueue := &recordingSendQueue{}
+	tc := newServerTestConnection(t, mockCtrl, nil, false,
+		connectionOptHandshakeConfirmed(),
+		connectionOptSender(sendQueue),
+		connectionOptUnpacker(unpacker),
+	)
+	c := tc.conn
+	prevAddr := &net.UDPAddr{IP: net.IPv4(192, 168, 1, 1), Port: 1234}
+	c.pathManager = newPathManager(c.connIDManager.GetConnIDForPath, c.connIDManager.RetireConnIDForPath, func() time.Duration { return time.Second }, c.logger)
+	c.pathManager.AddPreviousPath(prevAddr, netip.Addr{}, packetInfo{}, monotime.Now())
+	require.True(t, c.pathManager.AddrValidated(prevAddr, netip.Addr{}))
+
+	// a packer that packs the frames into packets of at most maxSize bytes, expanded to 1200 bytes
+	const overhead = 30
+	var probeSizes []protocol.ByteCount
+	var responses int
+	var pn protocol.PacketNumber
+	tc.packer.EXPECT().PackPathProbePacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), protocol.PathID(0)).DoAndReturn(
+		func(_ protocol.ConnectionID, frames []ackhandler.Frame, maxSize protocol.ByteCount, v protocol.Version, _ protocol.PathID) (shortHeaderPacket, *packetBuffer, error) {
+			size := protocol.ByteCount(overhead)
+			for _, f := range frames {
+				size += f.Frame.Length(v)
+			}
+			if size > maxSize {
+				return shortHeaderPacket{}, nil, errNothingToPack
+			}
+			size = max(size, min(maxSize, protocol.MinInitialPacketSize))
+			for _, f := range frames {
+				if _, ok := f.Frame.(*wire.PathResponseFrame); ok {
+					responses++
+				}
+			}
+			probeSizes = append(probeSizes, size)
+			pn++
+			return shortHeaderPacket{PacketNumber: pn, IsPathProbePacket: true, Frames: frames, Length: size}, getPacketBuffer(), nil
+		},
+	).AnyTimes()
+
+	receive := func(numChallenges int, size protocol.ByteCount) {
+		t.Helper()
+		var data []byte
+		for i := range numChallenges {
+			var err error
+			data, err = (&wire.PathChallengeFrame{Data: [8]byte{byte(i), byte(i >> 8)}}).Append(data, protocol.Version1)
+			require.NoError(t, err)
+		}
+		unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any(), gomock.Any()).Return(
+			c.largestRcvdAppData+1, protocol.PacketNumberLen2, protocol.KeyPhaseZero, data, nil,
+		)
+		_, err := c.handleShortHeaderPacket(receivedPacket{
+			remoteAddr: prevAddr,
+			data:       make([]byte, size),
+			buffer:     getPacketBuffer(),
+			rcvTime:    monotime.Now(),
+		}, false, 0)
+		require.NoError(t, err)
+	}
+
+	// A datagram of 1250 bytes has room for 135 PATH_CHALLENGE frames.
+	// They are answered in 2 packets: one packet only has room for 130 PATH_RESPONSE frames.
+	receive(135, 1250)
+	require.Equal(t, 135, responses)
+	require.Len(t, probeSizes, 2)
+	var sent protocol.ByteCount
+	for _, s := range probeSizes {
+		sent += s
+	}
+	require.LessOrEqual(t, sent, 3*protocol.ByteCount(1250))
+	require.Len(t, sendQueue.sent, 2)
+
+	// A small datagram is answered in a datagram of 1200 bytes (section 8.2.2 of RFC 9000).
+	probeSizes = nil
+	responses = 0
+	receive(1, 50)
+	require.Equal(t, []protocol.ByteCount{protocol.MinInitialPacketSize}, probeSizes)
+	require.Equal(t, 1, responses)
+	require.Equal(t, tc.remoteAddr, c.RemoteAddr())
+}
+
+// After the client migrated, the server uses the connection ID it used to validate the new path,
+// since the connection ID used so far was used towards the previous client address (section 9.5 of RFC 9000).
+// It validates the previous path (section 9.3.3 of RFC 9000), using a connection ID that is only used for that path.
+// A non-probing packet received on the previous path then switches the connection back.
+func TestConnectionServerMigrationValidatesPreviousPath(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	unpacker := NewMockUnpacker(mockCtrl)
+	sendQueue := &recordingSendQueue{}
+	tc := newServerTestConnection(t, mockCtrl, nil, false,
+		connectionOptHandshakeConfirmed(),
+		connectionOptSender(sendQueue),
+		connectionOptUnpacker(unpacker),
+	)
+	c := tc.conn
+	require.NoError(t, c.handleTransportParameters(&wire.TransportParameters{MaxUDPPayloadSize: 1456}))
+	// the client's address was validated during the handshake
+	c.sentPacketHandler.ReceivedPacket(protocol.EncryptionHandshake, monotime.Now())
+	// the client uses a connection ID of non-zero length
+	handshakeConnID := protocol.ParseConnectionID([]byte{9, 9, 9, 9})
+	c.connIDManager = newConnIDManager(handshakeConnID, func(protocol.StatelessResetToken) {}, func(protocol.StatelessResetToken) {}, c.queueControlFrame)
+	c.peerConnIDs = newPathConnIDManagers(c.connIDManager)
+	// the sendConn keeps track of the remote address
+	rawConn := NewMockRawConn(mockCtrl)
+	rawConn.EXPECT().LocalAddr().Return(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1234}).AnyTimes()
+	c.conn = newSendConn(rawConn, tc.remoteAddr, packetInfo{}, utils.DefaultLogger)
+	connIDs := []protocol.ConnectionID{
+		protocol.ParseConnectionID([]byte{1, 1, 1, 1}),
+		protocol.ParseConnectionID([]byte{2, 2, 2, 2}),
+		protocol.ParseConnectionID([]byte{3, 3, 3, 3}),
+	}
+	for i, connID := range connIDs {
+		require.NoError(t, c.peerConnIDs.AddNewConnectionID(&wire.NewConnectionIDFrame{
+			SequenceNumber:      uint64(i + 1),
+			ConnectionID:        connID,
+			StatelessResetToken: protocol.StatelessResetToken{byte(i + 1)},
+		}))
+	}
+	require.Equal(t, handshakeConnID, c.connIDManager.Get())
+	queuedFrames(c)
+
+	type probe struct {
+		connID protocol.ConnectionID
+		frames []wire.Frame
+	}
+	var probes []probe
+	var pn protocol.PacketNumber
+	tc.packer.EXPECT().PackPathProbePacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), protocol.PathID(0)).DoAndReturn(
+		func(connID protocol.ConnectionID, frames []ackhandler.Frame, maxSize protocol.ByteCount, _ protocol.Version, _ protocol.PathID) (shortHeaderPacket, *packetBuffer, error) {
+			pr := probe{connID: connID}
+			for _, f := range frames {
+				pr.frames = append(pr.frames, f.Frame)
+			}
+			probes = append(probes, pr)
+			pn++
+			return shortHeaderPacket{PacketNumber: pn, IsPathProbePacket: true, Frames: frames, Length: min(maxSize, protocol.MinInitialPacketSize)}, getPacketBuffer(), nil
+		},
+	).AnyTimes()
+	challengeData := func(pr probe) [8]byte {
+		for _, f := range pr.frames {
+			if pc, ok := f.(*wire.PathChallengeFrame); ok {
+				return pc.Data
+			}
+		}
+		t.Fatal("no PATH_CHALLENGE")
+		return [8]byte{}
+	}
+	var rcvPN protocol.PacketNumber
+	receive := func(addr net.Addr, frames ...wire.Frame) {
+		t.Helper()
+		var payload []byte
+		for _, f := range frames {
+			var err error
+			payload, err = f.Append(payload, protocol.Version1)
+			require.NoError(t, err)
+		}
+		rcvPN++
+		unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any(), gomock.Any()).Return(
+			rcvPN, protocol.PacketNumberLen2, protocol.KeyPhaseZero, payload, nil,
+		)
+		_, err := c.handleShortHeaderPacket(receivedPacket{
+			remoteAddr: addr,
+			data:       make([]byte, 1000),
+			buffer:     getPacketBuffer(),
+			rcvTime:    monotime.Now(),
+		}, false, 0)
+		require.NoError(t, err)
+	}
+
+	// the client migrates to a new address
+	newRemoteAddr := &net.UDPAddr{IP: net.IPv4(192, 168, 1, 1), Port: 1234}
+	receive(newRemoteAddr, &wire.PingFrame{})
+	require.Len(t, probes, 1)
+	require.Equal(t, connIDs[0], probes[0].connID)
+	receive(newRemoteAddr, &wire.PingFrame{}, &wire.PathResponseFrame{Data: challengeData(probes[0])})
+	require.Equal(t, newRemoteAddr, c.RemoteAddr())
+	require.Equal(t, connIDs[0], c.connIDManager.Get())
+	// The connection ID used during the handshake is retired: the client didn't provide a stateless reset token for
+	// it. The previous path is validated using another connection ID.
+	require.Contains(t, queuedFrames(c), ackhandler.Frame{Frame: &wire.RetireConnectionIDFrame{SequenceNumber: 0}})
+	require.NoError(t, c.sendDuePathChallenges(monotime.Now()))
+	require.Len(t, probes, 2)
+	require.Equal(t, connIDs[1], probes[1].connID)
+	require.Len(t, probes[1].frames, 1)
+	require.Equal(t, []net.Addr{newRemoteAddr, tc.remoteAddr}, sendQueue.sent)
+
+	// The previous path is validated. A non-probing packet received on it switches the connection back.
+	receive(tc.remoteAddr, &wire.PathResponseFrame{Data: challengeData(probes[1])})
+	receive(tc.remoteAddr, &wire.PingFrame{})
+	require.Equal(t, tc.remoteAddr, c.RemoteAddr())
+	require.Equal(t, connIDs[1], c.connIDManager.Get())
+	// The connection ID used on the new path is kept for validating that path, since the client provided
+	// a stateless reset token for it.
+	require.NotContains(t, queuedFrames(c), ackhandler.Frame{Frame: &wire.RetireConnectionIDFrame{SequenceNumber: 1}})
+	require.NoError(t, c.sendDuePathChallenges(monotime.Now()))
+	require.Len(t, probes, 3)
+	require.Equal(t, connIDs[0], probes[2].connID)
+	require.Equal(t, []net.Addr{newRemoteAddr, tc.remoteAddr, newRemoteAddr}, sendQueue.sent)
+}
+
 func TestConnectionMigrationServer(t *testing.T) {
 	tc := newServerTestConnection(t, nil, nil, false)
 	_, err := tc.conn.AddPath(&Transport{})
-	require.Error(t, err)
 	require.ErrorContains(t, err, "server cannot initiate connection migration")
 }
 
@@ -3396,7 +4750,6 @@ func testConnectionMigration(t *testing.T, enabled bool) {
 	defer tr.Close()
 	path, err := tc.conn.AddPath(tr)
 	if !enabled {
-		require.Error(t, err)
 		require.ErrorContains(t, err, "server disabled connection migration")
 		return
 	}
@@ -3407,8 +4760,8 @@ func testConnectionMigration(t *testing.T, enabled bool) {
 		shortHeaderPacket{}, errNothingToPack,
 	).AnyTimes()
 	packedProbe := make(chan struct{})
-	tc.packer.EXPECT().PackPathProbePacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
-		func(_ protocol.ConnectionID, _ []ackhandler.Frame, _ protocol.Version, _ protocol.PathID) (shortHeaderPacket, *packetBuffer, error) {
+	tc.packer.EXPECT().PackPathProbePacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ protocol.ConnectionID, _ []ackhandler.Frame, _ protocol.ByteCount, _ protocol.Version, _ protocol.PathID) (shortHeaderPacket, *packetBuffer, error) {
 			defer close(packedProbe)
 			return shortHeaderPacket{IsPathProbePacket: true}, getPacketBuffer(), nil
 		},
@@ -3450,6 +4803,592 @@ func testConnectionMigration(t *testing.T, enabled bool) {
 	}
 }
 
+// A PATH_CHALLENGE received on a path that the client probes is answered on that path (section 8.2.2 of RFC 9000):
+// the PATH_RESPONSE is sent from the path's Transport, using the path's connection ID.
+func TestConnectionClientPathChallengeOnProbedPath(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	unpacker := NewMockUnpacker(mockCtrl)
+	tc := newClientTestConnection(t, mockCtrl, nil, false, connectionOptHandshakeConfirmed(), connectionOptUnpacker(unpacker))
+	require.NoError(t, tc.conn.handleTransportParameters(&wire.TransportParameters{
+		InitialSourceConnectionID:       tc.destConnID,
+		OriginalDestinationConnectionID: tc.destConnID,
+	}))
+	c := tc.conn
+	tc.connRunner.EXPECT().AddResetToken(gomock.Any(), gomock.Any()).AnyTimes()
+	pathConnID := protocol.ParseConnectionID([]byte{1, 2, 3, 4})
+	_, err := c.handleFrame(&wire.NewConnectionIDFrame{SequenceNumber: 1, ConnectionID: pathConnID}, protocol.Encryption1RTT, tc.destConnID, monotime.Now())
+	require.NoError(t, err)
+
+	tr := &Transport{Conn: newUDPConnLocalhost(t)}
+	defer tr.Close()
+	path, err := c.AddPath(tr)
+	require.NoError(t, err)
+	// add the path to the path manager, as Path.Probe does
+	pm := c.pathManagerOutgoing.Load()
+	pm.addPath(path, func() {})
+	serverConn := newUDPConnLocalhost(t)
+	queuedFrames(c)
+
+	receive := func(transport *Transport, data [8]byte) {
+		t.Helper()
+		payload, err := (&wire.PathChallengeFrame{Data: data}).Append(nil, protocol.Version1)
+		require.NoError(t, err)
+		unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any(), gomock.Any()).Return(
+			c.largestRcvdAppData+1, protocol.PacketNumberLen2, protocol.KeyPhaseZero, payload, nil,
+		)
+		_, err = c.handleShortHeaderPacket(receivedPacket{
+			remoteAddr: serverConn.LocalAddr(),
+			data:       make([]byte, 1200),
+			buffer:     getPacketBuffer(),
+			rcvTime:    monotime.Now(),
+			transport:  transport,
+		}, false, 0)
+		require.NoError(t, err)
+	}
+
+	tc.packer.EXPECT().PackPathProbePacket(pathConnID, gomock.Any(), protocol.ByteCount(protocol.MinInitialPacketSize), protocol.Version1, protocol.PathID(0)).DoAndReturn(
+		func(_ protocol.ConnectionID, frames []ackhandler.Frame, _ protocol.ByteCount, _ protocol.Version, _ protocol.PathID) (shortHeaderPacket, *packetBuffer, error) {
+			require.Equal(t, []ackhandler.Frame{{Frame: &wire.PathResponseFrame{Data: [8]byte{1, 2, 3}}, Handler: emptyHandler{}}}, frames)
+			buf := getPacketBuffer()
+			buf.Data = append(buf.Data, "path response"...)
+			return shortHeaderPacket{PacketNumber: 1, IsPathProbePacket: true, Frames: frames, Length: buf.Len()}, buf, nil
+		},
+	)
+	receive(tr, [8]byte{1, 2, 3})
+	require.Empty(t, queuedFrames(c))
+	serverConn.SetReadDeadline(time.Now().Add(time.Second))
+	b := make([]byte, 100)
+	n, addr, err := serverConn.ReadFrom(b)
+	require.NoError(t, err)
+	require.Equal(t, "path response", string(b[:n]))
+	require.Equal(t, tr.Conn.LocalAddr(), addr)
+
+	// a PATH_CHALLENGE received on the active path is answered on the active path
+	receive(nil, [8]byte{4, 5, 6})
+	require.Equal(t, []ackhandler.Frame{{Frame: &wire.PathResponseFrame{Data: [8]byte{4, 5, 6}}}}, queuedFrames(c))
+	receive(&Transport{}, [8]byte{7, 8, 9})
+	require.Equal(t, []ackhandler.Frame{{Frame: &wire.PathResponseFrame{Data: [8]byte{7, 8, 9}}}}, queuedFrames(c))
+
+	// once the connection switched to the path, it is the active path
+	pm.paths[path.id].isValidated = true
+	require.NoError(t, path.Switch())
+	receive(tr, [8]byte{10, 11, 12})
+	require.Equal(t, []ackhandler.Frame{{Frame: &wire.PathResponseFrame{Data: [8]byte{10, 11, 12}}}}, queuedFrames(c))
+}
+
+// After the client switched paths, the server validates the previous path (section 9.3.3 of RFC 9000).
+// The client answers its PATH_CHALLENGE from the Transport used for the handshake (section 8.2.2 of RFC 9000),
+// using a connection ID that wasn't used on any other path (section 9.5 of RFC 9000).
+func TestConnectionClientPathChallengeOnHandshakePath(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	unpacker := NewMockUnpacker(mockCtrl)
+	tc := newClientTestConnection(t, mockCtrl, nil, false, connectionOptHandshakeConfirmed(), connectionOptUnpacker(unpacker))
+	require.NoError(t, tc.conn.handleTransportParameters(&wire.TransportParameters{
+		InitialSourceConnectionID:       tc.destConnID,
+		OriginalDestinationConnectionID: tc.destConnID,
+	}))
+	c := tc.conn
+	tc.connRunner.EXPECT().AddResetToken(gomock.Any(), gomock.Any()).AnyTimes()
+	pathConnID := protocol.ParseConnectionID([]byte{1, 2, 3, 4})
+	_, err := c.handleFrame(&wire.NewConnectionIDFrame{SequenceNumber: 1, ConnectionID: pathConnID}, protocol.Encryption1RTT, tc.destConnID, monotime.Now())
+	require.NoError(t, err)
+
+	handshakeTr := &Transport{Conn: newUDPConnLocalhost(t)}
+	require.NoError(t, handshakeTr.init(false))
+	defer handshakeTr.Close()
+	c.handshakeTransport = handshakeTr
+	tr := &Transport{Conn: newUDPConnLocalhost(t)}
+	defer tr.Close()
+	path, err := c.AddPath(tr)
+	require.NoError(t, err)
+	// add the path to the path manager and take its connection ID, as Path.Probe does
+	pm := c.pathManagerOutgoing.Load()
+	pm.addPath(path, func() {})
+	connID, ok := c.connIDManager.GetConnIDForPath(path.id)
+	require.True(t, ok)
+	require.Equal(t, pathConnID, connID)
+	serverConn := newUDPConnLocalhost(t)
+	queuedFrames(c)
+
+	receive := func(transport *Transport, data [8]byte) {
+		t.Helper()
+		payload, err := (&wire.PathChallengeFrame{Data: data}).Append(nil, protocol.Version1)
+		require.NoError(t, err)
+		unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any(), gomock.Any()).Return(
+			c.largestRcvdAppData+1, protocol.PacketNumberLen2, protocol.KeyPhaseZero, payload, nil,
+		)
+		_, err = c.handleShortHeaderPacket(receivedPacket{
+			remoteAddr: serverConn.LocalAddr(),
+			data:       make([]byte, 1200),
+			buffer:     getPacketBuffer(),
+			rcvTime:    monotime.Now(),
+			transport:  transport,
+		}, false, 0)
+		require.NoError(t, err)
+	}
+
+	// before switching, the handshake Transport is used by the active path
+	receive(handshakeTr, [8]byte{1, 2, 3})
+	require.Equal(t, []ackhandler.Frame{{Frame: &wire.PathResponseFrame{Data: [8]byte{1, 2, 3}}}}, queuedFrames(c))
+
+	pm.paths[path.id].isValidated = true
+	require.NoError(t, path.Switch())
+
+	// Without an unused connection ID, the PATH_CHALLENGE is not answered.
+	// It must not be answered on the active path.
+	receive(handshakeTr, [8]byte{4, 5, 6})
+	require.Empty(t, queuedFrames(c))
+
+	newConnID := protocol.ParseConnectionID([]byte{5, 6, 7, 8})
+	_, err = c.handleFrame(&wire.NewConnectionIDFrame{SequenceNumber: 2, ConnectionID: newConnID}, protocol.Encryption1RTT, tc.destConnID, monotime.Now())
+	require.NoError(t, err)
+	tc.packer.EXPECT().PackPathProbePacket(newConnID, gomock.Any(), protocol.ByteCount(protocol.MinInitialPacketSize), protocol.Version1, protocol.PathID(0)).DoAndReturn(
+		func(_ protocol.ConnectionID, frames []ackhandler.Frame, _ protocol.ByteCount, _ protocol.Version, _ protocol.PathID) (shortHeaderPacket, *packetBuffer, error) {
+			require.Equal(t, []ackhandler.Frame{{Frame: &wire.PathResponseFrame{Data: [8]byte{7, 8, 9}}, Handler: emptyHandler{}}}, frames)
+			buf := getPacketBuffer()
+			buf.Data = append(buf.Data, "path response"...)
+			return shortHeaderPacket{PacketNumber: 1, IsPathProbePacket: true, Frames: frames, Length: buf.Len()}, buf, nil
+		},
+	)
+	receive(handshakeTr, [8]byte{7, 8, 9})
+	require.Empty(t, queuedFrames(c))
+	serverConn.SetReadDeadline(time.Now().Add(time.Second))
+	b := make([]byte, 100)
+	n, addr, err := serverConn.ReadFrom(b)
+	require.NoError(t, err)
+	require.Equal(t, "path response", string(b[:n]))
+	require.Equal(t, handshakeTr.Conn.LocalAddr(), addr)
+
+	// PATH_CHALLENGE frames received on the active path are answered on the active path
+	receive(tr, [8]byte{10, 11, 12})
+	require.Equal(t, []ackhandler.Frame{{Frame: &wire.PathResponseFrame{Data: [8]byte{10, 11, 12}}}}, queuedFrames(c))
+}
+
+// The client answers the PATH_CHALLENGE that the server sends to validate the previous path after the client switched
+// paths (section 9.3.3 of RFC 9000) from the Transport used for the handshake (section 8.2.2 of RFC 9000).
+func TestConnectionClientPathResponseOnHandshakePath(t *testing.T) {
+	serverTr := &Transport{Conn: newUDPConnLocalhost(t)}
+	defer serverTr.Close()
+	ln, err := serverTr.Listen(generateTLSConfig(), nil)
+	require.NoError(t, err)
+	defer ln.Close()
+	handshakeConn := &countingPacketConn{PacketConn: newUDPConnLocalhost(t)}
+	tr1 := &Transport{Conn: handshakeConn}
+	defer tr1.Close()
+	pathConn := &holdingPacketConn{countingPacketConn: countingPacketConn{PacketConn: newUDPConnLocalhost(t)}}
+	tr2 := &Transport{Conn: pathConn}
+	defer tr2.Close()
+
+	var recorder events.Recorder
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := tr1.Dial(ctx, ln.Addr(), generateTLSConfigWithServerName("localhost"), &Config{Tracer: multipathTestTracer(&recorder)})
+	require.NoError(t, err)
+	defer conn.CloseWithError(0, "")
+	sconn, err := ln.Accept(ctx)
+	require.NoError(t, err)
+	defer sconn.CloseWithError(0, "")
+	path, err := conn.AddPath(tr2)
+	require.NoError(t, err)
+	require.NoError(t, path.Probe(ctx))
+	// wait for the client to answer the server's PATH_CHALLENGE on the new path
+	pathResponses := func(evs []qlogwriter.Event) int {
+		var n int
+		for _, ev := range evs {
+			for _, f := range ev.(qlog.PacketSent).Frames {
+				if _, ok := f.Frame.(*qlog.PathResponseFrame); ok {
+					n++
+				}
+			}
+		}
+		return n
+	}
+	require.Eventually(t, func() bool { return pathResponses(recorder.Events(qlog.PacketSent{})) > 0 }, time.Second, time.Millisecond)
+
+	// Hold back the packets sent on the new path, so that the server only switches to the path
+	// once the client completed switching.
+	pathConn.hold.Store(true)
+	require.NoError(t, path.Switch())
+	str, err := conn.OpenUniStream()
+	require.NoError(t, err)
+	_, err = str.Write([]byte("foobar"))
+	require.NoError(t, err)
+	require.NoError(t, str.Close())
+	// The client only sends on the new path after it sent all packets queued for the previous path.
+	require.Eventually(t, func() bool { return pathConn.numHeld() > 0 }, time.Second, time.Millisecond)
+	written := handshakeConn.written.Load()
+	sentEvents := len(recorder.Events(qlog.PacketSent{}))
+	pathConn.release()
+
+	// The server switches to the new path once it receives the stream data, and validates the previous path.
+	rstr, err := sconn.AcceptUniStream(ctx)
+	require.NoError(t, err)
+	data, err := io.ReadAll(rstr)
+	require.NoError(t, err)
+	require.Equal(t, []byte("foobar"), data)
+	// The PATH_RESPONSE frames are sent from the Transport used for the handshake.
+	// The packet is logged before it is sent.
+	require.Eventually(t, func() bool {
+		responses := pathResponses(recorder.Events(qlog.PacketSent{})[sentEvents:])
+		return responses > 0 && int(handshakeConn.written.Load()-written) >= responses
+	}, 2*time.Second, time.Millisecond)
+}
+
+// After switching to a path added with AddPath, the client recognizes a stateless reset that the server sends on that
+// path (section 10.3.1 of RFC 9000).
+func TestConnectionClientStatelessResetOnNewPath(t *testing.T) {
+	var serverKey StatelessResetKey
+	rand.Read(serverKey[:])
+	udpConn := newUDPConnLocalhost(t)
+	serverConn := &droppingPacketConn{PacketConn: udpConn}
+	serverTr := &Transport{Conn: serverConn, StatelessResetKey: &serverKey}
+	defer serverTr.Close()
+	ln, err := serverTr.Listen(generateTLSConfig(), nil)
+	require.NoError(t, err)
+	defer ln.Close()
+	tr1 := &Transport{Conn: newUDPConnLocalhost(t)}
+	defer tr1.Close()
+	tr2 := &Transport{Conn: newUDPConnLocalhost(t)}
+	defer tr2.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := tr1.Dial(ctx, ln.Addr(), generateTLSConfigWithServerName("localhost"), nil)
+	require.NoError(t, err)
+	defer conn.CloseWithError(0, "")
+	sconn, err := ln.Accept(ctx)
+	require.NoError(t, err)
+	path, err := conn.AddPath(tr2)
+	require.NoError(t, err)
+	require.NoError(t, path.Probe(ctx))
+	require.NoError(t, path.Switch())
+	// the server switches to the path once it receives a non-probing packet on it
+	str, err := conn.OpenUniStream()
+	require.NoError(t, err)
+	_, err = str.Write([]byte("foobar"))
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		return sconn.RemoteAddr().String() == tr2.Conn.LocalAddr().String()
+	}, time.Second, time.Millisecond)
+
+	// The server loses its state. A new Transport on the same address sends a stateless reset
+	// when it receives a packet for the connection.
+	serverConn.drop.Store(true)
+	require.NoError(t, serverTr.Close())
+	require.NoError(t, udpConn.Close())
+	udpConn2, err := net.ListenUDP("udp", udpConn.LocalAddr().(*net.UDPAddr))
+	require.NoError(t, err)
+	serverTr2 := &Transport{Conn: udpConn2, StatelessResetKey: &serverKey}
+	defer serverTr2.Close()
+	ln2, err := serverTr2.Listen(generateTLSConfig(), nil)
+	require.NoError(t, err)
+	defer ln2.Close()
+
+	_, err = str.Write(make([]byte, 100))
+	require.NoError(t, err)
+	select {
+	case <-conn.Context().Done():
+		require.ErrorIs(t, context.Cause(conn.Context()), &StatelessResetError{})
+	case <-ctx.Done():
+		t.Fatal("the client didn't recognize the stateless reset")
+	}
+}
+
+// holdingPacketConn holds back the datagrams written while hold is set, until release is called.
+type holdingPacketConn struct {
+	countingPacketConn
+	hold atomic.Bool
+
+	mx   sync.Mutex
+	held []heldDatagram
+}
+
+type heldDatagram struct {
+	data []byte
+	addr net.Addr
+}
+
+func (c *holdingPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	c.mx.Lock()
+	if c.hold.Load() {
+		c.held = append(c.held, heldDatagram{data: slices.Clone(b), addr: addr})
+		c.mx.Unlock()
+		return len(b), nil
+	}
+	c.mx.Unlock()
+	return c.countingPacketConn.WriteTo(b, addr)
+}
+
+func (c *holdingPacketConn) numHeld() int {
+	c.mx.Lock()
+	defer c.mx.Unlock()
+	return len(c.held)
+}
+
+func (c *holdingPacketConn) release() {
+	c.mx.Lock()
+	defer c.mx.Unlock()
+	c.hold.Store(false)
+	for _, d := range c.held {
+		c.countingPacketConn.WriteTo(d.data, d.addr)
+	}
+	c.held = nil
+}
+
+// When switching to a new path, the client uses the connection ID it used for probing the path, which wasn't used on
+// any other path, and retires the connection ID used so far (section 9.5 of RFC 9000).
+func TestConnectionClientPathSwitchConnectionID(t *testing.T) {
+	tc := newClientTestConnection(t, nil, nil, false, connectionOptHandshakeConfirmed(), connectionOptSender(&recordingSendQueue{}))
+	require.NoError(t, tc.conn.handleTransportParameters(&wire.TransportParameters{
+		InitialSourceConnectionID:       tc.destConnID,
+		OriginalDestinationConnectionID: tc.destConnID,
+	}))
+	c := tc.conn
+	c.applyTransportParameters()
+	tc.connRunner.EXPECT().AddResetToken(gomock.Any(), gomock.Any()).AnyTimes()
+	tc.connRunner.EXPECT().RemoveResetToken(gomock.Any()).AnyTimes()
+	connIDs := []protocol.ConnectionID{
+		protocol.ParseConnectionID([]byte{1, 1, 1, 1}),
+		protocol.ParseConnectionID([]byte{2, 2, 2, 2}),
+		protocol.ParseConnectionID([]byte{3, 3, 3, 3}),
+	}
+	for i, connID := range connIDs {
+		_, err := c.handleFrame(&wire.NewConnectionIDFrame{
+			SequenceNumber:      uint64(i + 1),
+			ConnectionID:        connID,
+			StatelessResetToken: protocol.StatelessResetToken{byte(i + 1)},
+		}, protocol.Encryption1RTT, tc.destConnID, monotime.Now())
+		require.NoError(t, err)
+	}
+	require.Equal(t, tc.destConnID, c.connIDManager.Get())
+	queuedFrames(c)
+
+	// probe and validate a path, as Path.Probe does
+	addValidatedPath := func() *Path {
+		t.Helper()
+		tr := &Transport{Conn: newUDPConnLocalhost(t)}
+		t.Cleanup(func() { tr.Close() })
+		path, err := c.AddPath(tr)
+		require.NoError(t, err)
+		pm := c.pathManagerOutgoing.Load()
+		pm.addPath(path, func() {})
+		pm.enqueueProbe(path)
+		_, f, _, ok := pm.NextPathToProbe()
+		require.True(t, ok)
+		pm.HandlePathResponseFrame(&wire.PathResponseFrame{Data: f.Frame.(*wire.PathChallengeFrame).Data})
+		return path
+	}
+	switchToPath := func(path *Path) {
+		t.Helper()
+		require.NoError(t, path.Switch())
+		tr, id, ok := c.pathManagerOutgoing.Load().ShouldSwitchPath(c.connIDManager.HasConnIDForPath)
+		require.True(t, ok)
+		// switching to a new path closes the send queue of the previous path
+		c.switchToNewPath(tr, id, monotime.Now())
+		require.Equal(t, path.tr.Conn.LocalAddr(), c.LocalAddr())
+	}
+	defer func() { c.sendQueue.Close() }()
+
+	path1 := addValidatedPath()
+	switchToPath(path1)
+	require.Equal(t, connIDs[0], c.connIDManager.Get())
+	require.Equal(t, []ackhandler.Frame{{Frame: &wire.RetireConnectionIDFrame{SequenceNumber: 0}}}, queuedFrames(c))
+
+	path2 := addValidatedPath()
+	switchToPath(path2)
+	require.Equal(t, connIDs[1], c.connIDManager.Get())
+	require.Equal(t, []ackhandler.Frame{{Frame: &wire.RetireConnectionIDFrame{SequenceNumber: 1}}}, queuedFrames(c))
+
+	// Switching back to the first path uses a new connection ID:
+	// the one used for probing that path was used on that path.
+	switchToPath(path1)
+	require.Equal(t, connIDs[2], c.connIDManager.Get())
+	require.Equal(t, []ackhandler.Frame{{Frame: &wire.RetireConnectionIDFrame{SequenceNumber: 2}}}, queuedFrames(c))
+
+	// No unused connection ID is left. Switching back to the second path is delayed,
+	// since the connection ID used on the first path must not be used from another local address.
+	require.NoError(t, path2.Switch())
+	pm := c.pathManagerOutgoing.Load()
+	_, _, ok := pm.ShouldSwitchPath(c.connIDManager.HasConnIDForPath)
+	require.False(t, ok)
+	require.Equal(t, connIDs[2], c.connIDManager.Get())
+	_, err := c.handleFrame(&wire.NewConnectionIDFrame{
+		SequenceNumber:      4,
+		ConnectionID:        protocol.ParseConnectionID([]byte{4, 4, 4, 4}),
+		StatelessResetToken: protocol.StatelessResetToken{4},
+	}, protocol.Encryption1RTT, tc.destConnID, monotime.Now())
+	require.NoError(t, err)
+	tr, id, ok := pm.ShouldSwitchPath(c.connIDManager.HasConnIDForPath)
+	require.True(t, ok)
+	c.switchToNewPath(tr, id, monotime.Now())
+	require.Equal(t, path2.tr.Conn.LocalAddr(), c.LocalAddr())
+	require.Equal(t, protocol.ParseConnectionID([]byte{4, 4, 4, 4}), c.connIDManager.Get())
+	require.Equal(t, []ackhandler.Frame{{Frame: &wire.RetireConnectionIDFrame{SequenceNumber: 3}}}, queuedFrames(c))
+}
+
+// The client answers the PATH_CHALLENGE that the server sends when the client probes a new path on that path.
+func TestConnectionClientPathResponseOnProbedPath(t *testing.T) {
+	serverTr := &Transport{Conn: newUDPConnLocalhost(t)}
+	defer serverTr.Close()
+	ln, err := serverTr.Listen(generateTLSConfig(), nil)
+	require.NoError(t, err)
+	defer ln.Close()
+	tr1 := &Transport{Conn: newUDPConnLocalhost(t)}
+	defer tr1.Close()
+	pathConn := &countingPacketConn{PacketConn: newUDPConnLocalhost(t)}
+	tr2 := &Transport{Conn: pathConn}
+	defer tr2.Close()
+
+	var recorder events.Recorder
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := tr1.Dial(ctx, ln.Addr(), generateTLSConfigWithServerName("localhost"), &Config{Tracer: multipathTestTracer(&recorder)})
+	require.NoError(t, err)
+	defer conn.CloseWithError(0, "")
+	path, err := conn.AddPath(tr2)
+	require.NoError(t, err)
+	require.NoError(t, path.Probe(ctx))
+
+	// All packets sent on the path are probe packets: those with the client's PATH_CHALLENGE frames,
+	// and those with the PATH_RESPONSE frames.
+	probePackets := func() (challenges, responses int) {
+		for _, ev := range recorder.Events(qlog.PacketSent{}) {
+			for _, f := range ev.(qlog.PacketSent).Frames {
+				switch f.Frame.(type) {
+				case *qlog.PathChallengeFrame:
+					challenges++
+				case *qlog.PathResponseFrame:
+					responses++
+				}
+			}
+		}
+		return challenges, responses
+	}
+	require.Eventually(t, func() bool {
+		challenges, responses := probePackets()
+		return responses > 0 && int(pathConn.written.Load()) == challenges+responses
+	}, time.Second, time.Millisecond)
+}
+
+// countingPacketConn counts the datagrams written.
+type countingPacketConn struct {
+	net.PacketConn
+	written atomic.Int64
+}
+
+func (c *countingPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	c.written.Add(1)
+	return c.PacketConn.WriteTo(b, addr)
+}
+
+// LocalAddr, RemoteAddr and ConnectionState can be called while the connection switches to a new path.
+// This test is only meaningful with the race detector.
+func TestConnectionMigrationConcurrentAddressAccess(t *testing.T) {
+	serverTr := &Transport{Conn: newUDPConnLocalhost(t)}
+	defer serverTr.Close()
+	ln, err := serverTr.Listen(generateTLSConfig(), nil)
+	require.NoError(t, err)
+	defer ln.Close()
+	tr1 := &Transport{Conn: newUDPConnLocalhost(t)}
+	defer tr1.Close()
+	tr2 := &Transport{Conn: newUDPConnLocalhost(t)}
+	defer tr2.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := tr1.Dial(ctx, ln.Addr(), generateTLSConfigWithServerName("localhost"), nil)
+	require.NoError(t, err)
+	defer conn.CloseWithError(0, "")
+	path, err := conn.AddPath(tr2)
+	require.NoError(t, err)
+	require.NoError(t, path.Probe(ctx))
+
+	done := make(chan struct{})
+	switched := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			_ = conn.RemoteAddr().String()
+			_ = conn.ConnectionState()
+			if conn.LocalAddr().String() == tr2.Conn.LocalAddr().String() {
+				close(switched)
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+		}
+	}()
+	require.NoError(t, path.Switch())
+	select {
+	case <-switched:
+	case <-ctx.Done():
+		t.Fatal("timeout waiting for the connection to switch to the new path")
+	}
+	<-done
+	require.Equal(t, ln.Addr().String(), conn.RemoteAddr().String())
+}
+
+// AddPath can be called while the connection switches to a new path.
+// This test is only meaningful with the race detector.
+func TestConnectionMigrationConcurrentAddPath(t *testing.T) {
+	serverTr := &Transport{Conn: newUDPConnLocalhost(t)}
+	defer serverTr.Close()
+	ln, err := serverTr.Listen(generateTLSConfig(), nil)
+	require.NoError(t, err)
+	defer ln.Close()
+	tr1 := &Transport{Conn: newUDPConnLocalhost(t)}
+	defer tr1.Close()
+	tr2 := &Transport{Conn: newUDPConnLocalhost(t)}
+	defer tr2.Close()
+	tr3 := &Transport{Conn: newUDPConnLocalhost(t)}
+	defer tr3.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := tr1.Dial(ctx, ln.Addr(), generateTLSConfigWithServerName("localhost"), nil)
+	require.NoError(t, err)
+	defer conn.CloseWithError(0, "")
+	path, err := conn.AddPath(tr2)
+	require.NoError(t, err)
+	require.NoError(t, path.Probe(ctx))
+
+	done := make(chan struct{})
+	switched := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			p, err := conn.AddPath(tr3)
+			if err != nil {
+				t.Errorf("adding path failed: %v", err)
+				return
+			}
+			if p == nil {
+				t.Error("expected a path")
+				return
+			}
+			if conn.LocalAddr().String() == tr2.Conn.LocalAddr().String() {
+				close(switched)
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+		}
+	}()
+	require.NoError(t, path.Switch())
+	select {
+	case <-switched:
+	case <-ctx.Done():
+		t.Fatal("timeout waiting for the connection to switch to the new path")
+	}
+	<-done
+}
+
 func TestConnectionDatagrams(t *testing.T) {
 	t.Run("disabled", func(t *testing.T) {
 		testConnectionDatagrams(t, false)
@@ -3466,10 +5405,11 @@ func testConnectionDatagrams(t *testing.T, enabled bool) {
 	require.NoError(t, err)
 	data, err = (&wire.DatagramFrame{Data: []byte("bar")}).Append(data, protocol.Version1)
 	require.NoError(t, err)
-	_, _, _, err = tc.conn.handleFrames(data, protocol.ConnectionID{}, protocol.Encryption1RTT, nil, monotime.Now(), protocol.InvalidPathID)
+	_, _, _, err = tc.conn.handleFrames(data, protocol.ConnectionID{}, protocol.Encryption1RTT, nil, monotime.Now())
 
 	if !enabled {
-		require.ErrorIs(t, err, &qerr.TransportError{ErrorCode: qerr.FrameEncodingError, FrameType: uint64(wire.FrameTypeDatagramWithLength)})
+		// section 3 of RFC 9221
+		require.ErrorIs(t, err, &qerr.TransportError{ErrorCode: qerr.ProtocolViolation, FrameType: uint64(wire.FrameTypeDatagramWithLength)})
 		return
 	}
 
@@ -3484,3 +5424,50 @@ func testConnectionDatagrams(t *testing.T, enabled bool) {
 	require.Equal(t, []byte("bar"), d)
 }
 
+// The ACK Delay only includes delays that the endpoint controls (section 13.2.5 of RFC 9000).
+// The time that a packet spent in the queue of received packets is part of the RTT.
+func TestConnectionAckDelayExcludesQueueingDelay(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		mockCtrl := gomock.NewController(t)
+		unpacker := NewMockUnpacker(mockCtrl)
+		tc := newServerTestConnection(t, mockCtrl, nil, false,
+			connectionOptHandshakeConfirmed(),
+			connectionOptUnpacker(unpacker),
+		)
+		c := tc.conn
+		rcvTime := monotime.Now()
+		unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any(), gomock.Any()).Return(
+			protocol.PacketNumber(1), protocol.PacketNumberLen2, protocol.KeyPhaseZero, []byte{1} /* PING */, nil,
+		)
+		p := getShortHeaderPacket(t, tc.remoteAddr, tc.srcConnID, 1, []byte("foobar"))
+		p.rcvTime = rcvTime
+		c.handlePacket(p)
+		// the packet waits in the queue for 20ms before the connection processes it
+		time.Sleep(20 * time.Millisecond)
+		processed, err := c.handlePackets()
+		require.NoError(t, err)
+		require.True(t, processed)
+		// the idle timeout is still based on the time the packet was received
+		require.Equal(t, rcvTime, c.lastPacketReceivedTime)
+
+		time.Sleep(5 * time.Millisecond)
+		ack := c.receivedPacketHandler.GetAckFrame(protocol.Encryption1RTT, monotime.Now(), false, 0)
+		require.NotNil(t, ack)
+		require.Equal(t, 5*time.Millisecond, ack.DelayTime)
+	})
+}
+
+// Packets that were queued because their keys weren't available yet include the buffering delay
+// in the ACK Delay (section 13.2.5 of RFC 9000).
+func TestConnectionAckTime(t *testing.T) {
+	tc := newServerTestConnection(t, nil, nil, false)
+	c := tc.conn
+	now := monotime.Now()
+	require.Equal(t, now, c.ackTime(now))
+	c.processingStartTime = now.Add(time.Millisecond)
+	require.Equal(t, now.Add(time.Millisecond), c.ackTime(now))
+	require.Equal(t, now.Add(2*time.Millisecond), c.ackTime(now.Add(2*time.Millisecond)))
+	// packets taken from the queue of undecryptable packets
+	c.processingStartTime = 0
+	require.Equal(t, now, c.ackTime(now))
+}

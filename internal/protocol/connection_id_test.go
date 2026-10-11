@@ -22,7 +22,7 @@ func TestGenerateRandomConnectionIDs(t *testing.T) {
 
 func TestGenerateRandomLengthDestinationConnectionIDs(t *testing.T) {
 	var has8ByteConnID, has20ByteConnID bool
-	for i := 0; i < 1000; i++ {
+	for range 1000 {
 		c, err := GenerateConnectionIDForInitial()
 		require.NoError(t, err)
 		require.GreaterOrEqual(t, c.Len(), 8)
@@ -48,7 +48,7 @@ func TestConnectionID(t *testing.T) {
 
 	// too few bytes
 	_, err = ReadConnectionID(buf, 10)
-	require.Equal(t, io.EOF, err)
+	require.ErrorIs(t, err, io.EOF)
 
 	// zero length
 	c2, err := ReadConnectionID(buf, 0)
@@ -58,7 +58,7 @@ func TestConnectionID(t *testing.T) {
 	// connection ID can have a length of a maximum of 20 bytes
 	buf2 := bytes.NewBuffer(make([]byte, 21))
 	_, err = ReadConnectionID(buf2, 21)
-	require.Equal(t, ErrInvalidConnectionIDLen, err)
+	require.ErrorIs(t, err, ErrInvalidConnectionIDLen)
 }
 
 func TestConnectionIDZeroValue(t *testing.T) {

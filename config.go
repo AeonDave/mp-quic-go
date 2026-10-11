@@ -2,6 +2,7 @@ package quic
 
 import (
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/AeonDave/mp-quic-go/internal/protocol"
@@ -49,6 +50,15 @@ func validateConfig(config *Config) error {
 	for _, v := range config.Versions {
 		if !protocol.IsValidVersion(v) {
 			return fmt.Errorf("invalid QUIC version: %s", v)
+		}
+	}
+	if config.InitialVersion != 0 {
+		versions := config.Versions
+		if len(versions) == 0 {
+			versions = protocol.SupportedVersions
+		}
+		if !slices.Contains(versions, config.InitialVersion) {
+			return fmt.Errorf("initial QUIC version %s is not one of the versions (%s)", config.InitialVersion, versions)
 		}
 	}
 	return nil
@@ -104,14 +114,22 @@ func populateConfig(config *Config) *Config {
 	if initialPacketSize == 0 {
 		initialPacketSize = protocol.InitialPacketSize
 	}
+	// Configs returned by GetConfigForClient are not validated, so the limits are applied here.
 	maxPaths := config.MaxPaths
-	if maxPaths == 0 {
+	switch {
+	case maxPaths == 0:
 		maxPaths = 3 // default value
+	case maxPaths < 0:
+		maxPaths = 1
+	case maxPaths > protocol.MaxMultipathPaths:
+		maxPaths = protocol.MaxMultipathPaths
 	}
 
 	return &Config{
 		GetConfigForClient:               config.GetConfigForClient,
 		Versions:                         versions,
+		versionsConfigured:               len(config.Versions) > 0,
+		InitialVersion:                   config.InitialVersion,
 		HandshakeIdleTimeout:             handshakeIdleTimeout,
 		MaxIdleTimeout:                   idleTimeout,
 		KeepAlivePeriod:                  config.KeepAlivePeriod,
@@ -127,15 +145,22 @@ func populateConfig(config *Config) *Config {
 		InitialPacketSize:                initialPacketSize,
 		DisablePathMTUDiscovery:          config.DisablePathMTUDiscovery,
 		EnableStreamResetPartialDelivery: config.EnableStreamResetPartialDelivery,
+		EnableQUICBitGreasing:            config.EnableQUICBitGreasing,
+		RequestObservedAddress:           config.RequestObservedAddress,
+		ProvideObservedAddress:           config.ProvideObservedAddress,
 		MaxPaths:                         maxPaths,
 		MultipathController:              config.MultipathController,
+		MultipathControllerFactory:       config.MultipathControllerFactory,
+		MultipathCongestionControl:       config.MultipathCongestionControl,
 		MultipathDuplicationPolicy:       config.MultipathDuplicationPolicy,
 		MultipathReinjectionPolicy:       config.MultipathReinjectionPolicy,
 		MultipathAutoPaths:               config.MultipathAutoPaths,
+		EnableAddressAdvertisement:       config.EnableAddressAdvertisement,
 		MultipathAutoAdvertise:           config.MultipathAutoAdvertise,
 		MultipathAutoAddrs:               config.MultipathAutoAddrs,
 		ExtensionFrameHandler:            config.ExtensionFrameHandler,
 		Allow0RTT:                        config.Allow0RTT,
+		ZeroRTTReplayCache:               config.ZeroRTTReplayCache,
 		Tracer:                           config.Tracer,
 	}
 }

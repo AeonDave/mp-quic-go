@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AeonDave/mp-quic-go"
+	quic "github.com/AeonDave/mp-quic-go"
 	"github.com/AeonDave/mp-quic-go/http3/qlog"
 	"github.com/AeonDave/mp-quic-go/qlogwriter"
 	"github.com/AeonDave/mp-quic-go/quicvarint"
@@ -252,7 +252,6 @@ func expectStreamWriteReset(t *testing.T, str quicSendStream, errCode quic.Strea
 		t.Fatal("timeout")
 	}
 	_, err := str.Write([]byte{0})
-	require.Error(t, err)
 	var strErr *quic.StreamError
 	require.ErrorAs(t, err, &strErr)
 	require.Equal(t, errCode, strErr.ErrorCode)
@@ -350,4 +349,109 @@ func expectedFrameLength(t *testing.T, frame any) (length, payloadLength int) {
 		t.Fatalf("unexpected frame type: %T", frame)
 	}
 	panic("unreachable")
+}
+
+// encodeTrailerFrame encodes a HEADERS frame carrying a trailer section.
+func encodeTrailerFrame(t *testing.T, fields ...qpack.HeaderField) []byte {
+	t.Helper()
+
+	var buf bytes.Buffer
+	enc := qpack.NewEncoder(&buf)
+	for _, f := range fields {
+		require.NoError(t, enc.WriteField(f))
+	}
+	require.NoError(t, enc.Close())
+	return append((&headersFrame{Length: uint64(buf.Len())}).Append(nil), buf.Bytes()...)
+}
+
+// encodeHeadersFrame encodes a HEADERS frame carrying the given encoded field section.
+func encodeHeadersFrame(fieldSection []byte) []byte {
+	return append((&headersFrame{Length: uint64(len(fieldSection))}).Append(nil), fieldSection...)
+}
+
+// qpackConnectionErrorTests are encoded field sections that must be treated
+// as a connection error of type QPACK_DECOMPRESSION_FAILED, see RFC 9204.
+var qpackConnectionErrorTests = []struct {
+	name         string
+	fieldSection []byte
+}{
+	{name: "non-zero Required Insert Count", fieldSection: []byte{0x01, 0x00, 0xd1}},
+	{name: "reference to the dynamic table", fieldSection: []byte{0x00, 0x00, 0x80}},
+	{name: "invalid static table index", fieldSection: []byte{0x00, 0x00, 0xff, 0x24}},
+}
+
+// expectConnClosedByPeer waits until the peer closes the connection with the given error code.
+func expectConnClosedByPeer(t *testing.T, conn *quic.Conn, errCode ErrCode) {
+	t.Helper()
+
+	select {
+	case <-conn.Context().Done():
+		require.ErrorIs(t,
+			context.Cause(conn.Context()),
+			&quic.ApplicationError{Remote: true, ErrorCode: quic.ApplicationErrorCode(errCode)},
+		)
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for the connection to be closed")
+	}
+}
+
+// A trailerValidationTest is a trailer section that must be rejected,
+// and the error code used to reset the stream.
+type trailerValidationTest struct {
+	name           string
+	trailer        []byte
+	maxHeaderBytes int
+	errCode        ErrCode
+}
+
+func trailerValidationTests(t *testing.T) []trailerValidationTest {
+	t.Helper()
+
+	// Static table entries are encoded in a single byte,
+	// but count with their full name and value length towards the field section size.
+	tooLarge := make([]qpack.HeaderField, 0, 100)
+	for range 100 {
+		tooLarge = append(tooLarge, qpack.HeaderField{Name: "accept-encoding", Value: "gzip, deflate, br"})
+	}
+	return []trailerValidationTest{
+		{
+			name:    "uppercase field name",
+			trailer: encodeTrailerFrame(t, qpack.HeaderField{Name: "Foo", Value: "bar"}),
+			errCode: ErrCodeMessageError,
+		},
+		{
+			name:    "connection-specific field",
+			trailer: encodeTrailerFrame(t, qpack.HeaderField{Name: "connection", Value: "close"}),
+			errCode: ErrCodeMessageError,
+		},
+		{
+			name:    "pseudo header field",
+			trailer: encodeTrailerFrame(t, qpack.HeaderField{Name: ":path", Value: "/"}),
+			errCode: ErrCodeMessageError,
+		},
+		{
+			name:    "invalid field value",
+			trailer: encodeTrailerFrame(t, qpack.HeaderField{Name: "foo", Value: "bar\r\nbaz"}),
+			errCode: ErrCodeMessageError,
+		},
+		{
+			// A truncated field line is a stream error.
+			// Other QPACK errors are connection errors, see qpackConnectionErrorTests.
+			name:    "invalid QPACK encoding",
+			trailer: encodeHeadersFrame([]byte{0x00, 0x00, 0x52}),
+			errCode: ErrCodeQPACKDecompressionFailed,
+		},
+		{
+			name:           "field section too large",
+			trailer:        encodeTrailerFrame(t, tooLarge...),
+			maxHeaderBytes: 1000,
+			errCode:        ErrCodeExcessiveLoad,
+		},
+		{
+			name:           "HEADERS frame too large",
+			trailer:        (&headersFrame{Length: 1001}).Append(nil),
+			maxHeaderBytes: 1000,
+			errCode:        ErrCodeExcessiveLoad,
+		},
+	}
 }

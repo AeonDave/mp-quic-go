@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AeonDave/mp-quic-go"
+	quic "github.com/AeonDave/mp-quic-go"
 	"github.com/AeonDave/mp-quic-go/internal/protocol"
 	"github.com/AeonDave/mp-quic-go/qlogwriter"
 
@@ -143,6 +143,10 @@ func testTransferWithConnectionIDs(
 		expectedLen := clientConnIDLen
 		if clientConnIDGenerator != nil {
 			expectedLen = clientConnIDGenerator.ConnectionIDLen()
+		} else if clientConnIDLen == 0 && clientMultipathConfigured() {
+			// IETF Multipath QUIC requires non-zero-length connection IDs (section 2.1 of draft-ietf-quic-multipath-21).
+			// With a multipath controller, quic.Dial uses the default connection ID length.
+			expectedLen = protocol.DefaultConnectionIDLength
 		}
 		if !assert.Equal(t, expectedLen, p.hdr.DestConnectionID.Len(), "client conn length mismatch") {
 			break

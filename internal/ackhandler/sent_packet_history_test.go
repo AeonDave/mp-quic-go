@@ -47,6 +47,11 @@ func testSentPacketHistoryPacketTracking(t *testing.T, firstPacketAckEliciting b
 	require.Equal(t, []protocol.PacketNumber{0, 1, 2}, hist.getPacketNumbers())
 	require.Empty(t, slices.Collect(hist.SkippedPackets()))
 	require.Equal(t, 3, hist.Len())
+	if firstPacketAckEliciting {
+		require.Equal(t, 3, hist.NumOutstanding())
+	} else {
+		require.Equal(t, 2, hist.NumOutstanding())
+	}
 
 	// non-ack-eliciting packets are saved, but don't count as outstanding
 	hist.SentPacket(3, &packet{})
@@ -54,6 +59,11 @@ func testSentPacketHistoryPacketTracking(t *testing.T, firstPacketAckEliciting b
 	hist.SentPacket(5, &packet{})
 	hist.SentPacket(6, ackElicitingPacket())
 	require.Equal(t, []protocol.PacketNumber{0, 1, 2, 3, 4, 5, 6}, hist.getPacketNumbers())
+	if firstPacketAckEliciting {
+		require.Equal(t, 5, hist.NumOutstanding())
+	} else {
+		require.Equal(t, 4, hist.NumOutstanding())
+	}
 
 	// handle skipped packet numbers
 	hist.SkippedPacket(7)
@@ -64,6 +74,11 @@ func testSentPacketHistoryPacketTracking(t *testing.T, firstPacketAckEliciting b
 	require.Equal(t, []protocol.PacketNumber{0, 1, 2, 3, 4, 5, 6, 8, 9, 11}, hist.getPacketNumbers())
 	require.Equal(t, []protocol.PacketNumber{7, 10}, slices.Collect(hist.SkippedPackets()))
 	require.Equal(t, 12, hist.Len())
+	if firstPacketAckEliciting {
+		require.Equal(t, 7, hist.NumOutstanding())
+	} else {
+		require.Equal(t, 6, hist.NumOutstanding())
+	}
 }
 
 func TestSentPacketHistoryNonSequentialPacketNumberUse(t *testing.T) {
@@ -105,7 +120,6 @@ func TestSentPacketHistoryRemovePackets(t *testing.T) {
 
 	// try to remove non-existent packet
 	err := hist.Remove(9)
-	require.Error(t, err)
 	require.EqualError(t, err, "packet 9 not found in sent packet history")
 
 	// only the last 4 skipped packets should be preserved
@@ -325,4 +339,110 @@ func TestSentPacketHistoryDifference(t *testing.T) {
 	require.Equal(t, protocol.PacketNumber(4), hist.Difference(7, 1)) // 4 and 5 were skipped
 	require.Equal(t, protocol.PacketNumber(3), hist.Difference(7, 2)) // 4 and 5 were skipped
 	require.Equal(t, protocol.PacketNumber(5), hist.Difference(9, 1)) // 4, 5 and 8 were skipped
+}
+
+func TestSentPacketHistoryPrecedingAcked(t *testing.T) {
+	hist := newSentPacketHistory(true)
+	packets := make(map[protocol.PacketNumber]*packet)
+	send := func(pn protocol.PacketNumber) {
+		p := ackElicitingPacket()
+		packets[pn] = p
+		hist.SentPacket(pn, p)
+	}
+	for pn := range protocol.PacketNumber(4) {
+		send(pn)
+	}
+	for _, p := range packets {
+		require.Equal(t, protocol.InvalidPacketNumber, p.precedingAcked)
+	}
+
+	// packet 1 is acknowledged: it precedes packet 2
+	require.NoError(t, hist.Remove(1))
+	require.Equal(t, protocol.InvalidPacketNumber, packets[0].precedingAcked)
+	require.Equal(t, protocol.PacketNumber(1), packets[2].precedingAcked)
+	require.Equal(t, protocol.InvalidPacketNumber, packets[3].precedingAcked)
+
+	// Packet 2 is declared lost: packet 1 now precedes packet 3.
+	require.NoError(t, hist.Remove(0))
+	hist.DeclareLost(2)
+	require.Equal(t, protocol.PacketNumber(1), packets[3].precedingAcked)
+	require.Equal(t, []protocol.PacketNumber{3}, hist.getPacketNumbers())
+
+	// The last packet is acknowledged: it precedes the next packet sent.
+	// Skipped packet numbers don't change that.
+	require.NoError(t, hist.Remove(3))
+	require.Empty(t, hist.getPacketNumbers())
+	hist.SkippedPacket(4)
+	send(5)
+	require.Equal(t, protocol.PacketNumber(3), packets[5].precedingAcked)
+	send(6)
+	require.Equal(t, protocol.InvalidPacketNumber, packets[6].precedingAcked)
+
+	// packets acknowledged out of order: the precedingAcked value is the largest one
+	send(7)
+	send(8)
+	send(9)
+	require.NoError(t, hist.Remove(8))
+	require.NoError(t, hist.Remove(7))
+	require.Equal(t, protocol.PacketNumber(8), packets[9].precedingAcked)
+	require.Equal(t, protocol.InvalidPacketNumber, packets[6].precedingAcked)
+
+	// declaring a packet lost that doesn't follow an acknowledged packet doesn't change the next packet
+	send(10)
+	send(11)
+	hist.DeclareLost(10)
+	require.Equal(t, protocol.InvalidPacketNumber, packets[11].precedingAcked)
+	// packet 9 follows packet 8, which was acknowledged
+	hist.DeclareLost(9)
+	require.Equal(t, protocol.PacketNumber(8), packets[11].precedingAcked)
+	hist.DeclareLost(5)
+	hist.DeclareLost(6)
+	hist.DeclareLost(11)
+	require.Empty(t, hist.getPacketNumbers())
+	send(12)
+	require.Equal(t, protocol.PacketNumber(8), packets[12].precedingAcked)
+
+	// path probe packets take the value as well
+	require.NoError(t, hist.Remove(12))
+	hist.SentPathProbePacket(13, ackElicitingPacket())
+	send(14)
+	require.Equal(t, protocol.InvalidPacketNumber, packets[14].precedingAcked)
+	for pn, p := range hist.Packets() {
+		if pn == 13 {
+			require.True(t, p.isPathProbePacket)
+			require.Equal(t, protocol.PacketNumber(12), p.precedingAcked)
+		}
+	}
+	// ... and pass it on when they are declared lost
+	hist.DeclareLost(13)
+	require.Equal(t, protocol.PacketNumber(12), packets[14].precedingAcked)
+}
+
+func TestSentPacketHistoryDeclareProbed(t *testing.T) {
+	hist := newSentPacketHistory(true)
+	p0 := ackElicitingPacket()
+	hist.SentPacket(0, p0)
+	hist.SentPacket(1, ackElicitingPacket())
+	require.Equal(t, 2, hist.NumOutstanding())
+
+	hist.DeclareProbed(0)
+	require.True(t, p0.probed)
+	require.False(t, p0.Outstanding())
+	require.Equal(t, 1, hist.NumOutstanding())
+	// the packet stays in the history
+	require.Equal(t, []protocol.PacketNumber{0, 1}, hist.getPacketNumbers())
+	pn, _ := hist.FirstOutstanding()
+	require.Equal(t, protocol.PacketNumber(1), pn)
+
+	// declaring it lost doesn't change the number of outstanding packets
+	hist.DeclareLost(0)
+	require.Equal(t, 1, hist.NumOutstanding())
+	require.Equal(t, []protocol.PacketNumber{1}, hist.getPacketNumbers())
+
+	// neither does removing a probed packet
+	hist.DeclareProbed(1)
+	require.Zero(t, hist.NumOutstanding())
+	require.NoError(t, hist.Remove(1))
+	require.Zero(t, hist.NumOutstanding())
+	require.False(t, hist.HasOutstandingPackets())
 }

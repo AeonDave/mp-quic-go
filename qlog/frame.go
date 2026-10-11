@@ -52,6 +52,24 @@ type (
 	AckFrequencyFrame = wire.AckFrequencyFrame
 	// An ImmediateAckFrame is an IMMEDIATE_ACK frame.
 	ImmediateAckFrame = wire.ImmediateAckFrame
+	// A PathAbandonFrame is a PATH_ABANDON frame.
+	PathAbandonFrame = wire.PathAbandonFrame
+	// A PathStatusFrame is a PATH_STATUS_BACKUP or a PATH_STATUS_AVAILABLE frame.
+	PathStatusFrame = wire.PathStatusFrame
+	// A PathNewConnectionIDFrame is a PATH_NEW_CONNECTION_ID frame.
+	PathNewConnectionIDFrame = wire.PathNewConnectionIDFrame
+	// A PathRetireConnectionIDFrame is a PATH_RETIRE_CONNECTION_ID frame.
+	PathRetireConnectionIDFrame = wire.PathRetireConnectionIDFrame
+	// A MaxPathIDFrame is a MAX_PATH_ID frame.
+	MaxPathIDFrame = wire.MaxPathIDFrame
+	// A PathsBlockedFrame is a PATHS_BLOCKED frame.
+	PathsBlockedFrame = wire.PathsBlockedFrame
+	// A PathCIDsBlockedFrame is a PATH_CIDS_BLOCKED frame.
+	PathCIDsBlockedFrame = wire.PathCIDsBlockedFrame
+	// An AddAddressFrame is an ADD_ADDRESS frame of the address advertisement extension of this module.
+	AddAddressFrame = wire.AddAddressFrame
+	// An ObservedAddressFrame is an OBSERVED_ADDRESS frame of QUIC Address Discovery.
+	ObservedAddressFrame = wire.ObservedAddressFrame
 )
 
 type AckRange = wire.AckRange
@@ -73,6 +91,12 @@ type StreamFrame struct {
 // A DatagramFrame is a DATAGRAM frame.
 type DatagramFrame struct {
 	Length int64
+}
+
+// An UnknownFrame is a frame without a qlog definition,
+// for example a frame of a private extension, or a frame sent using Conn.QueueRawFrame.
+type UnknownFrame struct {
+	FrameType uint64
 }
 
 func (fs frames) encode(enc *jsontext.Encoder) error {
@@ -133,6 +157,26 @@ func (f Frame) Encode(enc *jsontext.Encoder) error {
 		return encodeAckFrequencyFrame(enc, frame)
 	case *ImmediateAckFrame:
 		return encodeImmediateAckFrame(enc, frame)
+	case *PathAbandonFrame:
+		return encodePathAbandonFrame(enc, frame)
+	case *PathStatusFrame:
+		return encodePathStatusFrame(enc, frame)
+	case *PathNewConnectionIDFrame:
+		return encodePathNewConnectionIDFrame(enc, frame)
+	case *PathRetireConnectionIDFrame:
+		return encodePathRetireConnectionIDFrame(enc, frame)
+	case *MaxPathIDFrame:
+		return encodeMaxPathIDFrame(enc, frame)
+	case *PathsBlockedFrame:
+		return encodePathsBlockedFrame(enc, frame)
+	case *PathCIDsBlockedFrame:
+		return encodePathCIDsBlockedFrame(enc, frame)
+	case *AddAddressFrame:
+		return encodeAddAddressFrame(enc, frame)
+	case *ObservedAddressFrame:
+		return encodeObservedAddressFrame(enc, frame)
+	case *UnknownFrame:
+		return encodeUnknownFrame(enc, frame)
 	default:
 		panic("unknown frame type")
 	}
@@ -178,7 +222,13 @@ func encodeAckFrame(enc *jsontext.Encoder, f *AckFrame) error {
 	h := encoderHelper{enc: enc}
 	h.WriteToken(jsontext.BeginObject)
 	h.WriteToken(jsontext.String("frame_type"))
-	h.WriteToken(jsontext.String("ack"))
+	if f.HasPathID {
+		h.WriteToken(jsontext.String("path_ack"))
+		h.WriteToken(jsontext.String("path_id"))
+		h.WriteToken(jsontext.Uint(uint64(f.PathID)))
+	} else {
+		h.WriteToken(jsontext.String("ack"))
+	}
 	if f.DelayTime > 0 {
 		h.WriteToken(jsontext.String("ack_delay"))
 		h.WriteToken(jsontext.Float(milliseconds(f.DelayTime)))
@@ -418,7 +468,12 @@ func encodeConnectionCloseFrame(enc *jsontext.Encoder, f *ConnectionCloseFrame) 
 		errorSpace = "application"
 	}
 	h.WriteToken(jsontext.String(errorSpace))
-	errName := transportError(f.ErrorCode).String()
+	// Application error codes are defined by the application.
+	// They don't have the names of the transport error codes with the same value.
+	var errName string
+	if !f.IsApplicationError {
+		errName = transportError(f.ErrorCode).String()
+	}
 	if len(errName) > 0 {
 		h.WriteToken(jsontext.String("error_code"))
 		h.WriteToken(jsontext.String(errName))
@@ -476,6 +531,160 @@ func encodeImmediateAckFrame(enc *jsontext.Encoder, _ *ImmediateAckFrame) error 
 	h.WriteToken(jsontext.BeginObject)
 	h.WriteToken(jsontext.String("frame_type"))
 	h.WriteToken(jsontext.String("immediate_ack"))
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
+func encodePathAbandonFrame(enc *jsontext.Encoder, f *PathAbandonFrame) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("frame_type"))
+	h.WriteToken(jsontext.String("path_abandon"))
+	h.WriteToken(jsontext.String("path_id"))
+	h.WriteToken(jsontext.Uint(uint64(f.PathID)))
+	h.WriteToken(jsontext.String("error_code"))
+	if errName := transportError(f.ErrorCode).String(); len(errName) > 0 {
+		h.WriteToken(jsontext.String(errName))
+	} else {
+		h.WriteToken(jsontext.Uint(uint64(f.ErrorCode)))
+	}
+	h.WriteToken(jsontext.String("raw_error_code"))
+	h.WriteToken(jsontext.Uint(uint64(f.ErrorCode)))
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
+func encodePathStatusFrame(enc *jsontext.Encoder, f *PathStatusFrame) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("frame_type"))
+	if f.Backup {
+		h.WriteToken(jsontext.String("path_status_backup"))
+	} else {
+		h.WriteToken(jsontext.String("path_status_available"))
+	}
+	h.WriteToken(jsontext.String("path_id"))
+	h.WriteToken(jsontext.Uint(uint64(f.PathID)))
+	h.WriteToken(jsontext.String("path_status_sequence_number"))
+	h.WriteToken(jsontext.Uint(f.SequenceNumber))
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
+func encodePathNewConnectionIDFrame(enc *jsontext.Encoder, f *PathNewConnectionIDFrame) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("frame_type"))
+	h.WriteToken(jsontext.String("path_new_connection_id"))
+	h.WriteToken(jsontext.String("path_id"))
+	h.WriteToken(jsontext.Uint(uint64(f.PathID)))
+	h.WriteToken(jsontext.String("sequence_number"))
+	h.WriteToken(jsontext.Uint(f.SequenceNumber))
+	h.WriteToken(jsontext.String("retire_prior_to"))
+	h.WriteToken(jsontext.Uint(f.RetirePriorTo))
+	h.WriteToken(jsontext.String("length"))
+	h.WriteToken(jsontext.Int(int64(f.ConnectionID.Len())))
+	h.WriteToken(jsontext.String("connection_id"))
+	h.WriteToken(jsontext.String(f.ConnectionID.String()))
+	h.WriteToken(jsontext.String("stateless_reset_token"))
+	h.WriteToken(jsontext.String(hex.EncodeToString(f.StatelessResetToken[:])))
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
+func encodePathRetireConnectionIDFrame(enc *jsontext.Encoder, f *PathRetireConnectionIDFrame) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("frame_type"))
+	h.WriteToken(jsontext.String("path_retire_connection_id"))
+	h.WriteToken(jsontext.String("path_id"))
+	h.WriteToken(jsontext.Uint(uint64(f.PathID)))
+	h.WriteToken(jsontext.String("sequence_number"))
+	h.WriteToken(jsontext.Uint(f.SequenceNumber))
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
+func encodeMaxPathIDFrame(enc *jsontext.Encoder, f *MaxPathIDFrame) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("frame_type"))
+	h.WriteToken(jsontext.String("max_path_id"))
+	h.WriteToken(jsontext.String("maximum_path_id"))
+	h.WriteToken(jsontext.Uint(uint64(f.MaximumPathID)))
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
+func encodePathsBlockedFrame(enc *jsontext.Encoder, f *PathsBlockedFrame) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("frame_type"))
+	h.WriteToken(jsontext.String("paths_blocked"))
+	h.WriteToken(jsontext.String("maximum_path_id"))
+	h.WriteToken(jsontext.Uint(uint64(f.MaximumPathID)))
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
+func encodePathCIDsBlockedFrame(enc *jsontext.Encoder, f *PathCIDsBlockedFrame) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("frame_type"))
+	h.WriteToken(jsontext.String("path_cids_blocked"))
+	h.WriteToken(jsontext.String("path_id"))
+	h.WriteToken(jsontext.Uint(uint64(f.PathID)))
+	h.WriteToken(jsontext.String("next_sequence_number"))
+	h.WriteToken(jsontext.Uint(f.NextSequenceNumber))
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
+// encodeAddAddressFrame encodes an ADD_ADDRESS frame.
+// qlog doesn't define this frame. It is logged with the names of its fields.
+func encodeAddAddressFrame(enc *jsontext.Encoder, f *AddAddressFrame) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("frame_type"))
+	h.WriteToken(jsontext.String("add_address"))
+	h.WriteToken(jsontext.String("address_id"))
+	h.WriteToken(jsontext.Uint(f.AddressID))
+	h.WriteToken(jsontext.String("sequence_number"))
+	h.WriteToken(jsontext.Uint(f.SequenceNumber))
+	h.WriteToken(jsontext.String("ip_version"))
+	h.WriteToken(jsontext.Uint(uint64(f.IPVersion)))
+	h.WriteToken(jsontext.String("ip"))
+	h.WriteToken(jsontext.String(f.GetIPAddress().String()))
+	h.WriteToken(jsontext.String("port"))
+	h.WriteToken(jsontext.Uint(uint64(f.Port)))
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
+// encodeObservedAddressFrame encodes an OBSERVED_ADDRESS frame (draft-ietf-quic-address-discovery-01).
+// qlog doesn't define this frame. It is logged with the names of its fields.
+func encodeObservedAddressFrame(enc *jsontext.Encoder, f *ObservedAddressFrame) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("frame_type"))
+	h.WriteToken(jsontext.String("observed_address"))
+	h.WriteToken(jsontext.String("sequence_number"))
+	h.WriteToken(jsontext.Uint(f.SequenceNumber))
+	h.WriteToken(jsontext.String("ip"))
+	h.WriteToken(jsontext.String(f.Address.Addr().String()))
+	h.WriteToken(jsontext.String("port"))
+	h.WriteToken(jsontext.Uint(uint64(f.Address.Port())))
+	h.WriteToken(jsontext.EndObject)
+	return h.err
+}
+
+func encodeUnknownFrame(enc *jsontext.Encoder, f *UnknownFrame) error {
+	h := encoderHelper{enc: enc}
+	h.WriteToken(jsontext.BeginObject)
+	h.WriteToken(jsontext.String("frame_type"))
+	h.WriteToken(jsontext.String("unknown"))
+	h.WriteToken(jsontext.String("frame_type_bytes"))
+	h.WriteToken(jsontext.Uint(f.FrameType))
 	h.WriteToken(jsontext.EndObject)
 	return h.err
 }

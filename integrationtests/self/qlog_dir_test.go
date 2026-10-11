@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AeonDave/mp-quic-go"
+	quic "github.com/AeonDave/mp-quic-go"
 	"github.com/AeonDave/mp-quic-go/qlog"
 
 	"github.com/stretchr/testify/require"
@@ -50,9 +50,7 @@ func TestQlogDirEnvironmentVariable(t *testing.T) {
 	server.Close()
 	<-serverStopped
 
-	_, err = os.Stat(qlogDir)
-	qlogDirCreated := !os.IsNotExist(err)
-	require.True(t, qlogDirCreated)
+	require.DirExists(t, qlogDir)
 
 	childs, err := os.ReadDir(qlogDir)
 	require.NoError(t, err)
@@ -70,6 +68,5 @@ func TestQlogDirEnvironmentVariable(t *testing.T) {
 	}
 
 	require.Equal(t, odcids[0], odcids[1])
-	require.Contains(t, vantagePoints, "client")
-	require.Contains(t, vantagePoints, "server")
+	require.ElementsMatch(t, []string{"client", "server"}, vantagePoints)
 }

@@ -69,10 +69,21 @@ const (
 	AEADLimitReached = qerr.AEADLimitReached
 	// NoViablePathError is the NO_VIABLE_PATH_ERROR transport error code.
 	NoViablePathError = qerr.NoViablePathError
+	// VersionNegotiationErrorCode is the VERSION_NEGOTIATION_ERROR transport error code (RFC 9368).
+	VersionNegotiationErrorCode = qerr.VersionNegotiationErrorCode
+	// ApplicationAbandonPath is the APPLICATION_ABANDON_PATH error code of the multipath extension.
+	ApplicationAbandonPath = qerr.ApplicationAbandonPath
+	// PathResourceLimitReached is the PATH_RESOURCE_LIMIT_REACHED error code of the multipath extension.
+	PathResourceLimitReached = qerr.PathResourceLimitReached
+	// PathUnstableOrPoor is the PATH_UNSTABLE_OR_POOR error code of the multipath extension.
+	PathUnstableOrPoor = qerr.PathUnstableOrPoor
+	// NoCIDAvailableForPath is the NO_CID_AVAILABLE_FOR_PATH error code of the multipath extension.
+	NoCIDAvailableForPath = qerr.NoCIDAvailableForPath
 )
 
 // A StreamError is used to signal stream cancellations.
-// It is returned from the Read and Write methods of the [ReceiveStream], [SendStream] and [Stream].
+// It can be returned by stream methods such as [ReceiveStream.Read], [SendStream.Write],
+// [Stream.Read], and [Stream.Write].
 type StreamError struct {
 	StreamID  StreamID
 	ErrorCode StreamErrorCode
@@ -92,7 +103,7 @@ func (e *StreamError) Error() string {
 	return fmt.Sprintf("stream %d canceled by %s with error code %d", e.StreamID, pers, e.ErrorCode)
 }
 
-// DatagramTooLargeError is returned from Conn.SendDatagram if the payload is too large to be sent.
+// DatagramTooLargeError is returned from [Conn.SendDatagram] if the payload is too large to be sent.
 type DatagramTooLargeError struct {
 	MaxDatagramPayloadSize int64
 }

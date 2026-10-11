@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/AeonDave/mp-quic-go"
+	quic "github.com/AeonDave/mp-quic-go"
 	"github.com/AeonDave/mp-quic-go/http3/qlog"
 	"github.com/AeonDave/mp-quic-go/testutils/events"
 
@@ -97,13 +97,14 @@ func newTestResponseWriter(t *testing.T) *testResponseWriter {
 
 func TestResponseWriterInvalidStatus(t *testing.T) {
 	rw := newTestResponseWriter(t)
-	require.Panics(t, func() { rw.WriteHeader(99) })
-	require.Panics(t, func() { rw.WriteHeader(1000) })
+	require.PanicsWithValue(t, "invalid WriteHeader code 99", func() { rw.WriteHeader(99) })
+	require.PanicsWithValue(t, "invalid WriteHeader code 1000", func() { rw.WriteHeader(1000) })
 }
 
 func TestResponseWriterHeader(t *testing.T) {
 	rw := newTestResponseWriter(t)
 	rw.Header().Add("Content-Length", "42")
+	rw.Header().Set("Priority", "u=0")
 	rw.WriteHeader(http.StatusTeapot) // 418
 	// repeated WriteHeader calls are ignored
 	rw.WriteHeader(http.StatusInternalServerError)
@@ -117,6 +118,7 @@ func TestResponseWriterHeader(t *testing.T) {
 	fields := rw.DecodeHeaders(t, 0)
 	require.Equal(t, []string{"418"}, fields[":status"])
 	require.Equal(t, []string{"42"}, fields["content-length"])
+	require.Equal(t, []string{"u=0"}, fields["priority"])
 	require.Equal(t,
 		[]string{"foo=bar", `baz="lorem ipsum"`},
 		fields["set-cookie"],
@@ -204,7 +206,7 @@ func TestResponseWriterEarlyHints(t *testing.T) {
 
 	// Early Hints must have been received
 	fields := rw.DecodeHeaders(t, 0)
-	require.Equal(t, 2, len(fields))
+	require.Len(t, fields, 2)
 	require.Equal(t, []string{"103"}, fields[":status"])
 	require.Equal(t,
 		[]string{"</style.css>; rel=preload; as=style", "</script.js>; rel=preload; as=script"},
@@ -213,7 +215,7 @@ func TestResponseWriterEarlyHints(t *testing.T) {
 
 	// headers sent in the informational response must also be included in the final response
 	fields = rw.DecodeHeaders(t, 1)
-	require.Equal(t, 4, len(fields))
+	require.Len(t, fields, 4)
 	require.Equal(t, []string{"200"}, fields[":status"])
 	require.Contains(t, fields, "date")
 	require.Contains(t, fields, "content-type")

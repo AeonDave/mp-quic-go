@@ -186,3 +186,31 @@ func TestAppDataReceivedPacketTrackerIgnoreBelow(t *testing.T) {
 		"receivedPacketTracker BUG: ReceivedPacket called for old / duplicate packet 4",
 	)
 }
+
+// A reordered packet can be received after an ACK frame that acknowledged later packets was sent.
+// If the peer then acknowledges that ACK frame, the reordered packet is deleted from the history,
+// and there's nothing left to acknowledge.
+func TestAppDataReceivedPacketTrackerIgnoreBelowReorderedPacket(t *testing.T) {
+	tr := newAppDataReceivedPacketTracker(utils.DefaultLogger)
+	now := monotime.Now()
+	require.NoError(t, tr.ReceivedPacket(10, protocol.ECNNon, now, true))
+	require.NoError(t, tr.ReceivedPacket(11, protocol.ECNNon, now, true))
+	ack := tr.GetAckFrame(now, true)
+	require.NotNil(t, ack)
+	require.Equal(t, []wire.AckRange{{Smallest: 10, Largest: 11}}, ack.AckRanges)
+
+	// the reordered packet was reported missing, so an ACK is queued
+	require.NoError(t, tr.ReceivedPacket(9, protocol.ECNNon, now, true))
+	// the peer acknowledges the packet that contained the ACK frame
+	tr.IgnoreBelow(12)
+	require.Nil(t, tr.GetAckFrame(now, true))
+	require.Nil(t, tr.GetAckFrame(now.Add(time.Hour), false))
+	require.Zero(t, tr.GetAlarmTimeout())
+
+	// newly received packets are acknowledged
+	require.NoError(t, tr.ReceivedPacket(12, protocol.ECNNon, now, true))
+	require.NoError(t, tr.ReceivedPacket(13, protocol.ECNNon, now, true))
+	ack = tr.GetAckFrame(now, true)
+	require.NotNil(t, ack)
+	require.Equal(t, []wire.AckRange{{Smallest: 12, Largest: 13}}, ack.AckRanges)
+}

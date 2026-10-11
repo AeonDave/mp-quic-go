@@ -40,6 +40,9 @@ func (h *receivedPacketHistory) ReceivedPacket(p protocol.PacketNumber) bool /* 
 	// This is a DoS defense against a peer that sends us too many gaps.
 	if len(h.ranges) > protocol.MaxNumAckRanges {
 		h.ranges = slices.Delete(h.ranges, 0, len(h.ranges)-protocol.MaxNumAckRanges)
+		// Packets below the oldest range kept are not accepted anymore: they might be duplicates of packets
+		// in the deleted ranges (sections 12.3 and 13.2.3 of RFC 9000).
+		h.deletedBelow = max(h.deletedBelow, h.ranges[0].Start)
 	}
 	return isNew
 }

@@ -2,6 +2,7 @@ package quicvarint
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand/v2"
@@ -39,6 +40,38 @@ func TestRead(t *testing.T) {
 	}
 }
 
+func TestReadAndPeekWithError(t *testing.T) {
+	for _, readErr := range []error{io.EOF, errors.New("test error")} {
+		t.Run(readErr.Error(), func(t *testing.T) {
+			for _, expected := range []uint64{0, 37, 1337} {
+				r := &errorReader{Data: Append(nil, expected), Err: readErr}
+				val, err := Peek(r)
+				require.NoError(t, err)
+				require.Equal(t, expected, val)
+				val, err = Read(NewReader(r))
+				require.NoError(t, err)
+				require.Equal(t, expected, val)
+				val, err = Peek(r)
+				require.ErrorIs(t, err, readErr)
+				require.Zero(t, val)
+				val, err = Read(NewReader(r))
+				require.ErrorIs(t, err, readErr)
+				require.Zero(t, val)
+			}
+		})
+
+		t.Run("truncated/"+readErr.Error(), func(t *testing.T) {
+			r := &errorReader{Data: []byte{0x40}, Err: readErr}
+			val, err := Peek(r)
+			require.ErrorIs(t, err, readErr)
+			require.Zero(t, val)
+			val, err = Read(NewReader(r))
+			require.ErrorIs(t, err, readErr)
+			require.Zero(t, val)
+		})
+	}
+}
+
 func TestParse(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -57,7 +90,7 @@ func TestParse(t *testing.T) {
 			value, l, err := Parse(tt.input)
 			require.Equal(t, tt.expectedValue, value)
 			require.Equal(t, tt.expectedLen, l)
-			require.Nil(t, err)
+			require.NoError(t, err)
 		})
 	}
 }
@@ -95,7 +128,7 @@ func TestParsingFailures(t *testing.T) {
 			value, l, err := Parse(tt.input)
 			require.Equal(t, uint64(0), value)
 			require.Equal(t, 0, l)
-			require.Equal(t, tt.expectedErr, err)
+			require.ErrorIs(t, err, tt.expectedErr)
 		})
 	}
 }
@@ -165,19 +198,20 @@ func TestAppendWithLen(t *testing.T) {
 
 func TestAppendWithLenFailures(t *testing.T) {
 	tests := []struct {
-		name   string
-		value  uint64
-		length int
+		name          string
+		value         uint64
+		length        int
+		expectedPanic string
 	}{
-		{"invalid length", 25, 3},
-		{"too short for 2 bytes", maxVarInt1 + 1, 1},
-		{"too short for 4 bytes", maxVarInt2 + 1, 2},
-		{"too short for 8 bytes", maxVarInt4 + 1, 4},
+		{"invalid length", 25, 3, "invalid varint length"},
+		{"too short for 2 bytes", maxVarInt1 + 1, 1, "cannot encode 64 in 1 bytes"},
+		{"too short for 4 bytes", maxVarInt2 + 1, 2, "cannot encode 16384 in 2 bytes"},
+		{"too short for 8 bytes", maxVarInt4 + 1, 4, "cannot encode 1073741824 in 4 bytes"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			require.Panics(t, func() {
+			require.PanicsWithValue(t, tt.expectedPanic, func() {
 				AppendWithLen(nil, tt.value, tt.length)
 			})
 		})

@@ -12,8 +12,10 @@ package mocks
 import (
 	context "context"
 	reflect "reflect"
+	time "time"
 
 	handshake "github.com/AeonDave/mp-quic-go/internal/handshake"
+	monotime "github.com/AeonDave/mp-quic-go/internal/monotime"
 	protocol "github.com/AeonDave/mp-quic-go/internal/protocol"
 	gomock "go.uber.org/mock/gomock"
 )
@@ -186,6 +188,80 @@ func (c *MockCryptoSetupDiscardInitialKeysCall) Do(f func()) *MockCryptoSetupDis
 
 // DoAndReturn rewrite *gomock.Call.DoAndReturn
 func (c *MockCryptoSetupDiscardInitialKeysCall) DoAndReturn(f func()) *MockCryptoSetupDiscardInitialKeysCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}
+
+// DropPath mocks base method.
+func (m *MockCryptoSetup) DropPath(arg0 protocol.PathID) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "DropPath", arg0)
+}
+
+// DropPath indicates an expected call of DropPath.
+func (mr *MockCryptoSetupMockRecorder) DropPath(arg0 any) *MockCryptoSetupDropPathCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DropPath", reflect.TypeOf((*MockCryptoSetup)(nil).DropPath), arg0)
+	return &MockCryptoSetupDropPathCall{Call: call}
+}
+
+// MockCryptoSetupDropPathCall wrap *gomock.Call
+type MockCryptoSetupDropPathCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockCryptoSetupDropPathCall) Return() *MockCryptoSetupDropPathCall {
+	c.Call = c.Call.Return()
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockCryptoSetupDropPathCall) Do(f func(protocol.PathID)) *MockCryptoSetupDropPathCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockCryptoSetupDropPathCall) DoAndReturn(f func(protocol.PathID)) *MockCryptoSetupDropPathCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}
+
+// EnableMultipath mocks base method.
+func (m *MockCryptoSetup) EnableMultipath(maxPTO func() time.Duration) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "EnableMultipath", maxPTO)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// EnableMultipath indicates an expected call of EnableMultipath.
+func (mr *MockCryptoSetupMockRecorder) EnableMultipath(maxPTO any) *MockCryptoSetupEnableMultipathCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "EnableMultipath", reflect.TypeOf((*MockCryptoSetup)(nil).EnableMultipath), maxPTO)
+	return &MockCryptoSetupEnableMultipathCall{Call: call}
+}
+
+// MockCryptoSetupEnableMultipathCall wrap *gomock.Call
+type MockCryptoSetupEnableMultipathCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockCryptoSetupEnableMultipathCall) Return(arg0 error) *MockCryptoSetupEnableMultipathCall {
+	c.Call = c.Call.Return(arg0)
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockCryptoSetupEnableMultipathCall) Do(f func(func() time.Duration) error) *MockCryptoSetupEnableMultipathCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockCryptoSetupEnableMultipathCall) DoAndReturn(f func(func() time.Duration) error) *MockCryptoSetupEnableMultipathCall {
 	c.Call = c.Call.DoAndReturn(f)
 	return c
 }
@@ -425,18 +501,18 @@ func (c *MockCryptoSetupGetHandshakeSealerCall) DoAndReturn(f func() (handshake.
 }
 
 // GetInitialOpener mocks base method.
-func (m *MockCryptoSetup) GetInitialOpener() (handshake.LongHeaderOpener, error) {
+func (m *MockCryptoSetup) GetInitialOpener(v protocol.Version) (handshake.LongHeaderOpener, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "GetInitialOpener")
+	ret := m.ctrl.Call(m, "GetInitialOpener", v)
 	ret0, _ := ret[0].(handshake.LongHeaderOpener)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // GetInitialOpener indicates an expected call of GetInitialOpener.
-func (mr *MockCryptoSetupMockRecorder) GetInitialOpener() *MockCryptoSetupGetInitialOpenerCall {
+func (mr *MockCryptoSetupMockRecorder) GetInitialOpener(v any) *MockCryptoSetupGetInitialOpenerCall {
 	mr.mock.ctrl.T.Helper()
-	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetInitialOpener", reflect.TypeOf((*MockCryptoSetup)(nil).GetInitialOpener))
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetInitialOpener", reflect.TypeOf((*MockCryptoSetup)(nil).GetInitialOpener), v)
 	return &MockCryptoSetupGetInitialOpenerCall{Call: call}
 }
 
@@ -452,13 +528,13 @@ func (c *MockCryptoSetupGetInitialOpenerCall) Return(arg0 handshake.LongHeaderOp
 }
 
 // Do rewrite *gomock.Call.Do
-func (c *MockCryptoSetupGetInitialOpenerCall) Do(f func() (handshake.LongHeaderOpener, error)) *MockCryptoSetupGetInitialOpenerCall {
+func (c *MockCryptoSetupGetInitialOpenerCall) Do(f func(protocol.Version) (handshake.LongHeaderOpener, error)) *MockCryptoSetupGetInitialOpenerCall {
 	c.Call = c.Call.Do(f)
 	return c
 }
 
 // DoAndReturn rewrite *gomock.Call.DoAndReturn
-func (c *MockCryptoSetupGetInitialOpenerCall) DoAndReturn(f func() (handshake.LongHeaderOpener, error)) *MockCryptoSetupGetInitialOpenerCall {
+func (c *MockCryptoSetupGetInitialOpenerCall) DoAndReturn(f func(protocol.Version) (handshake.LongHeaderOpener, error)) *MockCryptoSetupGetInitialOpenerCall {
 	c.Call = c.Call.DoAndReturn(f)
 	return c
 }
@@ -691,6 +767,44 @@ func (c *MockCryptoSetupSetLargest1RTTAckedCall) DoAndReturn(f func(protocol.Pac
 	return c
 }
 
+// SetLargest1RTTAckedForPath mocks base method.
+func (m *MockCryptoSetup) SetLargest1RTTAckedForPath(pathID protocol.PathID, pn protocol.PacketNumber, now monotime.Time) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "SetLargest1RTTAckedForPath", pathID, pn, now)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// SetLargest1RTTAckedForPath indicates an expected call of SetLargest1RTTAckedForPath.
+func (mr *MockCryptoSetupMockRecorder) SetLargest1RTTAckedForPath(pathID, pn, now any) *MockCryptoSetupSetLargest1RTTAckedForPathCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetLargest1RTTAckedForPath", reflect.TypeOf((*MockCryptoSetup)(nil).SetLargest1RTTAckedForPath), pathID, pn, now)
+	return &MockCryptoSetupSetLargest1RTTAckedForPathCall{Call: call}
+}
+
+// MockCryptoSetupSetLargest1RTTAckedForPathCall wrap *gomock.Call
+type MockCryptoSetupSetLargest1RTTAckedForPathCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockCryptoSetupSetLargest1RTTAckedForPathCall) Return(arg0 error) *MockCryptoSetupSetLargest1RTTAckedForPathCall {
+	c.Call = c.Call.Return(arg0)
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockCryptoSetupSetLargest1RTTAckedForPathCall) Do(f func(protocol.PathID, protocol.PacketNumber, monotime.Time) error) *MockCryptoSetupSetLargest1RTTAckedForPathCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockCryptoSetupSetLargest1RTTAckedForPathCall) DoAndReturn(f func(protocol.PathID, protocol.PacketNumber, monotime.Time) error) *MockCryptoSetupSetLargest1RTTAckedForPathCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}
+
 // StartHandshake mocks base method.
 func (m *MockCryptoSetup) StartHandshake(arg0 context.Context) error {
 	m.ctrl.T.Helper()
@@ -725,6 +839,42 @@ func (c *MockCryptoSetupStartHandshakeCall) Do(f func(context.Context) error) *M
 
 // DoAndReturn rewrite *gomock.Call.DoAndReturn
 func (c *MockCryptoSetupStartHandshakeCall) DoAndReturn(f func(context.Context) error) *MockCryptoSetupStartHandshakeCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}
+
+// SwitchVersion mocks base method.
+func (m *MockCryptoSetup) SwitchVersion(arg0 protocol.Version) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "SwitchVersion", arg0)
+}
+
+// SwitchVersion indicates an expected call of SwitchVersion.
+func (mr *MockCryptoSetupMockRecorder) SwitchVersion(arg0 any) *MockCryptoSetupSwitchVersionCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SwitchVersion", reflect.TypeOf((*MockCryptoSetup)(nil).SwitchVersion), arg0)
+	return &MockCryptoSetupSwitchVersionCall{Call: call}
+}
+
+// MockCryptoSetupSwitchVersionCall wrap *gomock.Call
+type MockCryptoSetupSwitchVersionCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockCryptoSetupSwitchVersionCall) Return() *MockCryptoSetupSwitchVersionCall {
+	c.Call = c.Call.Return()
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockCryptoSetupSwitchVersionCall) Do(f func(protocol.Version)) *MockCryptoSetupSwitchVersionCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockCryptoSetupSwitchVersionCall) DoAndReturn(f func(protocol.Version)) *MockCryptoSetupSwitchVersionCall {
 	c.Call = c.Call.DoAndReturn(f)
 	return c
 }

@@ -13,8 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AeonDave/mp-quic-go"
-
+	quic "github.com/AeonDave/mp-quic-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
@@ -100,10 +99,10 @@ func TestRequestValidation(t *testing.T) {
 			name: "invalid header value",
 			req: func() *http.Request {
 				r := httptest.NewRequest(http.MethodGet, "https://www.example.org/", nil)
-				r.Header.Add("foo", string([]byte{0x7}))
+				r.Header.Add("Authorization", "Bearer secret\x00")
 				return r
 			}(),
-			expectedErrContains: "http3: invalid http header field value",
+			expectedErr: `http3: invalid http header field value for key "Authorization"`,
 		},
 		{
 			name: "invalid method",
@@ -122,8 +121,7 @@ func TestRequestValidation(t *testing.T) {
 				require.EqualError(t, err, tt.expectedErr)
 			}
 			if tt.expectedErrContains != "" {
-				require.Error(t, err)
-				require.Contains(t, err.Error(), tt.expectedErrContains)
+				require.ErrorContains(t, err, tt.expectedErrContains)
 			}
 			require.True(t, tt.req.Body.(*mockBody).closed)
 		})
@@ -215,6 +213,26 @@ func TestTransportMultipleQUICVersions(t *testing.T) {
 	require.EqualError(t, err, "can only use a single QUIC version for dialing a HTTP/3 connection")
 }
 
+// The peer needs to be able to open at least 3 unidirectional streams (section 6.2 of RFC 9114).
+func TestTransportQUICConfigUniStreams(t *testing.T) {
+	for _, n := range []int64{-1, 1, 2} {
+		tr := &Transport{QUICConfig: &quic.Config{MaxIncomingUniStreams: n}}
+		req := httptest.NewRequest(http.MethodGet, "https://example.com", nil)
+		_, err := tr.RoundTrip(req)
+		require.EqualError(t, err, "http3: QUIC Config.MaxIncomingUniStreams must allow at least 3 unidirectional streams")
+	}
+
+	s := &Server{
+		TLSConfig:  &tls.Config{},
+		QUICConfig: &quic.Config{MaxIncomingUniStreams: 2},
+	}
+	_, err := s.setupListenerForConn(&tls.Config{}, nil)
+	require.EqualError(t, err, "http3: QUIC Config.MaxIncomingUniStreams must allow at least 3 unidirectional streams")
+
+	require.NoError(t, checkUniStreams(&quic.Config{}))
+	require.NoError(t, checkUniStreams(&quic.Config{MaxIncomingUniStreams: 3}))
+}
+
 func TestTransportConnectionReuse(t *testing.T) {
 	conn, _ := newConnPair(t)
 	mockCtrl := gomock.NewController(t)
@@ -238,7 +256,7 @@ func TestTransportConnectionReuse(t *testing.T) {
 	cl.EXPECT().RoundTrip(req1).Return(&http.Response{Request: req1}, nil)
 	rsp, err := tr.RoundTrip(req1)
 	require.NoError(t, err)
-	require.Equal(t, req1, rsp.Request)
+	require.Same(t, req1, rsp.Request)
 	require.Equal(t, 1, dialCount)
 
 	// ... which is then used for the second request
@@ -246,7 +264,7 @@ func TestTransportConnectionReuse(t *testing.T) {
 	cl.EXPECT().RoundTrip(req2).Return(&http.Response{Request: req2}, nil)
 	rsp, err = tr.RoundTrip(req2)
 	require.NoError(t, err)
-	require.Equal(t, req2, rsp.Request)
+	require.Same(t, req2, rsp.Request)
 	require.Equal(t, 1, dialCount)
 }
 
@@ -366,7 +384,7 @@ func TestTransportRequestContextCancellation(t *testing.T) {
 	cl.EXPECT().RoundTrip(req1).Return(&http.Response{Request: req1}, nil)
 	rsp, err := tr.RoundTrip(req1)
 	require.NoError(t, err)
-	require.Equal(t, req1, rsp.Request)
+	require.Same(t, req1, rsp.Request)
 	require.Equal(t, 1, dialCount)
 
 	// the second request reuses the QUIC connection, and runs into the cancelled context
@@ -388,7 +406,7 @@ func TestTransportRequestContextCancellation(t *testing.T) {
 	cl.EXPECT().RoundTrip(req3).Return(&http.Response{Request: req3}, nil)
 	rsp, err = tr.RoundTrip(req3)
 	require.NoError(t, err)
-	require.Equal(t, req3, rsp.Request)
+	require.Same(t, req3, rsp.Request)
 	require.Equal(t, 1, dialCount)
 }
 
@@ -417,7 +435,7 @@ func TestTransportConnetionRedialHandshakeError(t *testing.T) {
 	cl.EXPECT().RoundTrip(req2).Return(&http.Response{Request: req2}, nil)
 	rsp, err := tr.RoundTrip(req2)
 	require.NoError(t, err)
-	require.Equal(t, req2, rsp.Request)
+	require.Same(t, req2, rsp.Request)
 	require.Equal(t, 2, dialCount)
 }
 

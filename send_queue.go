@@ -1,7 +1,6 @@
 package quic
 
 import (
-	"fmt"
 	"net"
 
 	"github.com/AeonDave/mp-quic-go/internal/protocol"
@@ -9,23 +8,21 @@ import (
 
 type sender interface {
 	Send(p *packetBuffer, gsoSize uint16, ecn protocol.ECN)
-	SendProbe(*packetBuffer, net.Addr)
+	// SendOnConn sends a packet using a different sendConn than the one the queue was created with.
+	// It is used for the paths of IETF Multipath QUIC.
+	SendOnConn(p *packetBuffer, gsoSize uint16, ecn protocol.ECN, conn sendConn)
+	SendProbe(*packetBuffer, net.Addr, packetInfo)
 	Run() error
 	WouldBlock() bool
 	Available() <-chan struct{}
 	Close()
 }
 
-type pathSender interface {
-	WritePath(b []byte, gsoSize uint16, ecn protocol.ECN, addr net.Addr, info packetInfo) error
-}
-
 type queueEntry struct {
 	buf     *packetBuffer
 	gsoSize uint16
 	ecn     protocol.ECN
-	addr    net.Addr
-	info    packetInfo
+	conn    sendConn // if nil, the queue's sendConn is used
 }
 
 type sendQueue struct {
@@ -34,15 +31,22 @@ type sendQueue struct {
 	runStopped  chan struct{} // runStopped when the run loop returns
 	available   chan struct{}
 	conn        sendConn
+	// Called when writing a packet passed to SendOnConn fails.
+	// If nil, such errors are handled like errors on the queue's sendConn.
+	onConnError func(sendConn, error)
 }
 
 var _ sender = &sendQueue{}
 
 const sendQueueCapacity = 8
 
-func newSendQueue(conn sendConn) sender {
+// newSendQueue creates a new send queue.
+// Errors when writing to conn stop the queue: they are returned by Run.
+// Errors when writing to another sendConn (see SendOnConn) are passed to onConnError, if set.
+func newSendQueue(conn sendConn, onConnError func(sendConn, error)) sender {
 	return &sendQueue{
 		conn:        conn,
+		onConnError: onConnError,
 		runStopped:  make(chan struct{}),
 		closeCalled: make(chan struct{}),
 		available:   make(chan struct{}, 1),
@@ -54,15 +58,19 @@ func newSendQueue(conn sendConn) sender {
 // Callers need to make sure that there's actually space in the send queue by calling WouldBlock.
 // Otherwise Send will panic.
 func (h *sendQueue) Send(p *packetBuffer, gsoSize uint16, ecn protocol.ECN) {
-	h.SendPath(p, gsoSize, ecn, nil, packetInfo{})
+	h.enqueue(queueEntry{buf: p, gsoSize: gsoSize, ecn: ecn})
 }
 
-// SendPath sends out a packet on a specific path. It's guaranteed to not block.
+// SendOnConn sends out a packet using conn. It's guaranteed to not block.
 // Callers need to make sure that there's actually space in the send queue by calling WouldBlock.
-// Otherwise SendPath will panic.
-func (h *sendQueue) SendPath(p *packetBuffer, gsoSize uint16, ecn protocol.ECN, addr net.Addr, info packetInfo) {
+// Otherwise SendOnConn will panic.
+func (h *sendQueue) SendOnConn(p *packetBuffer, gsoSize uint16, ecn protocol.ECN, conn sendConn) {
+	h.enqueue(queueEntry{buf: p, gsoSize: gsoSize, ecn: ecn, conn: conn})
+}
+
+func (h *sendQueue) enqueue(e queueEntry) {
 	select {
-	case h.queue <- queueEntry{buf: p, gsoSize: gsoSize, ecn: ecn, addr: addr, info: info}:
+	case h.queue <- e:
 		// clear available channel if we've reached capacity
 		if len(h.queue) == sendQueueCapacity {
 			select {
@@ -76,8 +84,8 @@ func (h *sendQueue) SendPath(p *packetBuffer, gsoSize uint16, ecn protocol.ECN, 
 	}
 }
 
-func (h *sendQueue) SendProbe(p *packetBuffer, addr net.Addr) {
-	h.conn.WriteTo(p.Data, addr)
+func (h *sendQueue) SendProbe(p *packetBuffer, addr net.Addr, info packetInfo) {
+	h.conn.WriteTo(p.Data, addr, info)
 }
 
 func (h *sendQueue) WouldBlock() bool {
@@ -102,13 +110,12 @@ func (h *sendQueue) Run() error {
 			shouldClose = true
 		case e := <-h.queue:
 			var err error
-			if e.addr != nil {
-				if ps, ok := h.conn.(pathSender); ok {
-					err = ps.WritePath(e.buf.Data, e.gsoSize, e.ecn, e.addr, e.info)
-				} else if e.gsoSize == 0 && (e.ecn == protocol.ECNNon || e.ecn == protocol.ECNUnsupported) {
-					err = h.conn.WriteTo(e.buf.Data, e.addr)
-				} else {
-					err = fmt.Errorf("sendQueue: path send unsupported")
+			if e.conn != nil {
+				err = e.conn.Write(e.buf.Data, e.gsoSize, e.ecn)
+				// Errors on another sendConn don't stop the queue.
+				if err != nil && !isSendMsgSizeErr(err) && h.onConnError != nil {
+					h.onConnError(e.conn, err)
+					err = nil
 				}
 			} else {
 				err = h.conn.Write(e.buf.Data, e.gsoSize, e.ecn)

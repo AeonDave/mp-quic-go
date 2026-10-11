@@ -1,8 +1,6 @@
 package handshake
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/rand"
 	"crypto/tls"
 	"fmt"
@@ -15,17 +13,13 @@ import (
 
 func getSealerAndOpener(t *testing.T, cs cipherSuite, v protocol.Version) (LongHeaderSealer, LongHeaderOpener) {
 	t.Helper()
-	key := make([]byte, 16)
+	trafficSecret := make([]byte, cs.Hash.Size())
 	hpKey := make([]byte, 16)
-	rand.Read(key)
+	rand.Read(trafficSecret)
 	rand.Read(hpKey)
-	block, err := aes.NewCipher(key)
-	require.NoError(t, err)
-	aead, err := cipher.NewGCM(block)
-	require.NoError(t, err)
-
-	return newLongHeaderSealer(&xorNonceAEAD{aead: aead}, newHeaderProtector(cs, hpKey, true, v)),
-		newLongHeaderOpener(&xorNonceAEAD{aead: aead}, newHeaderProtector(cs, hpKey, true, v))
+	aead := createAEAD(cs, trafficSecret, v)
+	return newLongHeaderSealer(aead, newHeaderProtector(cs, hpKey, true, v)),
+		newLongHeaderOpener(aead, newHeaderProtector(cs, hpKey, true, v))
 }
 
 func TestEncryptAndDecryptMessage(t *testing.T) {
@@ -44,11 +38,11 @@ func TestEncryptAndDecryptMessage(t *testing.T) {
 
 				// incorrect associated data
 				_, err = opener.Open(nil, encrypted, 0x1337, []byte("wrong ad"))
-				require.Equal(t, ErrDecryptionFailed, err)
+				require.ErrorIs(t, err, ErrDecryptionFailed)
 
 				// incorrect packet number
 				_, err = opener.Open(nil, encrypted, 0x42, ad)
-				require.Equal(t, ErrDecryptionFailed, err)
+				require.ErrorIs(t, err, ErrDecryptionFailed)
 			})
 		}
 	}
@@ -87,7 +81,7 @@ func testEncryptAndDecryptHeader(t *testing.T, cs cipherSuite, v protocol.Versio
 	sealer, opener := getSealerAndOpener(t, cs, v)
 	var lastFourBitsDifferent int
 
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		sample := make([]byte, 16)
 		rand.Read(sample)
 		header := []byte{0xb5, 1, 2, 3, 4, 5, 6, 7, 8, 0xde, 0xad, 0xbe, 0xef}

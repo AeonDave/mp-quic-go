@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AeonDave/mp-quic-go"
+	quic "github.com/AeonDave/mp-quic-go"
 	"github.com/AeonDave/mp-quic-go/http3"
 	"github.com/AeonDave/mp-quic-go/integrationtests/tools"
 	"github.com/AeonDave/mp-quic-go/internal/protocol"
@@ -45,7 +45,7 @@ var (
 func GeneratePRData(l int) []byte {
 	res := make([]byte, l)
 	seed := uint64(1)
-	for i := 0; i < l; i++ {
+	for i := range l {
 		seed = seed * 48271 % 2147483647
 		res[i] = byte(seed)
 	}
@@ -55,6 +55,9 @@ func GeneratePRData(l int) []byte {
 var (
 	version    quic.Version
 	enableQlog bool
+	// The endpoints that IETF Multipath QUIC is configured on, set by the -multipath flag:
+	// "both", "client", "server", or "" (none).
+	multipathEndpoints string
 
 	tlsConfig                        *tls.Config
 	tlsConfigLongChain               *tls.Config
@@ -147,6 +150,7 @@ func getQuicConfig(conf *quic.Config) *quic.Config {
 	} else {
 		conf = conf.Clone()
 	}
+	configureMultipath(conf)
 	if !enableQlog {
 		return conf
 	}
@@ -166,6 +170,64 @@ func getQuicConfig(conf *quic.Config) *quic.Config {
 		return &multiplexedTrace{Traces: []qlogwriter.Trace{tr, qlogger}}
 	}
 	return conf
+}
+
+// configureMultipath configures a multipath controller, as requested by the -multipath flag.
+func configureMultipath(conf *quic.Config) {
+	configureMultipathOn(conf, multipathEndpoints)
+}
+
+// configureMultipathOn configures a multipath controller on both endpoints (both), the client or the server.
+// A config is used by clients and servers. Servers use the config returned by GetConfigForClient for a new
+// connection (the default config if it returns nil), so the multipath controller is added (or removed) there
+// for the server side. Tests that use GetConfigForClient therefore set it before calling getQuicConfig.
+func configureMultipathOn(conf *quic.Config, endpoints string) {
+	if endpoints == "" || conf.MultipathController != nil || conf.MultipathControllerFactory != nil {
+		return
+	}
+	factory := func() quic.MultipathController { return quic.NewDefaultMultipathController(nil) }
+	if endpoints != "server" {
+		conf.MultipathControllerFactory = factory
+	}
+	getConfigForClient := conf.GetConfigForClient
+	if endpoints == "both" && getConfigForClient == nil {
+		return
+	}
+	conf.GetConfigForClient = func(info *quic.ClientInfo) (*quic.Config, error) {
+		c := conf
+		if getConfigForClient != nil {
+			var err error
+			c, err = getConfigForClient(info)
+			if err != nil {
+				return nil, err
+			}
+			if c == nil {
+				c = &quic.Config{}
+			}
+		}
+		c = c.Clone()
+		c.GetConfigForClient = nil
+		// a controller configured by the test is kept
+		if c.MultipathController != nil {
+			return c, nil
+		}
+		if endpoints == "client" {
+			c.MultipathControllerFactory = nil
+		} else {
+			c.MultipathControllerFactory = factory
+		}
+		return c, nil
+	}
+}
+
+// multipathConfigured says if IETF Multipath QUIC is configured on both endpoints.
+func multipathConfigured() bool {
+	return multipathEndpoints == "both"
+}
+
+// clientMultipathConfigured says if IETF Multipath QUIC is configured on the client.
+func clientMultipathConfigured() bool {
+	return multipathEndpoints == "both" || multipathEndpoints == "client"
 }
 
 func addTracer(tr *quic.Transport) {
@@ -194,7 +256,18 @@ func TestMain(m *testing.M) {
 	var versionParam string
 	flag.StringVar(&versionParam, "version", "1", "QUIC version")
 	flag.BoolVar(&enableQlog, "qlog", false, "enable qlog")
+	flag.StringVar(&multipathEndpoints, "multipath", "", "configure IETF Multipath QUIC on both endpoints (both), the client or the server")
 	flag.Parse()
+
+	switch multipathEndpoints {
+	case "", "both", "client", "server":
+	default:
+		fmt.Printf("invalid value for -multipath: %s\n", multipathEndpoints)
+		os.Exit(1)
+	}
+	if multipathEndpoints != "" {
+		fmt.Printf("configuring IETF Multipath QUIC on: %s\n", multipathEndpoints)
+	}
 
 	switch versionParam {
 	case "1":
@@ -231,6 +304,7 @@ type packet struct {
 	time   time.Time
 	hdr    qlog.PacketHeader
 	frames []qlog.Frame
+	size   int
 }
 
 type packetCounter struct {
@@ -278,7 +352,7 @@ func (t *packetCounter) getRcvdShortHeaderPackets() []packet {
 		if e.Header.PacketType != qlog.PacketType1RTT {
 			continue
 		}
-		rcvdShortHdr = append(rcvdShortHdr, packet{time: ev.Time, hdr: e.Header, frames: e.Frames})
+		rcvdShortHdr = append(rcvdShortHdr, packet{time: ev.Time, hdr: e.Header, frames: e.Frames, size: e.Raw.Length})
 	}
 	return rcvdShortHdr
 }

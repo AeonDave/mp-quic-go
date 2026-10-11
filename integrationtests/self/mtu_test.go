@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AeonDave/mp-quic-go"
+	quic "github.com/AeonDave/mp-quic-go"
 	quicproxy "github.com/AeonDave/mp-quic-go/integrationtests/tools/proxy"
 	"github.com/AeonDave/mp-quic-go/internal/protocol"
 	"github.com/AeonDave/mp-quic-go/qlog"
@@ -124,7 +124,6 @@ func TestPathMTUDiscovery(t *testing.T) {
 	defer conn.CloseWithError(0, "")
 
 	err = conn.SendDatagram(make([]byte, 2000))
-	require.Error(t, err)
 	var datagramErr *quic.DatagramTooLargeError
 	require.ErrorAs(t, err, &datagramErr)
 	initialMaxDatagramSize := datagramErr.MaxDatagramPayloadSize

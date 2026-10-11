@@ -34,8 +34,26 @@ func TestTransportErrorCodeStringer(t *testing.T) {
 	require.Equal(t, "unknown error code: 0x1337", TransportErrorCode(0x1337).String())
 }
 
+func TestMultipathTransportErrorCodes(t *testing.T) {
+	for _, tc := range []struct {
+		code TransportErrorCode
+		val  uint64
+		str  string
+	}{
+		{ApplicationAbandonPath, 0x3e, "APPLICATION_ABANDON_PATH"},
+		{PathResourceLimitReached, 0x3e75, "PATH_RESOURCE_LIMIT_REACHED"},
+		{PathUnstableOrPoor, 0x3e76, "PATH_UNSTABLE_OR_POOR"},
+		{NoCIDAvailableForPath, 0x3e77, "NO_CID_AVAILABLE_FOR_PATH"},
+	} {
+		require.Equal(t, tc.val, uint64(tc.code))
+		require.Equal(t, tc.str, tc.code.String())
+		require.False(t, tc.code.IsCryptoError())
+		require.Equal(t, tc.str+" (local)", (&TransportError{ErrorCode: tc.code}).Error())
+	}
+}
+
 func TestIsCryptoError(t *testing.T) {
-	for i := 0; i < 0x100; i++ {
+	for i := range 0x100 {
 		require.False(t, TransportErrorCode(i).IsCryptoError())
 	}
 	for i := 0x100; i < 0x200; i++ {
@@ -44,4 +62,11 @@ func TestIsCryptoError(t *testing.T) {
 	for i := 0x200; i < 0x300; i++ {
 		require.False(t, TransportErrorCode(i).IsCryptoError())
 	}
+}
+
+func TestVersionNegotiationErrorCode(t *testing.T) {
+	// section 10.2 of RFC 9368
+	require.Equal(t, uint64(0x11), uint64(VersionNegotiationErrorCode))
+	require.Equal(t, "VERSION_NEGOTIATION_ERROR", VersionNegotiationErrorCode.String())
+	require.False(t, VersionNegotiationErrorCode.IsCryptoError())
 }

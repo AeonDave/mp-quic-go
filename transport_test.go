@@ -5,18 +5,17 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"math"
 	"net"
-	"runtime"
-	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/AeonDave/mp-quic-go/internal/protocol"
 	"github.com/AeonDave/mp-quic-go/internal/qerr"
-	"github.com/AeonDave/mp-quic-go/internal/synctest"
 	"github.com/AeonDave/mp-quic-go/internal/utils"
 	"github.com/AeonDave/mp-quic-go/internal/wire"
 	"github.com/AeonDave/mp-quic-go/qlog"
@@ -146,7 +145,6 @@ func TestTransportAndDialConcurrentClose(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 	_, err := tr.Dial(ctx, server.LocalAddr(), &tls.Config{}, nil)
-	require.Error(t, err)
 	require.ErrorIs(t, err, ErrTransportClosed)
 	require.NotErrorIs(t, err, context.DeadlineExceeded)
 
@@ -227,6 +225,108 @@ func TestTransportStatelessResetReceiving(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timeout")
 	}
+}
+
+// Any datagram ending in a valid stateless reset token is a stateless reset, also if it starts with a long header
+// (section 10.3 of RFC 9000).
+func TestTransportStatelessResetLongHeader(t *testing.T) {
+	tr := &Transport{
+		Conn:               newUDPConnLocalhost(t),
+		ConnectionIDLength: 4,
+	}
+	tr.init(true)
+	defer tr.Close()
+
+	token := protocol.StatelessResetToken{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	b := []byte{0xc0, 0x1a, 0x2a, 0x3a, 0x4a} // long header, unknown version
+	b = append(b, 4, 9, 10, 11, 12)           // destination connection ID, unknown to the Transport
+	b = append(b, 0)                          // empty source connection ID
+	b = append(b, make([]byte, 20)...)
+	b = append(b, token[:]...)
+
+	destroyChan := make(chan error, 1)
+	(*packetHandlerMap)(tr).AddResetToken(token, &mockPacketHandler{destruction: destroyChan})
+
+	conn := newUDPConnLocalhost(t)
+	_, err := conn.WriteTo(b, tr.Conn.LocalAddr())
+	require.NoError(t, err)
+
+	select {
+	case err := <-destroyChan:
+		require.ErrorIs(t, err, &qerr.StatelessResetError{})
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+}
+
+// The stateless reset tokens are not stored in the clear, so that looking them up doesn't leak them through
+// timing (section 10.3.1 of RFC 9000).
+func TestTransportStatelessResetTokenLookup(t *testing.T) {
+	tr := &Transport{
+		Conn:               newUDPConnLocalhost(t),
+		ConnectionIDLength: 4,
+	}
+	tr.init(true)
+	defer tr.Close()
+
+	token1 := protocol.StatelessResetToken{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	token2 := protocol.StatelessResetToken{16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1}
+	conn1 := &mockPacketHandler{}
+	conn2 := &mockPacketHandler{}
+	(*packetHandlerMap)(tr).AddResetToken(token1, conn1)
+	(*packetHandlerMap)(tr).AddResetToken(token2, conn2)
+
+	require.Len(t, tr.resetTokens.m, 2)
+	for k := range tr.resetTokens.m {
+		require.NotEqual(t, [16]byte(token1), k)
+		require.NotEqual(t, [16]byte(token2), k)
+	}
+	h, ok := tr.resetTokens.Get(token1)
+	require.True(t, ok)
+	require.Same(t, conn1, h)
+	h, ok = tr.resetTokens.Get(token2)
+	require.True(t, ok)
+	require.Same(t, conn2, h)
+
+	(*packetHandlerMap)(tr).RemoveResetToken(token1)
+	_, ok = tr.resetTokens.Get(token1)
+	require.False(t, ok)
+	_, ok = tr.resetTokens.Get(token2)
+	require.True(t, ok)
+}
+
+// The connections of a Transport don't share connection IDs (section 10.3.2 of RFC 9000).
+func TestTransportConnIDCollision(t *testing.T) {
+	connID1 := protocol.ParseConnectionID([]byte{1, 1, 1, 1})
+	connID2 := protocol.ParseConnectionID([]byte{2, 2, 2, 2})
+	connID3 := protocol.ParseConnectionID([]byte{3, 3, 3, 3})
+	m := &packetHandlerMap{
+		handlers: map[protocol.ConnectionID]packetHandler{connID1: &mockPacketHandler{}},
+		logger:   utils.DefaultLogger,
+	}
+
+	// a new connection can't use a connection ID of another connection
+	require.False(t, m.AddWithConnID(connID2, connID1, &mockPacketHandler{}))
+	_, ok := m.Get(connID2)
+	require.False(t, ok)
+	require.True(t, m.AddWithConnID(connID2, connID3, &mockPacketHandler{}))
+
+	inUse := func(id protocol.ConnectionID) bool {
+		_, ok := m.Get(id)
+		return ok
+	}
+	connID4 := protocol.ParseConnectionID([]byte{4, 4, 4, 4})
+	gen := &sequenceConnIDGenerator{connIDs: []protocol.ConnectionID{connID1, connID3, connID4}}
+	connID, err := generateUnusedConnID(gen, inUse)
+	require.NoError(t, err)
+	require.Equal(t, connID4, connID)
+
+	gen.connIDs = nil
+	for range maxConnIDGenerationAttempts {
+		gen.connIDs = append(gen.connIDs, connID1)
+	}
+	_, err = generateUnusedConnID(gen, inUse)
+	require.ErrorContains(t, err, "failed to generate an unused connection ID")
 }
 
 func TestTransportStatelessResetSending(t *testing.T) {
@@ -367,7 +467,6 @@ func TestTransportListening(t *testing.T) {
 
 		// only a single listener can be set
 		_, err = tr.Listen(&tls.Config{}, nil)
-		require.Error(t, err)
 		require.ErrorIs(t, err, errListenerAlreadySet)
 
 		require.NoError(t, ln.Close())
@@ -390,7 +489,6 @@ func TestTransportNonQUICPackets(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
 		defer cancel()
 		_, _, err := tr.ReadNonQUICPacket(ctx, make([]byte, 1024))
-		require.Error(t, err)
 		require.ErrorIs(t, err, context.DeadlineExceeded)
 
 		data := []byte{0 /* don't set the QUIC bit */, 1, 2, 3}
@@ -440,7 +538,6 @@ func TestTransportFaultySyscallConn(t *testing.T) {
 
 	tr := &Transport{Conn: syscallconn}
 	_, err := tr.Listen(&tls.Config{}, nil)
-	require.Error(t, err)
 	require.ErrorIs(t, err, assert.AnError)
 }
 
@@ -644,20 +741,23 @@ func TestTransportDialingVersionNegotiation(t *testing.T) {
 }
 
 func TestTransportReplaceWithClosed(t *testing.T) {
-	// synctest works slightly differently on Go 1.24,
-	// so we skip the test
-	if strings.HasPrefix(runtime.Version(), "go1.24") {
-		t.Skip("skipping on Go 1.24 due to synctest issues")
-	}
 	t.Run("local", func(t *testing.T) {
-		testTransportReplaceWithClosed(t, true)
+		testTransportReplaceWithClosed(t, true, false)
 	})
 	t.Run("remote", func(t *testing.T) {
-		testTransportReplaceWithClosed(t, false)
+		testTransportReplaceWithClosed(t, false, false)
+	})
+	// A connection that sent the grease_quic_bit transport parameter (RFC 9287) also handles the packets with the
+	// QUIC Bit set to 0 after it was closed.
+	t.Run("local, greasing the QUIC Bit", func(t *testing.T) {
+		testTransportReplaceWithClosed(t, true, true)
+	})
+	t.Run("remote, greasing the QUIC Bit", func(t *testing.T) {
+		testTransportReplaceWithClosed(t, false, true)
 	})
 }
 
-func testTransportReplaceWithClosed(t *testing.T, local bool) {
+func testTransportReplaceWithClosed(t *testing.T, local, greasing bool) {
 	synctest.Test(t, func(t *testing.T) {
 		clientConn, serverConn, closeFn := newSimnetLink(t, 10*time.Millisecond)
 		defer closeFn()
@@ -677,11 +777,20 @@ func testTransportReplaceWithClosed(t *testing.T, local bool) {
 		}
 
 		const expiry = 50 * time.Millisecond
-		handler := &mockPacketHandler{}
+		var handler packetHandler = &mockPacketHandler{}
+		if greasing {
+			handler = &greasingPacketHandler{accepts: true}
+		}
 		connID := protocol.ParseConnectionID([]byte{4, 3, 2, 1})
 		m := (*packetHandlerMap)(tr)
 		require.True(t, m.Add(connID, handler))
 		m.ReplaceWithClosed([]protocol.ConnectionID{connID}, closePacket, expiry)
+		if greasing {
+			h, ok := m.Get(connID)
+			require.True(t, ok)
+			require.Implements(t, (*greasedQUICBitAcceptor)(nil), h)
+			require.True(t, h.(greasedQUICBitAcceptor).acceptsGreasedQUICBit())
+		}
 
 		p := make([]byte, 100)
 		p[0] = 0x40 // QUIC bit
@@ -702,6 +811,10 @@ func testTransportReplaceWithClosed(t *testing.T, local bool) {
 					errChan <- errors.New("timeout")
 					return
 				case <-ticker.C:
+				}
+				if greasing {
+					// set the QUIC Bit of every other packet to 0
+					p[0] ^= 0x40
 				}
 				if _, err := clientConn.WriteTo(p, tr.Conn.LocalAddr()); err != nil {
 					errChan <- err
@@ -743,4 +856,130 @@ func testTransportReplaceWithClosed(t *testing.T, local bool) {
 		t.Logf("sent %d packets, received %d CONNECTION_CLOSE copies", numSent, received)
 		require.Equal(t, int(math.Ceil(math.Log2(float64(numSent)))), received)
 	})
+}
+
+// greasingPacketHandler is a packet handler of a connection that might accept packets with the QUIC Bit set to 0.
+type greasingPacketHandler struct {
+	mockPacketHandler
+	accepts bool
+}
+
+func (h *greasingPacketHandler) acceptsGreasedQUICBit() bool { return h.accepts }
+
+// Short header packets with the QUIC Bit set to 0 are passed to the connection that their connection ID belongs to,
+// if it sent the grease_quic_bit transport parameter (RFC 9287). All other packets with the QUIC Bit set to 0 are
+// non-QUIC packets.
+func TestTransportGreasedQUICBit(t *testing.T) {
+	tr := &Transport{Conn: newUDPConnLocalhost(t), ConnectionIDLength: 8}
+	tr.init(true)
+	defer tr.Close()
+	// make the Transport queue non-QUIC packets
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _, err := tr.ReadNonQUICPacket(ctx, make([]byte, 100))
+	require.ErrorIs(t, err, context.Canceled)
+
+	greasingConnID := protocol.ParseConnectionID([]byte{1, 2, 3, 4, 5, 6, 7, 8})
+	greasingPackets := make(chan receivedPacket, 10)
+	(*packetHandlerMap)(tr).Add(greasingConnID, &greasingPacketHandler{
+		mockPacketHandler: mockPacketHandler{packets: greasingPackets},
+		accepts:           true,
+	})
+	otherConnID := protocol.ParseConnectionID([]byte{8, 7, 6, 5, 4, 3, 2, 1})
+	otherPackets := make(chan receivedPacket, 10)
+	(*packetHandlerMap)(tr).Add(otherConnID, &greasingPacketHandler{
+		mockPacketHandler: mockPacketHandler{packets: otherPackets},
+		accepts:           false,
+	})
+
+	shortHeaderPacket := func(connID protocol.ConnectionID, quicBit bool) receivedPacket {
+		b, err := wire.AppendShortHeader(nil, connID, 1337, protocol.PacketNumberLen2, protocol.KeyPhaseZero)
+		require.NoError(t, err)
+		if !quicBit {
+			b[0] &^= 0x40
+		}
+		b = append(b, make([]byte, 50)...)
+		return receivedPacket{data: b, buffer: getPacketBuffer(), remoteAddr: &net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 1234}}
+	}
+	expectNonQUICPacket := func(t *testing.T, data []byte) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		b := make([]byte, 1500)
+		n, _, err := tr.ReadNonQUICPacket(ctx, b)
+		require.NoError(t, err)
+		require.Equal(t, data, b[:n])
+	}
+
+	// the QUIC Bit is set
+	p := shortHeaderPacket(greasingConnID, true)
+	tr.handlePacket(p)
+	require.Equal(t, p.data, (<-greasingPackets).data)
+	p = shortHeaderPacket(otherConnID, true)
+	tr.handlePacket(p)
+	require.Equal(t, p.data, (<-otherPackets).data)
+
+	// the QUIC Bit is set to 0
+	p = shortHeaderPacket(greasingConnID, false)
+	tr.handlePacket(p)
+	require.Equal(t, p.data, (<-greasingPackets).data)
+	p = shortHeaderPacket(otherConnID, false)
+	tr.handlePacket(p)
+	expectNonQUICPacket(t, p.data)
+	p = shortHeaderPacket(protocol.ParseConnectionID([]byte{0, 0, 0, 0, 0, 0, 0, 0}), false)
+	tr.handlePacket(p)
+	expectNonQUICPacket(t, p.data)
+	p = receivedPacket{data: []byte{0, 1, 2}, buffer: getPacketBuffer(), remoteAddr: &net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 1234}}
+	tr.handlePacket(p)
+	expectNonQUICPacket(t, p.data)
+
+	require.Empty(t, greasingPackets)
+	require.Empty(t, otherPackets)
+}
+
+// A stateless reset with the QUIC Bit set to 0 closes a connection that sent the grease_quic_bit transport parameter
+// (RFC 9287). For other connections, it is a non-QUIC packet.
+func TestTransportStatelessResetGreasedQUICBit(t *testing.T) {
+	for _, accepts := range []bool{true, false} {
+		t.Run(fmt.Sprintf("greasing: %t", accepts), func(t *testing.T) {
+			tr := &Transport{Conn: newUDPConnLocalhost(t), ConnectionIDLength: 4}
+			tr.init(true)
+			defer tr.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			_, _, err := tr.ReadNonQUICPacket(ctx, make([]byte, 100))
+			require.ErrorIs(t, err, context.Canceled)
+
+			token := protocol.StatelessResetToken{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+			destroyChan := make(chan error, 1)
+			(*packetHandlerMap)(tr).AddResetToken(token, &greasingPacketHandler{
+				mockPacketHandler: mockPacketHandler{destruction: destroyChan},
+				accepts:           accepts,
+			})
+
+			// a connection ID that doesn't exist
+			b, err := wire.AppendShortHeader(nil, protocol.ParseConnectionID([]byte{9, 10, 11, 12}), 1337, 2, protocol.KeyPhaseOne)
+			require.NoError(t, err)
+			b[0] &^= 0x40
+			b = append(b, token[:]...)
+			tr.handlePacket(receivedPacket{data: b, buffer: getPacketBuffer(), remoteAddr: &net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 1234}})
+
+			if accepts {
+				select {
+				case err := <-destroyChan:
+					require.ErrorIs(t, err, &qerr.StatelessResetError{})
+				case <-time.After(time.Second):
+					t.Fatal("timeout")
+				}
+				return
+			}
+			ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			buf := make([]byte, 100)
+			n, _, err := tr.ReadNonQUICPacket(ctx, buf)
+			require.NoError(t, err)
+			require.Equal(t, b, buf[:n])
+			require.Empty(t, destroyChan)
+		})
+	}
 }

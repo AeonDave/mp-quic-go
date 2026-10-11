@@ -35,3 +35,12 @@ func TestDatagramTooLargeError(t *testing.T) {
 	))
 	require.Equal(t, "DATAGRAM frame too large", (&DatagramTooLargeError{MaxDatagramPayloadSize: 1024}).Error())
 }
+
+func TestMultipathTransportErrorCodes(t *testing.T) {
+	require.Equal(t, TransportErrorCode(0x3e), ApplicationAbandonPath)
+	require.Equal(t, TransportErrorCode(0x3e75), PathResourceLimitReached)
+	require.Equal(t, TransportErrorCode(0x3e76), PathUnstableOrPoor)
+	require.Equal(t, TransportErrorCode(0x3e77), NoCIDAvailableForPath)
+	require.Equal(t, "APPLICATION_ABANDON_PATH", ApplicationAbandonPath.String())
+	require.Equal(t, "NO_CID_AVAILABLE_FOR_PATH", NoCIDAvailableForPath.String())
+}

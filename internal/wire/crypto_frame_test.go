@@ -29,7 +29,7 @@ func TestParseCryptoFrameErrorsOnEOFs(t *testing.T) {
 	require.Equal(t, len(data), l)
 	for i := range data {
 		_, _, err := parseCryptoFrame(data[:i], protocol.Version1)
-		require.Equal(t, io.EOF, err)
+		require.ErrorIs(t, err, io.EOF)
 	}
 }
 
@@ -45,7 +45,7 @@ func TestWriteCryptoFrame(t *testing.T) {
 	expected = append(expected, encodeVarInt(6)...)        // length
 	expected = append(expected, []byte("foobar")...)
 	require.Equal(t, expected, b)
-	require.Equal(t, int(f.Length(protocol.Version1)), len(b))
+	require.Len(t, b, int(f.Length(protocol.Version1)))
 }
 
 func TestCryptoFrameMaxDataLength(t *testing.T) {
@@ -77,7 +77,7 @@ func TestCryptoFrameMaxDataLength(t *testing.T) {
 			frameOneByteTooSmallCounter++
 			continue
 		}
-		require.Equal(t, i, len(b))
+		require.Len(t, b, i)
 	}
 	require.Equal(t, 1, frameOneByteTooSmallCounter)
 }

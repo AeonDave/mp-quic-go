@@ -2,6 +2,7 @@ package quic
 
 import (
 	"crypto/rand"
+	"slices"
 	"testing"
 
 	"github.com/AeonDave/mp-quic-go/internal/handshake"
@@ -93,7 +94,7 @@ func testUnpackLongHeaderPacket(t *testing.T,
 ) {
 	mockCtrl := gomock.NewController(t)
 	cs := mocks.NewMockCryptoSetup(mockCtrl)
-	unpacker := newPacketUnpacker(cs, 4)
+	unpacker := newPacketUnpacker(cs, 4, false)
 
 	var packetType protocol.PacketType
 	switch encLevel {
@@ -129,7 +130,7 @@ func testUnpackLongHeaderPacket(t *testing.T,
 	var calls []any
 	switch encLevel {
 	case protocol.EncryptionInitial:
-		calls = append(calls, cs.EXPECT().GetInitialOpener().Return(opener, nil))
+		calls = append(calls, cs.EXPECT().GetInitialOpener(protocol.Version1).Return(opener, nil))
 	case protocol.EncryptionHandshake:
 		calls = append(calls, cs.EXPECT().GetHandshakeOpener().Return(opener, nil))
 	case protocol.Encryption0RTT:
@@ -190,7 +191,7 @@ func testUnpackShortHeaderPacket(t *testing.T, incorrectReservedBits bool, decry
 	mockCtrl := gomock.NewController(t)
 	connID := protocol.ParseConnectionID([]byte{1, 2, 3, 4, 5})
 	cs := mocks.NewMockCryptoSetup(mockCtrl)
-	unpacker := newPacketUnpacker(cs, connID.Len())
+	unpacker := newPacketUnpacker(cs, connID.Len(), false)
 	payload := []byte("Lorem ipsum dolor sit amet")
 
 	hdrRaw, err := wire.AppendShortHeader(
@@ -211,7 +212,7 @@ func testUnpackShortHeaderPacket(t *testing.T, incorrectReservedBits bool, decry
 	opener.EXPECT().Open(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(
 		decryptResult.decrypted, decryptResult.err,
 	)
-	pn, pnLen, kp, data, err := unpacker.UnpackShortHeader(monotime.Now(), append(hdrRaw, payload...))
+	pn, pnLen, kp, data, err := unpacker.UnpackShortHeader(monotime.Now(), append(hdrRaw, payload...), 0)
 	if expectedErr != nil {
 		require.ErrorIs(t, err, expectedErr)
 		return
@@ -223,10 +224,32 @@ func testUnpackShortHeaderPacket(t *testing.T, incorrectReservedBits bool, decry
 	require.Equal(t, protocol.KeyPhaseOne, kp)
 }
 
+// With IETF Multipath QUIC, packet numbers are decoded in the packet number space of the path,
+// and the nonce contains the path ID.
+func TestUnpackShortHeaderPacketForPath(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	connID := protocol.ParseConnectionID([]byte{1, 2, 3, 4, 5})
+	cs := mocks.NewMockCryptoSetup(mockCtrl)
+	unpacker := newPacketUnpacker(cs, connID.Len(), false)
+	hdrRaw, err := wire.AppendShortHeader(nil, connID, 0x1337, protocol.PacketNumberLen2, protocol.KeyPhaseZero)
+	require.NoError(t, err)
+	opener := mocks.NewMockShortHeaderOpener(mockCtrl)
+	opener.EXPECT().DecryptHeader(gomock.Any(), gomock.Any(), gomock.Any())
+	cs.EXPECT().Get1RTTOpener().Return(opener, nil)
+	opener.EXPECT().DecodePacketNumberForPath(protocol.PathID(3), protocol.PacketNumber(0x1337), protocol.PacketNumberLen2).Return(protocol.PacketNumber(0x21337))
+	opener.EXPECT().OpenForPath(gomock.Any(), gomock.Any(), gomock.Any(), protocol.PathID(3), protocol.PacketNumber(0x21337), protocol.KeyPhaseZero, hdrRaw).Return([]byte("decrypted"), nil)
+	pn, pnLen, kp, data, err := unpacker.UnpackShortHeader(monotime.Now(), append(hdrRaw, []byte("Lorem ipsum dolor sit amet")...), 3)
+	require.NoError(t, err)
+	require.Equal(t, protocol.PacketNumber(0x21337), pn)
+	require.Equal(t, protocol.PacketNumberLen2, pnLen)
+	require.Equal(t, protocol.KeyPhaseZero, kp)
+	require.Equal(t, []byte("decrypted"), data)
+}
+
 func TestUnpackLongHeaderWithSample(t *testing.T) {
 	mockCtrl := gomock.NewController(t)
 	cs := mocks.NewMockCryptoSetup(mockCtrl)
-	unpacker := newPacketUnpacker(cs, 4)
+	unpacker := newPacketUnpacker(cs, 4, false)
 
 	extHdr := &wire.ExtendedHeader{
 		Header: wire.Header{
@@ -266,7 +289,7 @@ func TestUnpackLongHeaderWithSample(t *testing.T) {
 func TestUnpackShortHeaderWithSample(t *testing.T) {
 	mockCtrl := gomock.NewController(t)
 	cs := mocks.NewMockCryptoSetup(mockCtrl)
-	unpacker := newPacketUnpacker(cs, 4)
+	unpacker := newPacketUnpacker(cs, 4, false)
 
 	data, err := wire.AppendShortHeader(
 		nil,
@@ -282,7 +305,7 @@ func TestUnpackShortHeaderWithSample(t *testing.T) {
 
 	t.Run("too short", func(t *testing.T) {
 		cs.EXPECT().Get1RTTOpener().Return(mocks.NewMockShortHeaderOpener(mockCtrl), nil)
-		_, _, _, _, err = unpacker.UnpackShortHeader(monotime.Now(), data[:len(data)-1])
+		_, _, _, _, err = unpacker.UnpackShortHeader(monotime.Now(), data[:len(data)-1], 0)
 		require.IsType(t, &headerParseError{}, err)
 		require.ErrorContains(t, err, "packet too small, expected at least 20 bytes after the header, got 19")
 	})
@@ -293,7 +316,7 @@ func TestUnpackShortHeaderWithSample(t *testing.T) {
 		opener.EXPECT().DecryptHeader(data[len(data)-16:], gomock.Any(), gomock.Any())
 		opener.EXPECT().DecodePacketNumber(gomock.Any(), gomock.Any()).Return(protocol.PacketNumber(1337))
 		opener.EXPECT().Open(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return([]byte("decrypted"), nil)
-		_, _, _, _, err = unpacker.UnpackShortHeader(monotime.Now(), data)
+		_, _, _, _, err = unpacker.UnpackShortHeader(monotime.Now(), data, 0)
 		require.NoError(t, err)
 	})
 }
@@ -301,7 +324,7 @@ func TestUnpackShortHeaderWithSample(t *testing.T) {
 func TestUnpackErrors(t *testing.T) {
 	mockCtrl := gomock.NewController(t)
 	cs := mocks.NewMockCryptoSetup(mockCtrl)
-	unpacker := newPacketUnpacker(cs, 4)
+	unpacker := newPacketUnpacker(cs, 4, false)
 
 	// opener not available
 	cs.EXPECT().GetHandshakeOpener().Return(nil, handshake.ErrKeysNotYetAvailable)
@@ -321,7 +344,7 @@ func TestUnpackErrors(t *testing.T) {
 func TestUnpackHeaderDecryption(t *testing.T) {
 	mockCtrl := gomock.NewController(t)
 	cs := mocks.NewMockCryptoSetup(mockCtrl)
-	unpacker := newPacketUnpacker(cs, 4)
+	unpacker := newPacketUnpacker(cs, 4, false)
 	connID := protocol.ParseConnectionID([]byte{0xde, 0xad, 0xbe, 0xef})
 
 	extHdr := &wire.ExtendedHeader{
@@ -370,4 +393,51 @@ func TestUnpackHeaderDecryption(t *testing.T) {
 	packet, err := unpacker.UnpackLongHeader(hdr, data)
 	require.NoError(t, err)
 	require.Equal(t, protocol.PacketNumber(0x7331), packet.hdr.PacketNumber)
+}
+
+// An endpoint that sent the grease_quic_bit transport parameter accepts short header packets with the QUIC Bit set
+// to 0 (section 3 of RFC 9287). The first byte, including the QUIC Bit, is part of the associated data of the AEAD.
+func TestUnpackShortHeaderGreasedQUICBit(t *testing.T) {
+	data, err := wire.AppendShortHeader(
+		nil,
+		protocol.ParseConnectionID([]byte{0xde, 0xad, 0xbe, 0xef}),
+		1337,
+		protocol.PacketNumberLen2,
+		protocol.KeyPhaseZero,
+	)
+	require.NoError(t, err)
+	data[0] &^= 0x40
+	data = append(data, make([]byte, 2+16)...)
+
+	t.Run("accepted", func(t *testing.T) {
+		mockCtrl := gomock.NewController(t)
+		cs := mocks.NewMockCryptoSetup(mockCtrl)
+		unpacker := newPacketUnpacker(cs, 4, true)
+		opener := mocks.NewMockShortHeaderOpener(mockCtrl)
+		cs.EXPECT().Get1RTTOpener().Return(opener, nil)
+		opener.EXPECT().DecryptHeader(gomock.Any(), gomock.Any(), gomock.Any())
+		opener.EXPECT().DecodePacketNumber(gomock.Any(), gomock.Any()).Return(protocol.PacketNumber(1337))
+		opener.EXPECT().Open(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+			func(_, _ []byte, _ monotime.Time, _ protocol.PacketNumber, _ protocol.KeyPhaseBit, ad []byte) ([]byte, error) {
+				require.Zero(t, ad[0]&0x40)
+				return []byte("decrypted"), nil
+			},
+		)
+		pn, _, _, payload, err := unpacker.UnpackShortHeader(monotime.Now(), slices.Clone(data), 0)
+		require.NoError(t, err)
+		require.Equal(t, protocol.PacketNumber(1337), pn)
+		require.Equal(t, []byte("decrypted"), payload)
+	})
+
+	t.Run("rejected", func(t *testing.T) {
+		mockCtrl := gomock.NewController(t)
+		cs := mocks.NewMockCryptoSetup(mockCtrl)
+		unpacker := newPacketUnpacker(cs, 4, false)
+		opener := mocks.NewMockShortHeaderOpener(mockCtrl)
+		cs.EXPECT().Get1RTTOpener().Return(opener, nil)
+		opener.EXPECT().DecryptHeader(gomock.Any(), gomock.Any(), gomock.Any())
+		_, _, _, _, err := unpacker.UnpackShortHeader(monotime.Now(), slices.Clone(data), 0)
+		require.IsType(t, &headerParseError{}, err)
+		require.ErrorContains(t, err, "not a QUIC packet")
+	})
 }

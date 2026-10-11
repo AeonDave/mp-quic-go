@@ -1,12 +1,16 @@
 package quic
 
 import (
+	"bytes"
+	"fmt"
 	"net"
 	"net/netip"
 	"testing"
 
+	"github.com/AeonDave/mp-quic-go/internal/protocol"
 	"github.com/AeonDave/mp-quic-go/internal/wire"
 	"github.com/AeonDave/mp-quic-go/qlog"
+	"github.com/AeonDave/mp-quic-go/qlogwriter/jsontext"
 
 	"github.com/stretchr/testify/require"
 )
@@ -61,6 +65,69 @@ func TestConnectionLoggingAckFrame(t *testing.T) {
 		ECT0:      456,
 		ECT1:      789,
 	}, f.Frame)
+}
+
+func TestConnectionLoggingPathAckFrame(t *testing.T) {
+	ack := &wire.AckFrame{
+		AckRanges: []wire.AckRange{{Smallest: 1, Largest: 3}},
+		DelayTime: 42,
+		ECT0:      456,
+		PathID:    7,
+		HasPathID: true,
+	}
+	f := toQlogFrame(ack)
+	// the frame parser reuses the ACK frame
+	ack.Reset()
+	require.Equal(t, &qlog.AckFrame{
+		AckRanges: []wire.AckRange{{Smallest: 1, Largest: 3}},
+		DelayTime: 42,
+		ECT0:      456,
+		PathID:    7,
+		HasPathID: true,
+	}, f.Frame)
+}
+
+func TestConnectionLoggingMultipathFrames(t *testing.T) {
+	for _, frame := range []wire.Frame{
+		&wire.PathAbandonFrame{PathID: 1, ErrorCode: 0x3e},
+		&wire.PathStatusFrame{PathID: 1, SequenceNumber: 2, Backup: true},
+		&wire.PathStatusFrame{PathID: 1, SequenceNumber: 3},
+		&wire.PathNewConnectionIDFrame{PathID: 1, SequenceNumber: 2, ConnectionID: protocol.ParseConnectionID([]byte{1, 2, 3, 4})},
+		&wire.PathRetireConnectionIDFrame{PathID: 1, SequenceNumber: 2},
+		&wire.MaxPathIDFrame{MaximumPathID: 3},
+		&wire.PathsBlockedFrame{MaximumPathID: 3},
+		&wire.PathCIDsBlockedFrame{PathID: 2, NextSequenceNumber: 1},
+	} {
+		f := toQlogFrame(frame)
+		require.Equal(t, frame, f.Frame)
+		// the frame can be encoded
+		var buf bytes.Buffer
+		require.NoError(t, f.Encode(jsontext.NewEncoder(&buf)))
+		require.Contains(t, buf.String(), `"frame_type":"`)
+	}
+}
+
+// Frames that have no qlog definition are logged as unknown frames.
+func TestConnectionLoggingUnknownFrames(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		frame     wire.Frame
+		frameType uint64
+	}{
+		{
+			name:      "raw frame",
+			frame:     &rawFrame{frameType: 0x1234, data: []byte("foobar"), ackEliciting: true},
+			frameType: 0x1234,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := toQlogFrame(tc.frame)
+			require.Equal(t, &qlog.UnknownFrame{FrameType: tc.frameType}, f.Frame)
+			var buf bytes.Buffer
+			require.NoError(t, f.Encode(jsontext.NewEncoder(&buf)))
+			require.JSONEq(t, fmt.Sprintf(`{"frame_type": "unknown", "frame_type_bytes": %d}`, tc.frameType), buf.String())
+		})
+	}
 }
 
 func TestConnectionLoggingDatagramFrame(t *testing.T) {

@@ -152,6 +152,17 @@ func (m *incomingStreamsMap[T]) GetOrOpenStream(id protocol.StreamID) (T, error)
 	return entry.stream, nil
 }
 
+// getExistingStream returns a stream that the peer opened,
+// or the zero value if the stream wasn't opened, or was already deleted.
+func (m *incomingStreamsMap[T]) getExistingStream(id protocol.StreamID) T {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+	if entry, ok := m.streams[id]; ok && !entry.shouldDelete {
+		return entry.stream
+	}
+	return *new(T)
+}
+
 func (m *incomingStreamsMap[T]) DeleteStream(id protocol.StreamID) error {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()

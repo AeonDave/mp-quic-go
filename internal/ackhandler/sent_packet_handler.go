@@ -3,6 +3,8 @@ package ackhandler
 import (
 	"errors"
 	"fmt"
+	"iter"
+	"slices"
 	"time"
 
 	"github.com/AeonDave/mp-quic-go/internal/congestion"
@@ -27,6 +29,8 @@ const (
 	minRTTAfterRetry = 5 * time.Millisecond
 	// The PTO duration uses exponential backoff, but is truncated to a maximum value, as allowed by RFC 8961, section 4.4.
 	maxPTODuration = 60 * time.Second
+	// The persistent congestion duration, as a multiple of the PTO including max_ack_delay (RFC 9002, section 7.6.1).
+	persistentCongestionThreshold = 3
 )
 
 // Path probe packets are declared lost after this time.
@@ -58,6 +62,49 @@ func newPacketNumberSpace(initialPN protocol.PacketNumber, isAppData bool) *pack
 	}
 }
 
+// A pathRecovery holds the application data packet number space of a path,
+// and the loss recovery and congestion control state that belongs to it.
+//
+// The sentPacketHandler's appData is path 0, the path that the handshake is performed on.
+// Without IETF Multipath QUIC, it is the only path.
+// With IETF Multipath QUIC (see EnableMultipath), every path is recovered independently (RFC 9002 applied per path).
+type pathRecovery struct {
+	id    protocol.PathID
+	space *packetNumberSpace
+
+	lostPackets lostPacketTracker
+
+	rttStats   *utils.RTTStats // for path 0, the RTT stats passed to NewSentPacketHandler
+	congestion congestion.SendAlgorithmWithDebugInfos
+	ecnTracker ecnHandler // nil if ECN is disabled
+
+	// The time when the first RTT sample was taken on this path, zero before.
+	// Only packets sent after it can establish persistent congestion (section 7.6.2 of RFC 9002).
+	firstRTTSampleTime monotime.Time
+
+	// The bytes in flight of the packets sent on this path.
+	// For path 0, this includes Initial and Handshake packets.
+	bytesInFlight protocol.ByteCount
+	// send time of the largest acknowledged packet.
+	// Not used for path 0, see sentPacketHandler.largestAckedTime.
+	largestAckedTime monotime.Time
+
+	// The number of times a PTO has been sent without receiving an ack.
+	// The values of path 0 also apply to the Initial and Handshake packet number space.
+	ptoCount uint32
+	ptoMode  SendMode
+	// The number of PTO probe packets that should be sent.
+	numProbesToSend int
+
+	// The anti-amplification limit of paths other than path 0 (IETF Multipath QUIC).
+	addressValidated         bool
+	bytesSent, bytesReceived protocol.ByteCount
+
+	abandoned bool
+	// Path 0 of an IETF Multipath QUIC connection was removed. Other paths are deleted when they are removed.
+	removed bool
+}
+
 type alarmTimer struct {
 	Time            monotime.Time
 	TimerType       qlog.TimerType
@@ -67,9 +114,18 @@ type alarmTimer struct {
 type sentPacketHandler struct {
 	initialPackets   *packetNumberSpace
 	handshakePackets *packetNumberSpace
-	appDataPackets   map[protocol.PathID]*packetNumberSpace
-	lostPackets      map[protocol.PathID]*lostPacketTracker // only for application-data packet number space
-	// send time of the largest acknowledged packet, across all packet number spaces
+	// The application data state of path 0.
+	// Without IETF Multipath QUIC, this is the state of the connection.
+	appData pathRecovery
+	// All other paths (IETF Multipath QUIC), and their path IDs in ascending order.
+	paths   map[protocol.PathID]*pathRecovery
+	pathIDs []protocol.PathID
+	// Paths that were removed. Path IDs are never reused.
+	removedPaths utils.PathIDSet
+	// Is IETF Multipath QUIC used?
+	multipath bool
+
+	// send time of the largest acknowledged packet, across Initial, Handshake and appData
 	largestAckedTime monotime.Time
 
 	// Do we know that the peer completed address validation yet?
@@ -83,37 +139,30 @@ type sentPacketHandler struct {
 
 	handshakeConfirmed bool
 
-	ignorePacketsBelow func(protocol.PacketNumber)
+	ignorePacketsBelow        func(protocol.PacketNumber)
+	ignorePacketsBelowForPath func(protocol.PathID, protocol.PacketNumber)
 
 	ackedPackets []packetWithPacketNumber // to avoid allocations in detectAndRemoveAckedPackets
 
+	// the bytes in flight of all paths
 	bytesInFlight protocol.ByteCount
 
-	congestion congestion.SendAlgorithmWithDebugInfos
-	rttStats   *utils.RTTStats
-	connStats  *utils.ConnectionStats
-
-	// Per-path congestion control and RTT tracking for multipath
-	pathCongestionControllers map[protocol.PathID]congestion.SendAlgorithmWithDebugInfos
-	pathRTTStats              map[protocol.PathID]*utils.RTTStats
-	pathPacketNumberManager   *PathPacketNumberManager
+	maxDatagramSize        protocol.ByteCount
+	initialMaxDatagramSize protocol.ByteCount
+	rttStats               *utils.RTTStats // the RTT stats of appData
+	connStats              *utils.ConnectionStats
 
 	// Factory for creating per-path congestion controllers
 	// If nil, creates Cubic controllers by default
 	ccFactory func(pathID protocol.PathID, rttStats *utils.RTTStats, initialMaxDatagramSize protocol.ByteCount) congestion.SendAlgorithmWithDebugInfos
 
-	// The number of times a PTO has been sent without receiving an ack.
-	ptoCount uint32
-	ptoMode  SendMode
-	// The number of PTO probe packets that should be sent.
-	// Only applies to the application-data packet number space.
-	numProbesToSend int
-
 	// The alarm timeout
 	alarm alarmTimer
+	// With IETF Multipath QUIC, the path that the alarm is set for.
+	// The timers of the Initial and Handshake packet number spaces belong to path 0.
+	alarmPathID protocol.PathID
 
-	enableECN  bool
-	ecnTracker ecnHandler
+	enableECN bool
 
 	perspective protocol.Perspective
 
@@ -144,7 +193,7 @@ func NewSentPacketHandler(
 	qlogger qlogwriter.Recorder,
 	logger utils.Logger,
 ) SentPacketHandler {
-	cc := congestion.NewCubicSender(
+	congestion := congestion.NewCubicSender(
 		congestion.DefaultClock{},
 		rttStats,
 		connStats,
@@ -158,28 +207,65 @@ func NewSentPacketHandler(
 		peerAddressValidated:           pers == protocol.PerspectiveClient || clientAddressValidated,
 		initialPackets:                 newPacketNumberSpace(initialPN, false),
 		handshakePackets:               newPacketNumberSpace(0, false),
-		appDataPackets: map[protocol.PathID]*packetNumberSpace{
-			protocol.InvalidPathID: newPacketNumberSpace(0, true),
+		appData: pathRecovery{
+			id:          0,
+			space:       newPacketNumberSpace(0, true),
+			lostPackets: *newLostPacketTracker(64),
+			rttStats:    rttStats,
+			congestion:  congestion,
 		},
-		lostPackets: map[protocol.PathID]*lostPacketTracker{
-			protocol.InvalidPathID: newLostPacketTracker(64),
-		},
-		rttStats:                  rttStats,
-		connStats:                 connStats,
-		congestion:                cc,
-		pathCongestionControllers: make(map[protocol.PathID]congestion.SendAlgorithmWithDebugInfos),
-		pathRTTStats:              make(map[protocol.PathID]*utils.RTTStats),
-		pathPacketNumberManager:   NewPathPacketNumberManager(),
-		ignorePacketsBelow:        ignorePacketsBelow,
-		perspective:               pers,
-		qlogger:                   qlogger,
-		logger:                    logger,
+		rttStats:               rttStats,
+		connStats:              connStats,
+		maxDatagramSize:        initialMaxDatagramSize,
+		initialMaxDatagramSize: initialMaxDatagramSize,
+		ignorePacketsBelow:     ignorePacketsBelow,
+		perspective:            pers,
+		qlogger:                qlogger,
+		logger:                 logger,
 	}
 	if enableECN {
 		h.enableECN = true
-		h.ecnTracker = newECNTracker(logger, qlogger)
+		h.appData.ecnTracker = newECNTracker(logger, qlogger)
 	}
 	return h
+}
+
+// EnableMultipath enables IETF Multipath QUIC (draft-ietf-quic-multipath).
+// Every path gets its own packet number space, RTT estimate, congestion controller, ECN validation and PTO state.
+// When a packet containing a PATH_ACK frame for a path (or an ACK frame, for path 0) is acknowledged,
+// ignorePacketsBelow is called for that path.
+// If it is nil, the callback passed to NewSentPacketHandler is used for path 0.
+// It must be called before any path other than path 0 is used.
+// If a congestion control factory is set, path 0 gets a controller created by the factory,
+// which continues with the state of the controller used so far.
+func (h *sentPacketHandler) EnableMultipath(ignorePacketsBelow func(protocol.PathID, protocol.PacketNumber)) {
+	if h.multipath {
+		return
+	}
+	h.multipath = true
+	h.ignorePacketsBelowForPath = ignorePacketsBelow
+	if h.ccFactory != nil {
+		h.replacePath0CongestionController()
+	}
+}
+
+// replacePath0CongestionController replaces the congestion controller of path 0 by a controller created by the
+// congestion control factory. Path 0 was used before, and the response to losses must not be undone
+// (section 7.3.2 of RFC 9002): the new controller continues with the state of the old one.
+// If that's not possible, path 0 keeps its controller.
+func (h *sentPacketHandler) replacePath0CongestionController() {
+	from, ok := h.appData.congestion.(congestion.StateExporter)
+	if !ok {
+		return
+	}
+	cc := h.ccFactory(0, h.rttStats, h.maxDatagramSize)
+	to, ok := cc.(congestion.StateImporter)
+	if !ok {
+		unregisterCongestionController(cc)
+		return
+	}
+	to.TakeOverState(from.State())
+	h.appData.congestion = cc
 }
 
 func (h *sentPacketHandler) SetPacketObserver(o PacketObserver) {
@@ -189,132 +275,241 @@ func (h *sentPacketHandler) SetPacketObserver(o PacketObserver) {
 // SetCongestionControlFactory sets a custom factory for creating per-path congestion controllers.
 // This allows using OLIA or other multipath-aware congestion control algorithms.
 // The factory function receives the pathID, RTT stats, and initial max datagram size.
+// It is used for congestion controllers created after this call.
 func (h *sentPacketHandler) SetCongestionControlFactory(
 	factory func(pathID protocol.PathID, rttStats *utils.RTTStats, initialMaxDatagramSize protocol.ByteCount) congestion.SendAlgorithmWithDebugInfos,
 ) {
 	h.ccFactory = factory
 }
 
-// getOrCreatePathCongestionControl returns the congestion controller for a path.
-// If pathID is invalid, returns the default controller (single-path mode).
-func (h *sentPacketHandler) getOrCreatePathCongestionControl(pathID protocol.PathID) congestion.SendAlgorithmWithDebugInfos {
-	if pathID == protocol.InvalidPathID {
-		return h.congestion
+// path returns the state of a path, or nil if the path doesn't exist.
+func (h *sentPacketHandler) path(pathID protocol.PathID) *pathRecovery {
+	if pathID == 0 {
+		return &h.appData
 	}
-
-	if cc, ok := h.pathCongestionControllers[pathID]; ok {
-		return cc
-	}
-
-	// Create new congestion controller for this path
-	var cc congestion.SendAlgorithmWithDebugInfos
-	rttStats := h.getOrCreatePathRTTStats(pathID)
-
-	if h.ccFactory != nil {
-		// Use custom factory (e.g., for OLIA)
-		cc = h.ccFactory(pathID, rttStats, protocol.InitialPacketSize)
-	} else {
-		// Default to Cubic
-		cc = congestion.NewCubicSender(
-			congestion.DefaultClock{},
-			rttStats,
-			h.connStats,
-			protocol.InitialPacketSize,
-			true, // use Reno
-			h.qlogger,
-		)
-	}
-
-	h.pathCongestionControllers[pathID] = cc
-	return cc
+	return h.paths[pathID]
 }
 
-// getOrCreatePathRTTStats returns the RTT stats for a path.
-// If pathID is invalid, returns the default stats (single-path mode).
-func (h *sentPacketHandler) getOrCreatePathRTTStats(pathID protocol.PathID) *utils.RTTStats {
-	if pathID == protocol.InvalidPathID {
-		return h.rttStats
+// getOrCreatePath returns the state of a path, creating it if it doesn't exist yet.
+// Paths other than path 0 can only be created with IETF Multipath QUIC.
+func (h *sentPacketHandler) getOrCreatePath(pathID protocol.PathID) *pathRecovery {
+	if r := h.path(pathID); r != nil {
+		return r
 	}
-
-	if stats, ok := h.pathRTTStats[pathID]; ok {
-		return stats
+	if !h.multipath {
+		panic(fmt.Sprintf("ackhandler BUG: path %d used without multipath", pathID))
 	}
-
-	// Create new RTT stats for this path, inheriting MaxAckDelay from global stats
-	stats := utils.NewRTTStats()
-	stats.SetMaxAckDelay(h.rttStats.MaxAckDelay())
-	h.pathRTTStats[pathID] = stats
-	return stats
+	if h.removedPaths.Contains(pathID) {
+		// Recreating the path would reuse its packet numbers.
+		panic(fmt.Sprintf("ackhandler BUG: path %d was removed", pathID))
+	}
+	r := &pathRecovery{
+		id:          pathID,
+		space:       newPacketNumberSpace(0, true),
+		lostPackets: *newLostPacketTracker(64),
+		rttStats:    h.newPathRTTStats(),
+		// Only the server needs to validate the client's address.
+		addressValidated: h.perspective == protocol.PerspectiveClient,
+	}
+	// Congestion control and ECN events don't name a path in qlog.
+	// Only those of path 0 are logged.
+	r.congestion = h.newPathCongestionController(pathID, r.rttStats, h.initialMaxDatagramSize, nil)
+	if h.enableECN {
+		r.ecnTracker = newECNTracker(h.logger, nil)
+	}
+	if h.paths == nil {
+		h.paths = make(map[protocol.PathID]*pathRecovery)
+	}
+	h.paths[pathID] = r
+	idx, _ := slices.BinarySearch(h.pathIDs, pathID)
+	h.pathIDs = slices.Insert(h.pathIDs, idx, pathID)
+	return r
 }
 
-func (h *sentPacketHandler) GetPathRTTStats(pathID protocol.PathID) *utils.RTTStats {
-	return h.getOrCreatePathRTTStats(pathID)
-}
-
-func (h *sentPacketHandler) getAppDataPacketNumberSpace(pathID protocol.PathID) *packetNumberSpace {
-	if pnSpace, ok := h.appDataPackets[pathID]; ok {
-		return pnSpace
-	}
-	// If pathID is InvalidPathID and we have sent packets on other paths,
-	// fall back to the first path with sent packets to avoid ACK mismatch.
-	if pathID == protocol.InvalidPathID {
-		for pid, pnSpace := range h.appDataPackets {
-			if pid != protocol.InvalidPathID && pnSpace.largestSent != protocol.InvalidPacketNumber {
-				return pnSpace
+// allPaths iterates over all paths, in ascending order of their path IDs.
+func (h *sentPacketHandler) allPaths() iter.Seq[*pathRecovery] {
+	return func(yield func(*pathRecovery) bool) {
+		if !yield(&h.appData) {
+			return
+		}
+		for _, pathID := range h.pathIDs {
+			if !yield(h.paths[pathID]) {
+				return
 			}
 		}
 	}
-	pnSpace := newPacketNumberSpace(0, true)
-	h.appDataPackets[pathID] = pnSpace
-	return pnSpace
 }
 
-func (h *sentPacketHandler) getLostPacketTracker(pathID protocol.PathID) *lostPacketTracker {
-	if tracker, ok := h.lostPackets[pathID]; ok {
-		return tracker
+func (h *sentPacketHandler) newPathRTTStats() *utils.RTTStats {
+	// The peer's max_ack_delay applies to all paths.
+	stats := utils.NewRTTStats()
+	stats.SetMaxAckDelay(h.rttStats.MaxAckDelay())
+	return stats
+}
+
+func (h *sentPacketHandler) newPathCongestionController(
+	pathID protocol.PathID,
+	rttStats *utils.RTTStats,
+	initialMaxDatagramSize protocol.ByteCount,
+	qlogger qlogwriter.Recorder,
+) congestion.SendAlgorithmWithDebugInfos {
+	if h.ccFactory != nil {
+		// Use custom factory (e.g., for OLIA)
+		return h.ccFactory(pathID, rttStats, initialMaxDatagramSize)
 	}
-	tracker := newLostPacketTracker(64)
-	h.lostPackets[pathID] = tracker
-	return tracker
+	return congestion.NewCubicSender(
+		congestion.DefaultClock{},
+		rttStats,
+		h.connStats,
+		initialMaxDatagramSize,
+		true, // use Reno
+		qlogger,
+	)
 }
 
-func (h *sentPacketHandler) forEachAppDataSpace(fn func(pathID protocol.PathID, pnSpace *packetNumberSpace)) {
-	for pathID, pnSpace := range h.appDataPackets {
-		fn(pathID, pnSpace)
-	}
-}
-
-func (h *sentPacketHandler) hasOutstandingAppDataPackets() bool {
-	for _, pnSpace := range h.appDataPackets {
-		if pnSpace.history.HasOutstandingPackets() {
-			return true
-		}
-	}
-	return false
-}
-
-func (h *sentPacketHandler) hasOutstandingAppDataPathProbes() bool {
-	for _, pnSpace := range h.appDataPackets {
-		if pnSpace.history.HasOutstandingPathProbes() {
-			return true
-		}
-	}
-	return false
-}
-
-func (h *sentPacketHandler) SetPacketPathID(encLevel protocol.EncryptionLevel, pn protocol.PacketNumber, pathID protocol.PathID) {
-	pnSpace := h.getPacketNumberSpace(encLevel, pathID)
-	if pnSpace == nil {
+// AddPath creates the state of a path (IETF Multipath QUIC).
+// addressValidated says if the peer's address on this path was validated.
+// Until it is, the server doesn't send more than 3 times the bytes received on the path.
+func (h *sentPacketHandler) AddPath(pathID protocol.PathID, addressValidated bool) {
+	if !h.multipath || h.removedPaths.Contains(pathID) {
 		return
 	}
-	p, ok := pnSpace.history.SetPathID(pn, pathID)
-	if !ok || p == nil {
+	if r := h.getOrCreatePath(pathID); addressValidated && r != &h.appData {
+		r.addressValidated = true
+	}
+}
+
+// SetPathAddressValidated is called when the peer's address on a path was validated (IETF Multipath QUIC).
+func (h *sentPacketHandler) SetPathAddressValidated(pathID protocol.PathID, now monotime.Time) {
+	r := h.path(pathID)
+	if !h.multipath || r == nil || r == &h.appData || r.addressValidated {
 		return
 	}
-	if h.packetObserver != nil && !p.sentNotified {
-		p.sentNotified = true
-		h.packetObserver.OnPacketSent(newPacketEvent(pn, p, p.SendTime))
+	wasAmplificationLimited := h.isPathAmplificationLimited(r)
+	r.addressValidated = true
+	if wasAmplificationLimited {
+		h.setLossDetectionTimer(now)
 	}
+}
+
+// PathCongestionState returns the congestion window and the bytes in flight of a path.
+// ok is false if the path doesn't exist.
+func (h *sentPacketHandler) PathCongestionState(pathID protocol.PathID) (cwnd, bytesInFlight protocol.ByteCount, ok bool) {
+	r := h.path(pathID)
+	if r == nil {
+		return 0, 0, false
+	}
+	return r.congestion.GetCongestionWindow(), r.bytesInFlight, true
+}
+
+// AbandonPath declares all packets sent on a path lost, and queues their frames for retransmission
+// (IETF Multipath QUIC). This is not a congestion event.
+// No packets must be sent on the path afterwards, and acknowledgments for the path are ignored.
+func (h *sentPacketHandler) AbandonPath(pathID protocol.PathID, now monotime.Time) {
+	r := h.path(pathID)
+	if !h.multipath || r == nil {
+		return
+	}
+	h.abandonPath(r)
+	h.setLossDetectionTimer(now)
+}
+
+func (h *sentPacketHandler) abandonPath(r *pathRecovery) {
+	r.abandoned = true
+	for pn, p := range r.space.history.Packets() {
+		r.space.history.DeclareLost(pn)
+		if p.isPathProbePacket {
+			continue
+		}
+		h.removeFromBytesInFlight(p)
+		if p.IsAckEliciting() {
+			h.queueFramesForRetransmission(p)
+		}
+	}
+	for _, p := range removePathProbes(r.space) {
+		for _, f := range p.Frames {
+			if f.Handler != nil {
+				f.Handler.OnLost(f.Frame)
+			}
+		}
+	}
+	r.space.lossTime = 0
+	r.numProbesToSend = 0
+	r.ptoCount = 0
+	r.ptoMode = SendNone
+	// No packets are sent on the path anymore.
+	// A coupled congestion controller (e.g. OLIA) stops taking it into account.
+	unregisterCongestionController(r.congestion)
+}
+
+// unregisterCongestionController removes the congestion controller of a path from the state it shares with
+// the controllers of the other paths, if it is a coupled congestion controller.
+func unregisterCongestionController(cc congestion.SendAlgorithmWithDebugInfos) {
+	if u, ok := cc.(interface{ Unregister() }); ok {
+		u.Unregister()
+	}
+}
+
+// removePathProbes removes all path probe packets from the history of a packet number space, and returns them.
+func removePathProbes(pnSpace *packetNumberSpace) []packetWithPacketNumber {
+	// RemovePathProbe cannot be called while iterating.
+	var pathProbes []packetWithPacketNumber
+	for pn, p := range pnSpace.history.PathProbes() {
+		pathProbes = append(pathProbes, packetWithPacketNumber{PacketNumber: pn, packet: p})
+	}
+	for _, p := range pathProbes {
+		pnSpace.history.RemovePathProbe(p.PacketNumber)
+	}
+	return pathProbes
+}
+
+// RemovePath removes all state kept for a path (IETF Multipath QUIC).
+// Outstanding packets sent on the path are declared lost, and their frames are queued for retransmission.
+// Path 0 can't be removed, it is abandoned instead.
+// The path ID of a removed path must not be used again.
+func (h *sentPacketHandler) RemovePath(pathID protocol.PathID, now monotime.Time) {
+	if !h.multipath {
+		return
+	}
+	if pathID == 0 {
+		h.AbandonPath(pathID, now)
+		h.appData.removed = true
+		return
+	}
+	if r, ok := h.paths[pathID]; ok {
+		h.abandonPath(r)
+		unregisterCongestionController(r.congestion)
+		delete(h.paths, pathID)
+		if idx, found := slices.BinarySearch(h.pathIDs, pathID); found {
+			h.pathIDs = slices.Delete(h.pathIDs, idx, idx+1)
+		}
+	}
+	h.removedPaths.Add(pathID)
+	h.setLossDetectionTimer(now)
+}
+
+// ECNModeForPath returns the ECN marking to use for a 1-RTT packet sent on the given path.
+func (h *sentPacketHandler) ECNModeForPath(pathID protocol.PathID) protocol.ECN {
+	if !h.enableECN {
+		return protocol.ECNUnsupported
+	}
+	r := h.path(pathID)
+	if r == nil || r.ecnTracker == nil {
+		return protocol.ECNNon
+	}
+	return r.ecnTracker.Mode()
+}
+
+// GetPathRTTStats returns the RTT stats of a path, or nil if the path doesn't exist.
+func (h *sentPacketHandler) GetPathRTTStats(pathID protocol.PathID) *utils.RTTStats {
+	if r := h.path(pathID); r != nil {
+		return r.rttStats
+	}
+	return nil
+}
+
+func (h *sentPacketHandler) getAppDataPacketNumberSpace(pathID protocol.PathID) *packetNumberSpace {
+	return h.getOrCreatePath(pathID).space
 }
 
 func (h *sentPacketHandler) removeFromBytesInFlight(p *packet) {
@@ -324,6 +519,9 @@ func (h *sentPacketHandler) removeFromBytesInFlight(p *packet) {
 		}
 		h.bytesInFlight -= p.Length
 		p.includedInBytesInFlight = false
+		if r := h.path(p.PathID); r != nil {
+			r.bytesInFlight -= min(r.bytesInFlight, p.Length)
+		}
 	}
 }
 
@@ -335,7 +533,7 @@ func (h *sentPacketHandler) DropPackets(encLevel protocol.EncryptionLevel, now m
 	}
 	// remove outstanding packets from bytes_in_flight
 	if encLevel == protocol.EncryptionInitial || encLevel == protocol.EncryptionHandshake {
-		pnSpace := h.getPacketNumberSpace(encLevel, protocol.InvalidPathID)
+		pnSpace := h.getPacketNumberSpace(encLevel, 0)
 		// We might already have dropped this packet number space.
 		if pnSpace == nil {
 			return
@@ -359,24 +557,24 @@ func (h *sentPacketHandler) DropPackets(encLevel protocol.EncryptionLevel, now m
 		// and not when the client drops 0-RTT keys when the handshake completes.
 		// When 0-RTT is rejected, all application data sent so far becomes invalid.
 		// Delete the packets from the history and remove them from bytes_in_flight.
-		h.forEachAppDataSpace(func(_ protocol.PathID, pnSpace *packetNumberSpace) {
-			for pn, p := range pnSpace.history.Packets() {
+		for r := range h.allPaths() {
+			for pn, p := range r.space.history.Packets() {
 				if p.EncryptionLevel != protocol.Encryption0RTT {
 					break
 				}
 				h.removeFromBytesInFlight(p)
-				_ = pnSpace.history.Remove(pn)
+				_ = r.space.history.Remove(pn)
 			}
-		})
+		}
 	default:
 		panic(fmt.Sprintf("Cannot drop keys for encryption level %s", encLevel))
 	}
-	if h.qlogger != nil && h.ptoCount != 0 {
+	if h.qlogger != nil && h.appData.ptoCount != 0 {
 		h.qlogger.RecordEvent(qlog.PTOCountUpdated{PTOCount: 0})
 	}
-	h.ptoCount = 0
-	h.numProbesToSend = 0
-	h.ptoMode = SendNone
+	h.appData.ptoCount = 0
+	h.appData.numProbesToSend = 0
+	h.appData.ptoMode = SendNone
 	h.setLossDetectionTimer(now)
 }
 
@@ -389,6 +587,27 @@ func (h *sentPacketHandler) ReceivedBytes(n protocol.ByteCount, t monotime.Time)
 	}
 }
 
+// ReceivedBytesForPath is called for every datagram received on a path.
+// With IETF Multipath QUIC, the bytes received on a path other than path 0
+// increase the anti-amplification limit of that path.
+// Without IETF Multipath QUIC, and for path 0, it is equivalent to ReceivedBytes.
+func (h *sentPacketHandler) ReceivedBytesForPath(pathID protocol.PathID, n protocol.ByteCount, t monotime.Time) {
+	if !h.multipath || pathID == 0 {
+		h.ReceivedBytes(n, t)
+		return
+	}
+	h.connStats.BytesReceived.Add(uint64(n))
+	if h.removedPaths.Contains(pathID) {
+		return
+	}
+	r := h.getOrCreatePath(pathID)
+	wasAmplificationLimit := h.isPathAmplificationLimited(r)
+	r.bytesReceived += n
+	if wasAmplificationLimit && !h.isPathAmplificationLimited(r) {
+		h.setLossDetectionTimer(t)
+	}
+}
+
 func (h *sentPacketHandler) ReceivedPacket(l protocol.EncryptionLevel, t monotime.Time) {
 	h.connStats.PacketsReceived.Add(1)
 	if h.perspective == protocol.PerspectiveServer && l == protocol.EncryptionHandshake && !h.peerAddressValidated {
@@ -397,16 +616,15 @@ func (h *sentPacketHandler) ReceivedPacket(l protocol.EncryptionLevel, t monotim
 	}
 }
 
+// packetsInFlight returns the number of outstanding packets, for the qlog metrics.
+// With IETF Multipath QUIC, the metrics are those of path 0, so only its packets are counted.
 func (h *sentPacketHandler) packetsInFlight() int {
-	packetsInFlight := 0
-	h.forEachAppDataSpace(func(_ protocol.PathID, pnSpace *packetNumberSpace) {
-		packetsInFlight += pnSpace.history.Len()
-	})
+	packetsInFlight := h.appData.space.history.NumOutstanding()
 	if h.handshakePackets != nil {
-		packetsInFlight += h.handshakePackets.history.Len()
+		packetsInFlight += h.handshakePackets.history.NumOutstanding()
 	}
 	if h.initialPackets != nil {
-		packetsInFlight += h.initialPackets.history.Len()
+		packetsInFlight += h.initialPackets.history.NumOutstanding()
 	}
 	return packetsInFlight
 }
@@ -422,12 +640,29 @@ func (h *sentPacketHandler) SentPacket(
 	isPathMTUProbePacket bool,
 	isPathProbePacket bool,
 	pathID protocol.PathID,
+	pathAcks ...PathAck,
 ) {
-	h.bytesSent += size
 	h.connStats.BytesSent.Add(uint64(size))
 	h.connStats.PacketsSent.Add(1)
 
-	pnSpace := h.getPacketNumberSpace(encLevel, pathID)
+	r := &h.appData
+	var pnSpace *packetNumberSpace
+	//nolint:exhaustive // Initial, Handshake and application data are the only packet number spaces.
+	switch encLevel {
+	case protocol.EncryptionInitial:
+		pnSpace = h.initialPackets
+	case protocol.EncryptionHandshake:
+		pnSpace = h.handshakePackets
+	default:
+		r = h.getOrCreatePath(pathID)
+		pnSpace = r.space
+	}
+	if h.multipath && r != &h.appData {
+		r.bytesSent += size
+	} else {
+		h.bytesSent += size
+	}
+
 	if h.logger.Debug() && (pnSpace.history.HasOutstandingPackets() || pnSpace.history.HasOutstandingPathProbes()) {
 		for p := max(0, pnSpace.largestSent+1); p < pn; p++ {
 			h.logger.Debugf("Skipping packet number %d", p)
@@ -442,11 +677,17 @@ func (h *sentPacketHandler) SentPacket(
 	p.Length = size
 	p.Frames = frames
 	p.LargestAcked = largestAcked
+	if len(pathAcks) > 0 {
+		p.setPathAcks(pathAcks)
+	}
 	p.StreamFrames = streamFrames
 	p.IsPathMTUProbePacket = isPathMTUProbePacket
 	p.isPathProbePacket = isPathProbePacket
-	p.PathID = pathID
+	p.PathID = r.id
 	isAckEliciting := p.IsAckEliciting()
+	if h.packetObserver != nil {
+		h.packetObserver.OnPacketSent(newPacketEvent(pn, p, t))
+	}
 
 	if isPathProbePacket {
 		pnSpace.history.SentPathProbePacket(pn, p)
@@ -456,18 +697,17 @@ func (h *sentPacketHandler) SentPacket(
 	if isAckEliciting {
 		pnSpace.lastAckElicitingPacketTime = t
 		h.bytesInFlight += size
+		r.bytesInFlight += size
 		p.includedInBytesInFlight = true
-		if h.numProbesToSend > 0 {
-			h.numProbesToSend--
+		if r.numProbesToSend > 0 {
+			r.numProbesToSend--
 		}
 	}
 
-	// Use per-path congestion controller when available
-	cc := h.getOrCreatePathCongestionControl(pathID)
-	cc.OnPacketSent(t, h.bytesInFlight, pn, size, isAckEliciting)
+	r.congestion.OnPacketSent(t, r.bytesInFlight, pn, size, isAckEliciting)
 
-	if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil {
-		h.ecnTracker.SentPacket(pn, ecn)
+	if encLevel == protocol.Encryption1RTT && r.ecnTracker != nil {
+		r.ecnTracker.SentPacket(pn, ecn)
 	}
 
 	pnSpace.history.SentPacket(pn, p)
@@ -508,18 +748,20 @@ func (h *sentPacketHandler) qlogMetricsUpdated() {
 			updated = true
 		}
 	}
-	if cwnd := h.congestion.GetCongestionWindow(); h.lastMetrics.CongestionWindow != int(cwnd) {
+	if cwnd := h.appData.congestion.GetCongestionWindow(); h.lastMetrics.CongestionWindow != int(cwnd) {
 		metricsUpdatedEvent.CongestionWindow = int(cwnd)
 		h.lastMetrics.CongestionWindow = metricsUpdatedEvent.CongestionWindow
 		updated = true
 	}
-	if h.lastMetrics.BytesInFlight != int(h.bytesInFlight) {
-		metricsUpdatedEvent.BytesInFlight = int(h.bytesInFlight)
+	// With IETF Multipath QUIC, the metrics are those of path 0.
+	if h.lastMetrics.BytesInFlight != int(h.appData.bytesInFlight) {
+		metricsUpdatedEvent.BytesInFlight = int(h.appData.bytesInFlight)
 		h.lastMetrics.BytesInFlight = metricsUpdatedEvent.BytesInFlight
 		updated = true
 	}
-	if h.lastMetrics.PacketsInFlight != h.packetsInFlight() {
-		metricsUpdatedEvent.PacketsInFlight = h.packetsInFlight()
+	packetsInFlight := h.packetsInFlight()
+	if h.lastMetrics.PacketsInFlight != packetsInFlight {
+		metricsUpdatedEvent.PacketsInFlight = packetsInFlight
 		h.lastMetrics.PacketsInFlight = metricsUpdatedEvent.PacketsInFlight
 		updated = true
 	}
@@ -541,69 +783,46 @@ func (h *sentPacketHandler) getPacketNumberSpace(encLevel protocol.EncryptionLev
 	}
 }
 
-func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.EncryptionLevel, rcvTime monotime.Time, pathID protocol.PathID) (bool /* contained 1-RTT packet */, error) {
-	pnSpace := h.getPacketNumberSpace(encLevel, pathID)
-
-	largestAcked := ack.LargestAcked()
-	if largestAcked > pnSpace.largestSent {
-		// MP-QUIC: an ACK can be received on a different path than the one that carried
-		// the acked packet. If the pathID mapping is off, we can falsely think this ACK
-		// refers to an unsent packet.
-		//
-		// Try to find an application-data packet number space that could have sent
-		// this packet number, and process the ACK there. If we can't find one,
-		// only ignore it if we're in multipath mode (multiple paths exist).
-		if encLevel == protocol.Encryption0RTT || encLevel == protocol.Encryption1RTT {
-			var altPathID protocol.PathID
-			var altSpace *packetNumberSpace
-			var fallbackPathID protocol.PathID
-			var fallbackSpace *packetNumberSpace
-			for pid, ps := range h.appDataPackets {
-				if ps == nil {
-					continue
-				}
-				if largestAcked > ps.largestSent {
-					continue
-				}
-				if idx, ok := ps.history.getIndex(largestAcked); ok {
-					if p := ps.history.packets[idx]; p != nil {
-						altPathID = pid
-						altSpace = ps
-						break
-					}
-					// Track a fallback path with the correct range in case the packet was already removed (e.g., declared lost).
-					if fallbackSpace == nil {
-						fallbackPathID = pid
-						fallbackSpace = ps
-					}
-				}
-			}
-			if altSpace == nil && fallbackSpace != nil {
-				altPathID = fallbackPathID
-				altSpace = fallbackSpace
-			}
-			if altSpace != nil {
-				pathID = altPathID
-				pnSpace = altSpace
-			} else {
-				// Only ignore the ACK if we have multiple paths (multipath mode)
-				// In single-path mode, this is a protocol violation
-				if len(h.appDataPackets) > 1 {
-					if h.logger.Debug() {
-						h.logger.Debugf("ignoring ACK for unsent packet (enc=%s path=%d largestAcked=%d largestSent=%d)", encLevel, pathID, largestAcked, pnSpace.largestSent)
-					}
+// ReceivedAck processes an ACK frame.
+// With IETF Multipath QUIC, a PATH_ACK frame acknowledges packets sent on the path it names,
+// and an ACK frame acknowledges packets sent on path 0.
+// The path the frame was received on doesn't matter.
+func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.EncryptionLevel, rcvTime monotime.Time) (bool /* contained 1-RTT packet */, error) {
+	r := &h.appData
+	var pnSpace *packetNumberSpace
+	//nolint:exhaustive // 0-RTT packets can't contain ACK frames.
+	switch encLevel {
+	case protocol.EncryptionInitial:
+		pnSpace = h.initialPackets
+	case protocol.EncryptionHandshake:
+		pnSpace = h.handshakePackets
+	default:
+		if h.multipath {
+			r = h.path(ack.PathID)
+			if r == nil {
+				// PATH_ACK frames for removed paths are ignored (draft-ietf-quic-multipath, section 3.4.3).
+				if h.removedPaths.Contains(ack.PathID) {
 					return false, nil
 				}
 				return false, &qerr.TransportError{
 					ErrorCode:    qerr.ProtocolViolation,
-					ErrorMessage: "received ACK for an unsent packet",
+					ErrorMessage: fmt.Sprintf("received ACK for path %d, which didn't send any packets", ack.PathID),
 				}
 			}
-		} else {
-			return false, &qerr.TransportError{
-				ErrorCode:    qerr.ProtocolViolation,
-				ErrorMessage: "received ACK for an unsent packet",
+			// So are PATH_ACK frames for abandoned paths.
+			// Packets sent on these paths were already declared lost.
+			if r.abandoned {
+				return false, nil
 			}
+		}
+		pnSpace = r.space
+	}
+
+	largestAcked := ack.LargestAcked()
+	if largestAcked > pnSpace.largestSent {
+		return false, &qerr.TransportError{
+			ErrorCode:    qerr.ProtocolViolation,
+			ErrorMessage: "received ACK for an unsent packet",
 		}
 	}
 
@@ -616,8 +835,8 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 		h.setLossDetectionTimer(rcvTime)
 	}
 
-	priorInFlight := h.bytesInFlight
-	ackedPackets, hasAckEliciting, err := h.detectAndRemoveAckedPackets(ack, encLevel, pathID)
+	priorInFlight := r.bytesInFlight
+	ackedPackets, hasAckEliciting, err := h.detectAndRemoveAckedPackets(ack, encLevel, pnSpace)
 	if err != nil || len(ackedPackets) == 0 {
 		return false, err
 	}
@@ -629,56 +848,38 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 			// don't use the ack delay for Initial and Handshake packets
 			var ackDelay time.Duration
 			if encLevel == protocol.Encryption1RTT {
-				ackDelay = min(ack.DelayTime, h.rttStats.MaxAckDelay())
+				ackDelay = min(ack.DelayTime, r.rttStats.MaxAckDelay())
 			}
-			if h.largestAckedTime.IsZero() || !p.SendTime.Before(h.largestAckedTime) {
-				rtt := rcvTime.Sub(p.SendTime)
-
-				// Update per-path RTT stats
-				pathRTT := h.getOrCreatePathRTTStats(p.PathID)
-				pathRTT.UpdateRTT(rtt, ackDelay)
-
-				// Update global RTT only if it's a different instance
-				if pathRTT != h.rttStats {
-					h.rttStats.UpdateRTT(rtt, ackDelay)
+			// With IETF Multipath QUIC, paths other than path 0 track the largest acknowledged packet themselves.
+			largestAckedTime := &h.largestAckedTime
+			if r != &h.appData {
+				largestAckedTime = &r.largestAckedTime
+			}
+			if largestAckedTime.IsZero() || !p.SendTime.Before(*largestAckedTime) {
+				r.rttStats.UpdateRTT(rcvTime.Sub(p.SendTime), ackDelay)
+				if r.firstRTTSampleTime.IsZero() && r.rttStats.HasMeasurement() {
+					r.firstRTTSampleTime = rcvTime
 				}
-
 				if h.logger.Debug() {
-					h.logger.Debugf("\tupdated RTT: %s (σ: %s)", h.rttStats.SmoothedRTT(), h.rttStats.MeanDeviation())
+					h.logger.Debugf("\tupdated RTT: %s (σ: %s)", r.rttStats.SmoothedRTT(), r.rttStats.MeanDeviation())
 				}
-				h.largestAckedTime = p.SendTime
+				*largestAckedTime = p.SendTime
 			}
-
-			// Call MaybeExitSlowStart on per-path CC
-			cc := h.getOrCreatePathCongestionControl(p.PathID)
-			cc.MaybeExitSlowStart()
+			r.congestion.MaybeExitSlowStart()
 		}
 	}
 
 	// Only inform the ECN tracker about new 1-RTT ACKs if the ACK increases the largest acked.
-	if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil && largestAcked > pnSpace.largestAcked {
-		congested := h.ecnTracker.HandleNewlyAcked(ackedPackets, int64(ack.ECT0), int64(ack.ECT1), int64(ack.ECNCE))
+	if encLevel == protocol.Encryption1RTT && r.ecnTracker != nil && largestAcked > pnSpace.largestAcked {
+		congested := r.ecnTracker.HandleNewlyAcked(ackedPackets, int64(ack.ECT0), int64(ack.ECT1), int64(ack.ECNCE))
 		if congested {
-			// Group packets by path for congestion events
-			pathPackets := make(map[protocol.PathID][]packetWithPacketNumber)
-			for _, p := range ackedPackets {
-				pathPackets[p.PathID] = append(pathPackets[p.PathID], p)
-			}
-
-			// Send congestion event to each path's CC
-			for pathID := range pathPackets {
-				cc := h.getOrCreatePathCongestionControl(pathID)
-				cc.OnCongestionEvent(largestAcked, 0, priorInFlight)
-			}
+			r.congestion.OnCongestionEvent(largestAcked, 0, priorInFlight)
 		}
 	}
 
 	pnSpace.largestAcked = max(pnSpace.largestAcked, largestAcked)
-	if encLevel == protocol.Encryption0RTT || encLevel == protocol.Encryption1RTT {
-		h.pathPacketNumberManager.SetHighestAcked(pathID, encLevel, pnSpace.largestAcked)
-	}
 
-	h.detectLostPackets(rcvTime, encLevel, pathID)
+	h.detectLostPackets(rcvTime, encLevel, r.id)
 	if encLevel == protocol.Encryption1RTT {
 		h.detectLostPathProbes(rcvTime)
 	}
@@ -687,10 +888,8 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 		if h.packetObserver != nil {
 			h.packetObserver.OnPacketAcked(newPacketEvent(p.PacketNumber, p.packet, rcvTime))
 		}
-		if p.includedInBytesInFlight && !p.declaredLost {
-			// Route OnPacketAcked to per-path CC
-			cc := h.getOrCreatePathCongestionControl(p.PathID)
-			cc.OnPacketAcked(p.PacketNumber, p.Length, priorInFlight, rcvTime)
+		if p.includedInBytesInFlight {
+			r.congestion.OnPacketAcked(p.PacketNumber, p.Length, priorInFlight, rcvTime)
 		}
 		if p.EncryptionLevel == protocol.Encryption1RTT {
 			acked1RTTPacket = true
@@ -705,11 +904,11 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 	if encLevel == protocol.Encryption1RTT && largestAcked == pnSpace.largestAcked {
 		h.detectSpuriousLosses(
 			ack,
-			rcvTime.Add(-min(ack.DelayTime, h.rttStats.MaxAckDelay())),
-			pathID,
+			rcvTime.Add(-min(ack.DelayTime, r.rttStats.MaxAckDelay())),
+			r,
 		)
 		// clean up lost packet history
-		h.getLostPacketTracker(pathID).DeleteBefore(rcvTime.Add(-3 * h.rttStats.PTO(false)))
+		r.lostPackets.DeleteBefore(rcvTime.Add(-3 * r.rttStats.PTO(false)))
 	}
 
 	// After this point, we must not use ackedPackets any longer!
@@ -720,12 +919,13 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 
 	// Reset the pto_count unless the client is unsure if the server has validated the client's address.
 	if h.peerCompletedAddressValidation {
-		if h.qlogger != nil && h.ptoCount != 0 {
+		// The event doesn't name a path. With IETF Multipath QUIC, only the PTO count of path 0 is logged.
+		if h.qlogger != nil && r == &h.appData && r.ptoCount != 0 {
 			h.qlogger.RecordEvent(qlog.PTOCountUpdated{PTOCount: 0})
 		}
-		h.ptoCount = 0
+		r.ptoCount = 0
 	}
-	h.numProbesToSend = 0
+	r.numProbesToSend = 0
 
 	if h.qlogger != nil {
 		h.qlogMetricsUpdated()
@@ -735,14 +935,12 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
 	return acked1RTTPacket, nil
 }
 
-func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime monotime.Time, pathID protocol.PathID) {
+func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime monotime.Time, r *pathRecovery) {
 	var maxPacketReordering protocol.PacketNumber
 	var maxTimeReordering time.Duration
 	ackRangeIdx := len(ack.AckRanges) - 1
 	var spuriousLosses []protocol.PacketNumber
-	lostPackets := h.getLostPacketTracker(pathID)
-	pnSpace := h.getAppDataPacketNumberSpace(pathID)
-	for pn, sendTime := range lostPackets.All() {
+	for pn, sendTime := range r.lostPackets.All() {
 		ackRange := ack.AckRanges[ackRangeIdx]
 		for pn > ackRange.Largest {
 			// this should never happen, since detectSpuriousLosses is only called for ACKs that increase the largest acked
@@ -756,7 +954,7 @@ func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime mon
 			continue
 		}
 		if pn <= ackRange.Largest {
-			packetReordering := pnSpace.history.Difference(ack.LargestAcked(), pn)
+			packetReordering := r.space.history.Difference(ack.LargestAcked(), pn)
 			timeReordering := ackTime.Sub(sendTime)
 			maxPacketReordering = max(maxPacketReordering, packetReordering)
 			maxTimeReordering = max(maxTimeReordering, timeReordering)
@@ -773,7 +971,7 @@ func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime mon
 		}
 	}
 	for _, pn := range spuriousLosses {
-		lostPackets.Delete(pn)
+		r.lostPackets.Delete(pn)
 	}
 }
 
@@ -781,13 +979,11 @@ func (h *sentPacketHandler) detectSpuriousLosses(ack *wire.AckFrame, ackTime mon
 func (h *sentPacketHandler) detectAndRemoveAckedPackets(
 	ack *wire.AckFrame,
 	encLevel protocol.EncryptionLevel,
-	pathID protocol.PathID,
+	pnSpace *packetNumberSpace,
 ) (_ []packetWithPacketNumber, hasAckEliciting bool, _ error) {
 	if len(h.ackedPackets) > 0 {
 		return nil, false, errors.New("ackhandler BUG: ackedPackets slice not empty")
 	}
-
-	pnSpace := h.getPacketNumberSpace(encLevel, pathID)
 
 	if encLevel == protocol.Encryption1RTT {
 		for p := range pnSpace.history.SkippedPackets() {
@@ -835,6 +1031,14 @@ func (h *sentPacketHandler) detectAndRemoveAckedPackets(
 			}
 			continue
 		}
+		// The frames of probed packets were already retransmitted.
+		// The packet is only kept to establish persistent congestion.
+		if p.probed {
+			if err := pnSpace.history.Remove(pn); err != nil {
+				return nil, false, err
+			}
+			continue
+		}
 		if p.IsAckEliciting() {
 			hasAckEliciting = true
 		}
@@ -849,8 +1053,11 @@ func (h *sentPacketHandler) detectAndRemoveAckedPackets(
 	}
 
 	for _, p := range h.ackedPackets {
-		if p.LargestAcked != protocol.InvalidPacketNumber && encLevel == protocol.Encryption1RTT && h.ignorePacketsBelow != nil {
-			h.ignorePacketsBelow(p.LargestAcked + 1)
+		if p.LargestAcked != protocol.InvalidPacketNumber && encLevel == protocol.Encryption1RTT {
+			h.ackOfAckReceived(p.AckPathID, p.LargestAcked)
+			for _, a := range p.extraAcks {
+				h.ackOfAckReceived(a.PathID, a.LargestAcked)
+			}
 		}
 
 		for _, f := range p.Frames {
@@ -871,36 +1078,69 @@ func (h *sentPacketHandler) detectAndRemoveAckedPackets(
 	return h.ackedPackets, hasAckEliciting, nil
 }
 
-func (h *sentPacketHandler) getLossTimeAndSpace() (monotime.Time, protocol.EncryptionLevel, protocol.PathID) {
+// ackOfAckReceived is called when a packet containing an ACK or a PATH_ACK frame was acknowledged.
+// pathID is the path acknowledged by the frame: an ACK frame acknowledges packets received on path 0.
+func (h *sentPacketHandler) ackOfAckReceived(pathID protocol.PathID, largestAcked protocol.PacketNumber) {
+	if h.ignorePacketsBelowForPath != nil {
+		h.ignorePacketsBelowForPath(pathID, largestAcked+1)
+	} else if pathID == 0 && h.ignorePacketsBelow != nil {
+		h.ignorePacketsBelow(largestAcked + 1)
+	}
+}
+
+// canArmTimers says if the loss detection timer is armed for packets sent on a path.
+// For appData, the anti-amplification limit is checked in lossDetectionTime and pathLossDetectionTime.
+func (h *sentPacketHandler) canArmTimers(r *pathRecovery) bool {
+	return !r.abandoned && (r == &h.appData || !h.isPathAmplificationLimited(r))
+}
+
+// pathLossTime returns the loss time of the application data packets sent on a path,
+// or zero if the loss detection timer is not armed for them.
+func (h *sentPacketHandler) pathLossTime(r *pathRecovery) monotime.Time {
+	if !h.canArmTimers(r) {
+		return 0
+	}
+	return r.space.lossTime
+}
+
+// getLossTimeAndSpace returns the earliest loss time of the packet number spaces recovered together with path r.
+// Every path is recovered on its own (RFC 9002 applied per path).
+// The Initial and Handshake packet number spaces are recovered together with path 0.
+func (h *sentPacketHandler) getLossTimeAndSpace(r *pathRecovery) (monotime.Time, protocol.EncryptionLevel, protocol.PathID) {
 	var encLevel protocol.EncryptionLevel
 	var lossTime monotime.Time
 	var pathID protocol.PathID
 
-	if h.initialPackets != nil {
-		lossTime = h.initialPackets.lossTime
-		encLevel = protocol.EncryptionInitial
-		pathID = protocol.InvalidPathID
-	}
-	if h.handshakePackets != nil && (lossTime.IsZero() || (!h.handshakePackets.lossTime.IsZero() && h.handshakePackets.lossTime.Before(lossTime))) {
-		lossTime = h.handshakePackets.lossTime
-		encLevel = protocol.EncryptionHandshake
-		pathID = protocol.InvalidPathID
-	}
-	h.forEachAppDataSpace(func(appPathID protocol.PathID, pnSpace *packetNumberSpace) {
-		if pnSpace.lossTime.IsZero() {
-			return
+	if r == &h.appData {
+		if h.initialPackets != nil {
+			lossTime = h.initialPackets.lossTime
+			encLevel = protocol.EncryptionInitial
+			pathID = h.appData.id
 		}
-		if lossTime.IsZero() || pnSpace.lossTime.Before(lossTime) {
-			lossTime = pnSpace.lossTime
-			encLevel = protocol.Encryption1RTT
-			pathID = appPathID
+		if h.handshakePackets != nil && (lossTime.IsZero() || (!h.handshakePackets.lossTime.IsZero() && h.handshakePackets.lossTime.Before(lossTime))) {
+			lossTime = h.handshakePackets.lossTime
+			encLevel = protocol.EncryptionHandshake
+			pathID = h.appData.id
 		}
-	})
+	}
+	if t := h.pathLossTime(r); !t.IsZero() && (lossTime.IsZero() || t.Before(lossTime)) {
+		return t, protocol.Encryption1RTT, r.id
+	}
 	return lossTime, encLevel, pathID
 }
 
 func (h *sentPacketHandler) getScaledPTO(includeMaxAckDelay bool) time.Duration {
-	pto := h.rttStats.PTO(includeMaxAckDelay) << h.ptoCount
+	return scalePTO(h.rttStats.PTO(includeMaxAckDelay), h.appData.ptoCount)
+}
+
+// getScaledPathPTO returns the PTO for application data packets sent on a path.
+// Paths can have very different RTTs, so the connection's RTT can't be used.
+func (h *sentPacketHandler) getScaledPathPTO(r *pathRecovery) time.Duration {
+	return scalePTO(r.rttStats.PTO(true), r.ptoCount)
+}
+
+func scalePTO(pto time.Duration, ptoCount uint32) time.Duration {
+	pto <<= ptoCount
 	if pto > maxPTODuration || pto <= 0 {
 		return maxPTODuration
 	}
@@ -908,51 +1148,55 @@ func (h *sentPacketHandler) getScaledPTO(includeMaxAckDelay bool) time.Duration 
 }
 
 // same logic as getLossTimeAndSpace, but for lastAckElicitingPacketTime instead of lossTime
-func (h *sentPacketHandler) getPTOTimeAndSpace(now monotime.Time) (pto monotime.Time, encLevel protocol.EncryptionLevel, pathID protocol.PathID) {
-	// We only send application data probe packets once the handshake is confirmed,
-	// because before that, we don't have the keys to decrypt ACKs sent in 1-RTT packets.
-	if !h.handshakeConfirmed && !h.hasOutstandingCryptoPackets() {
-		if h.peerCompletedAddressValidation {
-			return
-		}
-		t := now.Add(h.getScaledPTO(false))
-		if h.initialPackets != nil {
-			return t, protocol.EncryptionInitial, protocol.InvalidPathID
-		}
-		return t, protocol.EncryptionHandshake, protocol.InvalidPathID
-	}
-
-	if h.initialPackets != nil && h.initialPackets.history.HasOutstandingPackets() &&
-		!h.initialPackets.lastAckElicitingPacketTime.IsZero() {
-		encLevel = protocol.EncryptionInitial
-		pathID = protocol.InvalidPathID
-		if t := h.initialPackets.lastAckElicitingPacketTime; !t.IsZero() {
-			pto = t.Add(h.getScaledPTO(false))
-		}
-	}
-	if h.handshakePackets != nil && h.handshakePackets.history.HasOutstandingPackets() &&
-		!h.handshakePackets.lastAckElicitingPacketTime.IsZero() {
-		t := h.handshakePackets.lastAckElicitingPacketTime.Add(h.getScaledPTO(false))
-		if pto.IsZero() || (!t.IsZero() && t.Before(pto)) {
-			pto = t
-			encLevel = protocol.EncryptionHandshake
-			pathID = protocol.InvalidPathID
-		}
-	}
-	if h.handshakeConfirmed {
-		h.forEachAppDataSpace(func(appPathID protocol.PathID, pnSpace *packetNumberSpace) {
-			if !pnSpace.history.HasOutstandingPackets() || pnSpace.lastAckElicitingPacketTime.IsZero() {
+func (h *sentPacketHandler) getPTOTimeAndSpace(now monotime.Time, r *pathRecovery) (pto monotime.Time, encLevel protocol.EncryptionLevel, pathID protocol.PathID) {
+	if r == &h.appData {
+		// We only send application data probe packets once the handshake is confirmed,
+		// because before that, we don't have the keys to decrypt ACKs sent in 1-RTT packets.
+		if !h.handshakeConfirmed && !h.hasOutstandingCryptoPackets() {
+			if h.peerCompletedAddressValidation {
 				return
 			}
-			t := pnSpace.lastAckElicitingPacketTime.Add(h.getScaledPTO(true))
+			t := now.Add(h.getScaledPTO(false))
+			if h.initialPackets != nil {
+				return t, protocol.EncryptionInitial, h.appData.id
+			}
+			return t, protocol.EncryptionHandshake, h.appData.id
+		}
+
+		if h.initialPackets != nil && h.initialPackets.history.HasOutstandingPackets() &&
+			!h.initialPackets.lastAckElicitingPacketTime.IsZero() {
+			encLevel = protocol.EncryptionInitial
+			pathID = h.appData.id
+			if t := h.initialPackets.lastAckElicitingPacketTime; !t.IsZero() {
+				pto = t.Add(h.getScaledPTO(false))
+			}
+		}
+		if h.handshakePackets != nil && h.handshakePackets.history.HasOutstandingPackets() &&
+			!h.handshakePackets.lastAckElicitingPacketTime.IsZero() {
+			t := h.handshakePackets.lastAckElicitingPacketTime.Add(h.getScaledPTO(false))
 			if pto.IsZero() || (!t.IsZero() && t.Before(pto)) {
 				pto = t
-				encLevel = protocol.Encryption1RTT
-				pathID = appPathID
+				encLevel = protocol.EncryptionHandshake
+				pathID = h.appData.id
 			}
-		})
+		}
+	}
+	if !h.handshakeConfirmed {
+		return pto, encLevel, pathID
+	}
+	if t := h.pathPTOTime(r); !t.IsZero() && (pto.IsZero() || t.Before(pto)) {
+		return t, protocol.Encryption1RTT, r.id
 	}
 	return pto, encLevel, pathID
+}
+
+// pathPTOTime returns the PTO time of the application data packets sent on a path,
+// or zero if the PTO timer is not armed for them.
+func (h *sentPacketHandler) pathPTOTime(r *pathRecovery) monotime.Time {
+	if !r.space.history.HasOutstandingPackets() || r.space.lastAckElicitingPacketTime.IsZero() || !h.canArmTimers(r) {
+		return 0
+	}
+	return r.space.lastAckElicitingPacketTime.Add(h.getScaledPathPTO(r))
 }
 
 func (h *sentPacketHandler) hasOutstandingCryptoPackets() bool {
@@ -967,7 +1211,12 @@ func (h *sentPacketHandler) hasOutstandingCryptoPackets() bool {
 
 func (h *sentPacketHandler) setLossDetectionTimer(now monotime.Time) {
 	oldAlarm := h.alarm // only needed in case tracing is enabled
-	newAlarm := h.lossDetectionTime(now)
+	var newAlarm alarmTimer
+	if h.multipath {
+		newAlarm, h.alarmPathID = h.multipathLossDetectionTime(now)
+	} else {
+		newAlarm = h.lossDetectionTime(now)
+	}
 	h.alarm = newAlarm
 
 	hasAlarm := !newAlarm.Time.IsZero()
@@ -990,10 +1239,11 @@ func (h *sentPacketHandler) setLossDetectionTimer(now monotime.Time) {
 	}
 }
 
+// lossDetectionTime returns the loss detection timer of a connection that doesn't use IETF Multipath QUIC.
 func (h *sentPacketHandler) lossDetectionTime(now monotime.Time) alarmTimer {
 	// cancel the alarm if no packets are outstanding
 	if h.peerCompletedAddressValidation && !h.hasOutstandingCryptoPackets() &&
-		!h.hasOutstandingAppDataPackets() && !h.hasOutstandingAppDataPathProbes() {
+		!h.appData.space.history.HasOutstandingPackets() && !h.appData.space.history.HasOutstandingPathProbes() {
 		return alarmTimer{}
 	}
 
@@ -1003,17 +1253,14 @@ func (h *sentPacketHandler) lossDetectionTime(now monotime.Time) alarmTimer {
 	}
 
 	var pathProbeLossTime monotime.Time
-	h.forEachAppDataSpace(func(_ protocol.PathID, pnSpace *packetNumberSpace) {
-		if _, p := pnSpace.history.FirstOutstandingPathProbe(); p != nil {
-			lossTime := p.SendTime.Add(pathProbePacketLossTimeout)
-			if pathProbeLossTime.IsZero() || lossTime.Before(pathProbeLossTime) {
-				pathProbeLossTime = lossTime
-			}
+	if h.appData.space.history.HasOutstandingPathProbes() {
+		if _, p := h.appData.space.history.FirstOutstandingPathProbe(); p != nil {
+			pathProbeLossTime = p.SendTime.Add(pathProbePacketLossTimeout)
 		}
-	})
+	}
 
 	// early retransmit timer or time loss detection
-	lossTime, encLevel, _ := h.getLossTimeAndSpace()
+	lossTime, encLevel, _ := h.getLossTimeAndSpace(&h.appData)
 	if !lossTime.IsZero() && (pathProbeLossTime.IsZero() || lossTime.Before(pathProbeLossTime)) {
 		return alarmTimer{
 			Time:            lossTime,
@@ -1021,7 +1268,7 @@ func (h *sentPacketHandler) lossDetectionTime(now monotime.Time) alarmTimer {
 			EncryptionLevel: encLevel,
 		}
 	}
-	ptoTime, encLevel, _ := h.getPTOTimeAndSpace(now)
+	ptoTime, encLevel, _ := h.getPTOTimeAndSpace(now, &h.appData)
 	if !ptoTime.IsZero() && (pathProbeLossTime.IsZero() || ptoTime.Before(pathProbeLossTime)) {
 		return alarmTimer{
 			Time:            ptoTime,
@@ -1039,15 +1286,75 @@ func (h *sentPacketHandler) lossDetectionTime(now monotime.Time) alarmTimer {
 	return alarmTimer{}
 }
 
+// multipathLossDetectionTime is lossDetectionTime for a connection using IETF Multipath QUIC.
+// Every path runs its own loss recovery (draft-ietf-quic-multipath, sections 1 and 5.7),
+// and has its own timer (see pathLossDetectionTime).
+// The alarm is set for the earliest of them. If timers are equal, the path with the lowest path ID is selected.
+func (h *sentPacketHandler) multipathLossDetectionTime(now monotime.Time) (alarmTimer, protocol.PathID) {
+	var alarm alarmTimer
+	var pathID protocol.PathID
+	for r := range h.allPaths() {
+		if t := h.pathLossDetectionTime(now, r); !t.Time.IsZero() && (alarm.Time.IsZero() || t.Time.Before(alarm.Time)) {
+			alarm = t
+			pathID = r.id
+		}
+	}
+	return alarm, pathID
+}
+
+// pathLossDetectionTime returns the timer of a path of a connection using IETF Multipath QUIC.
+// As in Appendix A.8 of RFC 9002, this is the path's loss time if one is set, and its PTO time otherwise.
+// The timer of path 0 also covers the Initial and Handshake packet number spaces.
+// If the first outstanding path probe packet sent on the path is declared lost earlier, the timer is set for that.
+func (h *sentPacketHandler) pathLossDetectionTime(now monotime.Time, r *pathRecovery) alarmTimer {
+	// cancel the timer if amplification limited
+	if r == &h.appData && h.isAmplificationLimited() {
+		return alarmTimer{}
+	}
+
+	var alarm alarmTimer
+	// If no packets are outstanding, there's nothing to detect lost.
+	// However, the client needs to arm the timer if the server might be blocked by the anti-amplification limit.
+	hasOutstanding := r.space.history.HasOutstandingPackets()
+	if r == &h.appData {
+		hasOutstanding = hasOutstanding || h.hasOutstandingCryptoPackets() || !h.peerCompletedAddressValidation
+	}
+	if hasOutstanding {
+		if lossTime, encLevel, _ := h.getLossTimeAndSpace(r); !lossTime.IsZero() {
+			alarm = alarmTimer{
+				Time:            lossTime,
+				TimerType:       qlog.TimerTypeACK,
+				EncryptionLevel: encLevel,
+			}
+		} else if ptoTime, encLevel, _ := h.getPTOTimeAndSpace(now, r); !ptoTime.IsZero() {
+			alarm = alarmTimer{
+				Time:            ptoTime,
+				TimerType:       qlog.TimerTypePTO,
+				EncryptionLevel: encLevel,
+			}
+		}
+	}
+	if _, p := r.space.history.FirstOutstandingPathProbe(); p != nil {
+		if lossTime := p.SendTime.Add(pathProbePacketLossTimeout); alarm.Time.IsZero() || lossTime.Before(alarm.Time) {
+			alarm = alarmTimer{
+				Time:            lossTime,
+				TimerType:       qlog.TimerTypePathProbe,
+				EncryptionLevel: protocol.Encryption1RTT,
+			}
+		}
+	}
+	return alarm
+}
+
 func (h *sentPacketHandler) detectLostPathProbes(now monotime.Time) {
 	lossTime := now.Add(-pathProbePacketLossTimeout)
-	h.forEachAppDataSpace(func(_ protocol.PathID, pnSpace *packetNumberSpace) {
-		if !pnSpace.history.HasOutstandingPathProbes() {
-			return
+	for r := range h.allPaths() {
+		if !r.space.history.HasOutstandingPathProbes() {
+			continue
 		}
 		// RemovePathProbe cannot be called while iterating.
 		var lostPathProbes []packetWithPacketNumber
-		for pn, p := range pnSpace.history.PathProbes() {
+		for pn, p := range r.space.history.PathProbes() {
 			if !p.SendTime.After(lossTime) {
 				lostPathProbes = append(lostPathProbes, packetWithPacketNumber{PacketNumber: pn, packet: p})
 			}
@@ -1059,16 +1366,20 @@ func (h *sentPacketHandler) detectLostPathProbes(now monotime.Time) {
 			for _, f := range p.Frames {
 				f.Handler.OnLost(f.Frame)
 			}
-			pnSpace.history.RemovePathProbe(p.PacketNumber)
+			r.space.history.RemovePathProbe(p.PacketNumber)
 		}
-	})
+	}
 }
 
 func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protocol.EncryptionLevel, pathID protocol.PathID) {
+	r := &h.appData
+	if encLevel == protocol.Encryption0RTT || encLevel == protocol.Encryption1RTT {
+		r = h.path(pathID)
+	}
 	pnSpace := h.getPacketNumberSpace(encLevel, pathID)
 	pnSpace.lossTime = 0
 
-	maxRTT := float64(max(h.rttStats.LatestRTT(), h.rttStats.SmoothedRTT()))
+	maxRTT := float64(max(r.rttStats.LatestRTT(), r.rttStats.SmoothedRTT()))
 	lossDelay := time.Duration(timeThreshold * maxRTT)
 
 	// Minimum time of granularity before packets are deemed lost.
@@ -1077,11 +1388,25 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 	// Packets sent before this time are deemed lost.
 	lostSendTime := now.Add(-lossDelay)
 
-	priorInFlight := h.bytesInFlight
+	// Persistent congestion (section 7.6 of RFC 9002) is established if two ack-eliciting packets declared lost here
+	// were sent more than the persistent congestion duration apart, and no packet sent between them was acknowledged.
+	// Only packets sent after the first RTT sample on the path, and only those of this packet number space,
+	// are taken into account.
+	pcDuration := persistentCongestionThreshold * r.rttStats.PTO(true)
+	var pcStart monotime.Time // send time of the first lost packet since the last acknowledged packet
+	var persistentCongestion bool
+	prevPN := protocol.InvalidPacketNumber
+
+	priorInFlight := r.bytesInFlight
 	for pn, p := range pnSpace.history.Packets() {
 		if pn > pnSpace.largestAcked {
 			break
 		}
+		// A packet sent between the previous packet and this packet was acknowledged.
+		if p.precedingAcked > prevPN {
+			pcStart = 0
+		}
+		prevPN = pn
 
 		var packetLost bool
 		if !p.SendTime.After(lostSendTime) {
@@ -1092,10 +1417,7 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 				}
 				if h.qlogger != nil {
 					h.qlogger.RecordEvent(qlog.PacketLost{
-						Header: qlog.PacketHeader{
-							PacketType:   qlog.EncryptionLevelToPacketType(p.EncryptionLevel),
-							PacketNumber: pn,
-						},
+						Header:  h.qlogPacketHeader(p, pn),
 						Trigger: qlog.PacketLossTimeThreshold,
 					})
 				}
@@ -1108,15 +1430,12 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 				}
 				if h.qlogger != nil {
 					h.qlogger.RecordEvent(qlog.PacketLost{
-						Header: qlog.PacketHeader{
-							PacketType:   qlog.EncryptionLevelToPacketType(p.EncryptionLevel),
-							PacketNumber: pn,
-						},
+						Header:  h.qlogPacketHeader(p, pn),
 						Trigger: qlog.PacketLossReorderingThreshold,
 					})
 				}
 			}
-		} else if pnSpace.lossTime.IsZero() {
+		} else if pnSpace.lossTime.IsZero() && !p.probed {
 			// Note: This conditional is only entered once per call
 			lossTime := p.SendTime.Add(lossDelay)
 			if h.logger.Debug() {
@@ -1124,9 +1443,15 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 			}
 			pnSpace.lossTime = lossTime
 		}
-		if packetLost {
+		if packetLost && p.probed {
+			// The frames of this packet were already retransmitted in a PTO probe packet,
+			// and it was removed from bytes in flight.
+			// Its loss doesn't change the congestion window, but it can establish persistent congestion.
+			pnSpace.history.DeclareLost(pn)
+			persistentCongestion = h.updatePersistentCongestion(r, p, &pcStart, pcDuration) || persistentCongestion
+		} else if packetLost {
 			if encLevel == protocol.Encryption0RTT || encLevel == protocol.Encryption1RTT {
-				h.getLostPacketTracker(p.PathID).Add(pn, p.SendTime)
+				r.lostPackets.Add(pn, p.SendTime)
 			}
 			pnSpace.history.DeclareLost(pn)
 			if h.packetObserver != nil {
@@ -1138,16 +1463,51 @@ func (h *sentPacketHandler) detectLostPackets(now monotime.Time, encLevel protoc
 				h.removeFromBytesInFlight(p)
 				h.queueFramesForRetransmission(p)
 				if !p.IsPathMTUProbePacket {
-					// Route congestion event to per-path CC
-					cc := h.getOrCreatePathCongestionControl(p.PathID)
-					cc.OnCongestionEvent(pn, p.Length, priorInFlight)
+					r.congestion.OnCongestionEvent(pn, p.Length, priorInFlight)
+					persistentCongestion = h.updatePersistentCongestion(r, p, &pcStart, pcDuration) || persistentCongestion
 				}
-				if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil {
-					h.ecnTracker.LostPacket(pn)
+				if encLevel == protocol.Encryption1RTT && r.ecnTracker != nil {
+					r.ecnTracker.LostPacket(pn)
 				}
 			}
 		}
 	}
+	if persistentCongestion {
+		if h.logger.Debug() {
+			h.logger.Debugf("\tpersistent congestion (%s)", encLevel)
+		}
+		r.congestion.OnPersistentCongestion()
+	}
+}
+
+// updatePersistentCongestion is called for every ack-eliciting packet declared lost in detectLostPackets,
+// except for Path MTU probe packets, whose loss is not a congestion signal.
+// pcStart is the send time of the first such packet since the last acknowledged packet, or zero.
+// It returns true if the loss of p establishes persistent congestion.
+func (h *sentPacketHandler) updatePersistentCongestion(r *pathRecovery, p *packet, pcStart *monotime.Time, pcDuration time.Duration) bool {
+	// Persistent congestion can only be established after an RTT sample (section 7.6.2 of RFC 9002).
+	if r.firstRTTSampleTime.IsZero() || !p.SendTime.After(r.firstRTTSampleTime) {
+		return false
+	}
+	if pcStart.IsZero() {
+		*pcStart = p.SendTime
+		return false
+	}
+	return p.SendTime.Sub(*pcStart) > pcDuration
+}
+
+// qlogPacketHeader returns the header logged for a lost packet.
+// With IETF Multipath QUIC, the header of a 1-RTT packet contains the path ID.
+func (h *sentPacketHandler) qlogPacketHeader(p *packet, pn protocol.PacketNumber) qlog.PacketHeader {
+	hdr := qlog.PacketHeader{
+		PacketType:   qlog.EncryptionLevelToPacketType(p.EncryptionLevel),
+		PacketNumber: pn,
+	}
+	if h.multipath && p.EncryptionLevel == protocol.Encryption1RTT {
+		hdr.PathID = p.PathID
+		hdr.HasPathID = true
+	}
+	return hdr
 }
 
 func (h *sentPacketHandler) OnLossDetectionTimeout(now monotime.Time) error {
@@ -1157,7 +1517,22 @@ func (h *sentPacketHandler) OnLossDetectionTimeout(now monotime.Time) error {
 		h.detectLostPathProbes(now)
 	}
 
-	earliestLossTime, encLevel, lossPathID := h.getLossTimeAndSpace()
+	// With IETF Multipath QUIC, every path has its own timer (see multipathLossDetectionTime).
+	// Only the timer that the alarm was set for is handled.
+	// If the timers of other paths expired as well, the alarm is set for the next one,
+	// and it fires right away.
+	r := &h.appData
+	if h.multipath {
+		// Path probe packets were already declared lost above.
+		if h.alarm.TimerType == qlog.TimerTypePathProbe {
+			return nil
+		}
+		if r = h.path(h.alarmPathID); r == nil {
+			return nil
+		}
+	}
+
+	earliestLossTime, encLevel, lossPathID := h.getLossTimeAndSpace(r)
 	if !earliestLossTime.IsZero() {
 		if h.logger.Debug() {
 			h.logger.Debugf("Loss detection alarm fired in loss timer mode. Loss time: %s", earliestLossTime)
@@ -1179,20 +1554,21 @@ func (h *sentPacketHandler) OnLossDetectionTimeout(now monotime.Time) error {
 	// However, there's no way to reset the timer in the connection.
 	// When OnLossDetectionTimeout is called, we therefore need to make sure that there are
 	// actually packets outstanding.
-	if h.bytesInFlight == 0 && !h.peerCompletedAddressValidation {
-		h.ptoCount++
-		h.numProbesToSend++
+	// The bytes in flight of path 0 include the Initial and Handshake packets.
+	if r == &h.appData && r.bytesInFlight == 0 && !h.peerCompletedAddressValidation {
+		h.appData.ptoCount++
+		h.appData.numProbesToSend++
 		if h.initialPackets != nil {
-			h.ptoMode = SendPTOInitial
+			h.appData.ptoMode = SendPTOInitial
 		} else if h.handshakePackets != nil {
-			h.ptoMode = SendPTOHandshake
+			h.appData.ptoMode = SendPTOHandshake
 		} else {
 			return errors.New("sentPacketHandler BUG: PTO fired, but bytes_in_flight is 0 and Initial and Handshake already dropped")
 		}
 		return nil
 	}
 
-	ptoTime, encLevel, ptoPathID := h.getPTOTimeAndSpace(now)
+	ptoTime, encLevel, ptoPathID := h.getPTOTimeAndSpace(now, r)
 	if ptoTime.IsZero() {
 		return nil
 	}
@@ -1200,9 +1576,17 @@ func (h *sentPacketHandler) OnLossDetectionTimeout(now monotime.Time) error {
 	if !ps.history.HasOutstandingPackets() && !ps.history.HasOutstandingPathProbes() && !h.peerCompletedAddressValidation {
 		return nil
 	}
-	h.ptoCount++
+	pto := &h.appData
+	if encLevel == protocol.Encryption1RTT {
+		pto = h.path(ptoPathID)
+	}
+	pto.ptoCount++
 	if h.logger.Debug() {
-		h.logger.Debugf("Loss detection alarm for %s fired in PTO mode. PTO count: %d", encLevel, h.ptoCount)
+		if h.multipath && encLevel == protocol.Encryption1RTT {
+			h.logger.Debugf("Loss detection alarm for %s on path %d fired in PTO mode. PTO count: %d", encLevel, ptoPathID, pto.ptoCount)
+		} else {
+			h.logger.Debugf("Loss detection alarm for %s fired in PTO mode. PTO count: %d", encLevel, pto.ptoCount)
+		}
 	}
 	if h.qlogger != nil {
 		h.qlogger.RecordEvent(qlog.LossTimerUpdated{
@@ -1210,23 +1594,23 @@ func (h *sentPacketHandler) OnLossDetectionTimeout(now monotime.Time) error {
 			TimerType: qlog.TimerTypePTO,
 			EncLevel:  encLevel,
 		})
-		h.qlogger.RecordEvent(qlog.PTOCountUpdated{PTOCount: h.ptoCount})
+		// The event doesn't name a path. With IETF Multipath QUIC, only the PTO count of path 0 is logged.
+		if pto == &h.appData {
+			h.qlogger.RecordEvent(qlog.PTOCountUpdated{PTOCount: pto.ptoCount})
+		}
 	}
-	h.numProbesToSend += 2
+	pto.numProbesToSend += 2
 	//nolint:exhaustive // We never arm a PTO timer for 0-RTT packets.
 	switch encLevel {
 	case protocol.EncryptionInitial:
-		h.ptoMode = SendPTOInitial
+		pto.ptoMode = SendPTOInitial
 	case protocol.EncryptionHandshake:
-		h.ptoMode = SendPTOHandshake
+		pto.ptoMode = SendPTOHandshake
 	case protocol.Encryption1RTT:
-		// Skip a packet number in order to elicit an immediate ACK when sending the PTO probe.
+		// skip a packet number in order to elicit an immediate ACK
 		pn := h.PopPacketNumber(ptoPathID, protocol.Encryption1RTT)
-		ps.history.SkippedPacket(pn)
-		if h.logger.Debug() {
-			h.logger.Debugf("Skipping packet number %d", pn)
-		}
-		h.ptoMode = SendPTOAppData
+		h.getPacketNumberSpace(protocol.Encryption1RTT, ptoPathID).history.SkippedPacket(pn)
+		pto.ptoMode = SendPTOAppData
 	default:
 		return fmt.Errorf("PTO timer in unexpected encryption level: %s", encLevel)
 	}
@@ -1244,49 +1628,34 @@ func (h *sentPacketHandler) ECNMode(isShortHeaderPacket bool) protocol.ECN {
 	if !isShortHeaderPacket {
 		return protocol.ECNNon
 	}
-	return h.ecnTracker.Mode()
+	return h.appData.ecnTracker.Mode()
 }
 
 func (h *sentPacketHandler) PeekPacketNumber(pathID protocol.PathID, encLevel protocol.EncryptionLevel) (protocol.PacketNumber, protocol.PacketNumberLen) {
 	pnSpace := h.getPacketNumberSpace(encLevel, pathID)
-	if encLevel == protocol.EncryptionInitial || encLevel == protocol.EncryptionHandshake {
-		pn := pnSpace.pns.Peek()
-		// See section 17.1 of RFC 9000.
-		return pn, protocol.PacketNumberLengthForHeader(pn, pnSpace.largestAcked)
-	}
-	pn, _ := h.pathPacketNumberManager.PeekPacketNumber(pathID, encLevel)
+	pn := pnSpace.pns.Peek()
+	// See section 17.1 of RFC 9000.
 	return pn, protocol.PacketNumberLengthForHeader(pn, pnSpace.largestAcked)
 }
 
 func (h *sentPacketHandler) PopPacketNumber(pathID protocol.PathID, encLevel protocol.EncryptionLevel) protocol.PacketNumber {
 	pnSpace := h.getPacketNumberSpace(encLevel, pathID)
-	if encLevel == protocol.EncryptionInitial || encLevel == protocol.EncryptionHandshake {
-		skipped, pn := pnSpace.pns.Pop()
-		if skipped {
-			h.markSkippedPacket(pnSpace, pn-1)
-		}
-		return pn
-	}
-
-	skipped, pn := h.pathPacketNumberManager.PopPacketNumberWithSkip(pathID, encLevel)
+	skipped, pn := pnSpace.pns.Pop()
 	if skipped {
-		h.markSkippedPacket(pnSpace, pn-1)
+		skippedPN := pn - 1
+		pnSpace.history.SkippedPacket(skippedPN)
+		if h.logger.Debug() {
+			h.logger.Debugf("Skipping packet number %d", skippedPN)
+		}
 	}
 	return pn
 }
 
-func (h *sentPacketHandler) markSkippedPacket(pnSpace *packetNumberSpace, pn protocol.PacketNumber) {
-	pnSpace.history.SkippedPacket(pn)
-	if h.logger.Debug() {
-		h.logger.Debugf("Skipping packet number %d", pn)
-	}
-}
-
 func (h *sentPacketHandler) SendMode(now monotime.Time) SendMode {
-	numTrackedPackets := 0
-	h.forEachAppDataSpace(func(_ protocol.PathID, pnSpace *packetNumberSpace) {
-		numTrackedPackets += pnSpace.history.Len()
-	})
+	if h.multipath {
+		return h.multipathSendMode(now)
+	}
+	numTrackedPackets := h.appData.space.history.Len()
 	if h.initialPackets != nil {
 		numTrackedPackets += h.initialPackets.history.Len()
 	}
@@ -1308,13 +1677,13 @@ func (h *sentPacketHandler) SendMode(now monotime.Time) SendMode {
 		}
 		return SendNone
 	}
-	if h.numProbesToSend > 0 {
-		return h.ptoMode
+	if h.appData.numProbesToSend > 0 {
+		return h.appData.ptoMode
 	}
 	// Only send ACKs if we're congestion limited.
-	if !h.congestion.CanSend(h.bytesInFlight) {
+	if !h.appData.congestion.CanSend(h.bytesInFlight) {
 		if h.logger.Debug() {
-			h.logger.Debugf("Congestion limited: bytes in flight %d, window %d", h.bytesInFlight, h.congestion.GetCongestionWindow())
+			h.logger.Debugf("Congestion limited: bytes in flight %d, window %d", h.bytesInFlight, h.appData.congestion.GetCongestionWindow())
 		}
 		return SendAck
 	}
@@ -1324,18 +1693,248 @@ func (h *sentPacketHandler) SendMode(now monotime.Time) SendMode {
 		}
 		return SendAck
 	}
-	if !h.congestion.HasPacingBudget(now) {
+	if !h.appData.congestion.HasPacingBudget(now) {
+		return SendPacingLimited
+	}
+	return SendAny
+}
+
+// multipathSendMode is the SendMode of an IETF Multipath QUIC connection.
+// It summarizes the send modes of all paths:
+// a probe packet is due if a path needs to send one (the path with the lowest path ID is preferred),
+// otherwise the connection can send if any path can send.
+func (h *sentPacketHandler) multipathSendMode(now monotime.Time) SendMode {
+	mode := SendNone
+	for r := range h.allPaths() {
+		switch m := h.pathSendMode(r, now); m {
+		case SendPTOInitial, SendPTOHandshake, SendPTOAppData:
+			return m
+		case SendAny:
+			mode = SendAny
+		case SendPacingLimited:
+			if mode != SendAny {
+				mode = SendPacingLimited
+			}
+		case SendAck:
+			if mode == SendNone {
+				mode = SendAck
+			}
+		case SendNone:
+		}
+	}
+	return mode
+}
+
+// SendModeForPath returns the send mode of a path.
+// The anti-amplification limit, the number of tracked packets, PTO probes, the congestion window
+// and pacing apply per path.
+// Without IETF Multipath QUIC, it returns the SendMode of the connection.
+func (h *sentPacketHandler) SendModeForPath(pathID protocol.PathID, now monotime.Time) SendMode {
+	if !h.multipath {
+		return h.SendMode(now)
+	}
+	r := h.path(pathID)
+	if r == nil {
+		return SendNone
+	}
+	return h.pathSendMode(r, now)
+}
+
+func (h *sentPacketHandler) pathSendMode(r *pathRecovery, now monotime.Time) SendMode {
+	if r.abandoned {
+		return SendNone
+	}
+	numTrackedPackets := r.space.history.Len()
+	if r == &h.appData {
+		if h.initialPackets != nil {
+			numTrackedPackets += h.initialPackets.history.Len()
+		}
+		if h.handshakePackets != nil {
+			numTrackedPackets += h.handshakePackets.history.Len()
+		}
+	}
+	if h.isPathAmplificationLimited(r) {
+		if h.logger.Debug() {
+			h.logger.Debugf("Path %d: amplification window limited", r.id)
+		}
+		return SendNone
+	}
+	if numTrackedPackets >= protocol.MaxTrackedSentPackets {
+		if h.logger.Debug() {
+			h.logger.Debugf("Path %d: limited by the number of tracked packets: tracking %d packets, maximum %d", r.id, numTrackedPackets, protocol.MaxTrackedSentPackets)
+		}
+		return SendNone
+	}
+	if r.numProbesToSend > 0 {
+		return r.ptoMode
+	}
+	if !r.congestion.CanSend(r.bytesInFlight) {
+		if h.logger.Debug() {
+			h.logger.Debugf("Path %d: congestion limited: bytes in flight %d, window %d", r.id, r.bytesInFlight, r.congestion.GetCongestionWindow())
+		}
+		return SendAck
+	}
+	if numTrackedPackets >= protocol.MaxOutstandingSentPackets {
+		if h.logger.Debug() {
+			h.logger.Debugf("Path %d: max outstanding limited: tracking %d packets, maximum: %d", r.id, numTrackedPackets, protocol.MaxOutstandingSentPackets)
+		}
+		return SendAck
+	}
+	if !r.congestion.HasPacingBudget(now) {
 		return SendPacingLimited
 	}
 	return SendAny
 }
 
 func (h *sentPacketHandler) TimeUntilSend() monotime.Time {
-	return h.congestion.TimeUntilSend(h.bytesInFlight)
+	if !h.multipath {
+		return h.appData.congestion.TimeUntilSend(h.bytesInFlight)
+	}
+	// the earliest time at which a path that is not congestion limited can send
+	var t monotime.Time
+	var found bool
+	for r := range h.allPaths() {
+		if r.abandoned || !r.congestion.CanSend(r.bytesInFlight) {
+			continue
+		}
+		pt := r.congestion.TimeUntilSend(r.bytesInFlight)
+		if pt.IsZero() {
+			return 0
+		}
+		if !found || pt.Before(t) {
+			t = pt
+			found = true
+		}
+	}
+	if !found {
+		return h.appData.congestion.TimeUntilSend(h.appData.bytesInFlight)
+	}
+	return t
 }
 
+// TimeUntilSendForPath is the time when the next packet should be sent on a path.
+// Without IETF Multipath QUIC, it returns TimeUntilSend.
+func (h *sentPacketHandler) TimeUntilSendForPath(pathID protocol.PathID) monotime.Time {
+	if !h.multipath {
+		return h.TimeUntilSend()
+	}
+	r := h.path(pathID)
+	if r == nil {
+		return 0
+	}
+	return r.congestion.TimeUntilSend(r.bytesInFlight)
+}
+
+// SetMaxDatagramSize sets the maximum datagram size of path 0.
+// With IETF Multipath QUIC, every path has its own maximum datagram size (see SetMaxDatagramSizeForPath).
 func (h *sentPacketHandler) SetMaxDatagramSize(s protocol.ByteCount) {
-	h.congestion.SetMaxDatagramSize(s)
+	h.maxDatagramSize = s
+	h.appData.congestion.SetMaxDatagramSize(s)
+}
+
+// SetMaxDatagramSizeForPath sets the maximum datagram size of a path.
+// Without IETF Multipath QUIC, it is equivalent to SetMaxDatagramSize.
+func (h *sentPacketHandler) SetMaxDatagramSizeForPath(pathID protocol.PathID, s protocol.ByteCount) {
+	if !h.multipath || pathID == 0 {
+		h.SetMaxDatagramSize(s)
+		return
+	}
+	if r := h.path(pathID); r != nil {
+		r.congestion.SetMaxDatagramSize(s)
+	}
+}
+
+// MaxPTO returns the largest PTO (without exponential backoff) of all paths that were not removed.
+// This includes abandoned paths: packets sent by the peer on these paths might still arrive
+// (section 3.4 of draft-ietf-quic-multipath-21).
+// Without IETF Multipath QUIC, it is the PTO of the connection.
+func (h *sentPacketHandler) MaxPTO(includeMaxAckDelay bool) time.Duration {
+	if !h.multipath {
+		return h.rttStats.PTO(includeMaxAckDelay)
+	}
+	var pto time.Duration
+	var found bool
+	for r := range h.allPaths() {
+		if r.removed {
+			continue
+		}
+		pto = max(pto, r.rttStats.PTO(includeMaxAckDelay))
+		found = true
+	}
+	if !found {
+		return h.rttStats.PTO(includeMaxAckDelay)
+	}
+	return pto
+}
+
+// OutstandingPackets iterates over the outstanding packets sent on a path, in ascending order of their packet numbers:
+// the ack-eliciting packets that were neither acknowledged nor declared lost.
+// Path probe packets and Path MTU probe packets are not included, and neither are packets sent on abandoned paths.
+// It is only used with IETF Multipath QUIC. The frames of the packets must not be modified.
+func (h *sentPacketHandler) OutstandingPackets(pathID protocol.PathID) iter.Seq[PacketEvent] {
+	return func(yield func(PacketEvent) bool) {
+		if !h.multipath {
+			return
+		}
+		r := h.path(pathID)
+		if r == nil || r.abandoned {
+			return
+		}
+		for pn, p := range r.space.history.Packets() {
+			if !p.Outstanding() {
+				continue
+			}
+			if !yield(newPacketEvent(pn, p, p.SendTime)) {
+				return
+			}
+		}
+	}
+}
+
+// DeclareOutstandingLost declares the outstanding packets sent on a path lost, and queues their frames for
+// retransmission. Like for any other lost packet, the congestion controller of the path reduces the congestion
+// window (section 7.3.2 of RFC 9002). The PTO state of the path is kept.
+// It is used when a path potentially failed (IETF Multipath QUIC): without acknowledgments for the path,
+// its packets would only be declared lost by the path's probe timeouts (section 5.7 of draft-ietf-quic-multipath-21).
+// Acknowledgments received for these packets later are ignored.
+func (h *sentPacketHandler) DeclareOutstandingLost(pathID protocol.PathID, now monotime.Time) {
+	if !h.multipath {
+		return
+	}
+	r := h.path(pathID)
+	if r == nil || r.abandoned {
+		return
+	}
+	priorInFlight := r.bytesInFlight
+	var declaredLost bool
+	for pn, p := range r.space.history.Packets() {
+		if !p.Outstanding() {
+			continue
+		}
+		declaredLost = true
+		if h.logger.Debug() {
+			h.logger.Debugf("\tlost packet %d (path %d potentially failed)", pn, pathID)
+		}
+		if h.qlogger != nil {
+			h.qlogger.RecordEvent(qlog.PacketLost{Header: h.qlogPacketHeader(p, pn)})
+		}
+		r.lostPackets.Add(pn, p.SendTime)
+		r.space.history.DeclareLost(pn)
+		if h.packetObserver != nil {
+			h.packetObserver.OnPacketLost(newPacketEvent(pn, p, now))
+		}
+		h.removeFromBytesInFlight(p)
+		h.queueFramesForRetransmission(p)
+		r.congestion.OnCongestionEvent(pn, p.Length, priorInFlight)
+		if r.ecnTracker != nil {
+			r.ecnTracker.LostPacket(pn)
+		}
+	}
+	r.space.lossTime = 0
+	h.setLossDetectionTimer(now)
+	if declaredLost && h.qlogger != nil {
+		h.qlogMetricsUpdated()
+	}
 }
 
 func (h *sentPacketHandler) isAmplificationLimited() bool {
@@ -1345,44 +1944,93 @@ func (h *sentPacketHandler) isAmplificationLimited() bool {
 	return h.bytesSent >= amplificationFactor*h.bytesReceived
 }
 
-func (h *sentPacketHandler) QueueProbePacket(encLevel protocol.EncryptionLevel) bool {
-	if encLevel == protocol.Encryption0RTT || encLevel == protocol.Encryption1RTT {
-		var selectedSpace *packetNumberSpace
-		var selectedPacket *packet
-		var selectedPN protocol.PacketNumber
-		h.forEachAppDataSpace(func(_ protocol.PathID, pnSpace *packetNumberSpace) {
-			pn, p := pnSpace.history.FirstOutstanding()
-			if p == nil {
-				return
-			}
-			if selectedPacket == nil || p.SendTime.Before(selectedPacket.SendTime) {
-				selectedSpace = pnSpace
-				selectedPacket = p
-				selectedPN = pn
-			}
-		})
-		if selectedPacket == nil {
-			return false
-		}
-		h.queueFramesForRetransmission(selectedPacket)
-		// TODO: don't declare the packet lost here.
-		// Keep track of acknowledged frames instead.
-		h.removeFromBytesInFlight(selectedPacket)
-		selectedSpace.history.DeclareLost(selectedPN)
-		return true
+// isPathAmplificationLimited says if sending on a path is limited by the anti-amplification limit.
+// For path 0, this is the anti-amplification limit of the handshake.
+func (h *sentPacketHandler) isPathAmplificationLimited(r *pathRecovery) bool {
+	if r == &h.appData {
+		return h.isAmplificationLimited()
 	}
+	if !h.multipath || r.addressValidated {
+		return false
+	}
+	return r.bytesSent >= amplificationFactor*r.bytesReceived
+}
 
-	pnSpace := h.getPacketNumberSpace(encLevel, protocol.InvalidPathID)
+// AmplificationBudgetForPath returns the number of bytes that can be sent on a path
+// before the anti-amplification limit of the path is reached.
+// For path 0, this is the anti-amplification limit of the handshake. The other paths are paths of IETF Multipath QUIC.
+// It returns protocol.MaxByteCount if the limit doesn't apply to the path.
+func (h *sentPacketHandler) AmplificationBudgetForPath(pathID protocol.PathID) protocol.ByteCount {
+	if pathID == 0 {
+		if h.peerAddressValidated {
+			return protocol.MaxByteCount
+		}
+		if limit := amplificationFactor * h.bytesReceived; limit > h.bytesSent {
+			return limit - h.bytesSent
+		}
+		return 0
+	}
+	r := h.path(pathID)
+	if !h.multipath || r == nil || r.addressValidated {
+		return protocol.MaxByteCount
+	}
+	if limit := amplificationFactor * r.bytesReceived; limit > r.bytesSent {
+		return limit - r.bytesSent
+	}
+	return 0
+}
+
+func (h *sentPacketHandler) QueueProbePacket(encLevel protocol.EncryptionLevel) bool {
+	// With IETF Multipath QUIC, the probe packet is sent on the path whose PTO expired.
+	if h.multipath && (encLevel == protocol.Encryption0RTT || encLevel == protocol.Encryption1RTT) {
+		pathID, ok := h.NextProbePath()
+		if !ok {
+			pathID = 0
+		}
+		return h.QueueProbePacketForPath(pathID)
+	}
+	return h.queueProbePacket(h.getPacketNumberSpace(encLevel, 0))
+}
+
+// QueueProbePacketForPath queues the frames of the oldest outstanding 1-RTT packet sent on a path for retransmission.
+// Without IETF Multipath QUIC, it is equivalent to QueueProbePacket for 1-RTT packets.
+func (h *sentPacketHandler) QueueProbePacketForPath(pathID protocol.PathID) bool {
+	if !h.multipath {
+		return h.QueueProbePacket(protocol.Encryption1RTT)
+	}
+	r := h.path(pathID)
+	if r == nil {
+		return false
+	}
+	return h.queueProbePacket(r.space)
+}
+
+func (h *sentPacketHandler) queueProbePacket(pnSpace *packetNumberSpace) bool {
 	pn, p := pnSpace.history.FirstOutstanding()
 	if p == nil {
 		return false
 	}
-	h.queueFramesForRetransmission(p)
-	// TODO: don't declare the packet lost here.
+	// TODO: don't remove the packet from bytes in flight here.
 	// Keep track of acknowledged frames instead.
+	// Call DeclareProbed before queueFramesForRetransmission, which clears the packet's frames.
+	pnSpace.history.DeclareProbed(pn)
 	h.removeFromBytesInFlight(p)
-	pnSpace.history.DeclareLost(pn)
+	h.queueFramesForRetransmission(p)
 	return true
+}
+
+// NextProbePath returns the path with the lowest path ID that needs to send PTO probe packets.
+// Without IETF Multipath QUIC, this is path 0.
+func (h *sentPacketHandler) NextProbePath() (protocol.PathID, bool) {
+	if !h.multipath {
+		return 0, h.appData.numProbesToSend > 0
+	}
+	for r := range h.allPaths() {
+		if !r.abandoned && r.numProbesToSend > 0 {
+			return r.id, true
+		}
+	}
+	return protocol.InvalidPathID, false
 }
 
 func (h *sentPacketHandler) queueFramesForRetransmission(p *packet) {
@@ -1403,30 +2051,31 @@ func (h *sentPacketHandler) queueFramesForRetransmission(p *packet) {
 	p.Frames = nil
 }
 
+// ResetForRetry is called when the client receives a Retry packet.
+// IETF Multipath QUIC is only used once the handshake completes, so all packets were sent on path 0.
 func (h *sentPacketHandler) ResetForRetry(now monotime.Time) {
 	h.bytesInFlight = 0
+	h.appData.bytesInFlight = 0
 	var firstPacketSendTime monotime.Time
 	for _, p := range h.initialPackets.history.Packets() {
 		if firstPacketSendTime.IsZero() {
 			firstPacketSendTime = p.SendTime
 		}
-		if !p.declaredLost && p.IsAckEliciting() {
+		if p.IsAckEliciting() {
 			h.queueFramesForRetransmission(p)
 		}
 	}
 	// All application data packets sent at this point are 0-RTT packets.
 	// In the case of a Retry, we can assume that the server dropped all of them.
-	h.forEachAppDataSpace(func(_ protocol.PathID, pnSpace *packetNumberSpace) {
-		for _, p := range pnSpace.history.Packets() {
-			if !p.declaredLost && p.IsAckEliciting() {
-				h.queueFramesForRetransmission(p)
-			}
+	for _, p := range h.appData.space.history.Packets() {
+		if p.IsAckEliciting() {
+			h.queueFramesForRetransmission(p)
 		}
-	})
+	}
 
 	// Only use the Retry to estimate the RTT if we didn't send any retransmission for the Initial.
 	// Otherwise, we don't know which Initial the Retry was sent in response to.
-	if h.ptoCount == 0 {
+	if h.appData.ptoCount == 0 {
 		// Don't set the RTT to a value lower than 5ms here.
 		h.rttStats.UpdateRTT(max(minRTTAfterRetry, now.Sub(firstPacketSendTime)), 0)
 		if h.logger.Debug() {
@@ -1437,12 +2086,7 @@ func (h *sentPacketHandler) ResetForRetry(now monotime.Time) {
 		}
 	}
 	h.initialPackets = newPacketNumberSpace(h.initialPackets.pns.Peek(), false)
-	h.appDataPackets = map[protocol.PathID]*packetNumberSpace{
-		protocol.InvalidPathID: newPacketNumberSpace(0, true),
-	}
-	h.lostPackets = map[protocol.PathID]*lostPacketTracker{
-		protocol.InvalidPathID: newLostPacketTracker(64),
-	}
+	h.appData.space = newPacketNumberSpace(h.appData.space.pns.Peek(), true)
 	oldAlarm := h.alarm
 	h.alarm = alarmTimer{}
 	if h.qlogger != nil {
@@ -1453,26 +2097,18 @@ func (h *sentPacketHandler) ResetForRetry(now monotime.Time) {
 			})
 		}
 	}
-	h.ptoCount = 0
+	h.appData.ptoCount = 0
 }
 
 func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSize protocol.ByteCount) {
+	if h.multipath {
+		h.MigratedPathForPath(0, now, initialMaxDatagramSize)
+		return
+	}
 	h.rttStats.ResetForPathMigration()
-	h.forEachAppDataSpace(func(_ protocol.PathID, pnSpace *packetNumberSpace) {
-		for pn, p := range pnSpace.history.Packets() {
-			pnSpace.history.DeclareLost(pn)
-			if !p.isPathProbePacket {
-				h.removeFromBytesInFlight(p)
-				if p.IsAckEliciting() {
-					h.queueFramesForRetransmission(p)
-				}
-			}
-		}
-		for pn := range pnSpace.history.PathProbes() {
-			pnSpace.history.RemovePathProbe(pn)
-		}
-	})
-	h.congestion = congestion.NewCubicSender(
+	h.appData.firstRTTSampleTime = 0
+	h.declareAllLostForMigration(&h.appData)
+	h.appData.congestion = congestion.NewCubicSender(
 		congestion.DefaultClock{},
 		h.rttStats,
 		h.connStats,
@@ -1480,5 +2116,68 @@ func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSi
 		true, // use Reno
 		h.qlogger,
 	)
+	// The new path might not have the same ECN capability (sections 9.2 and 13.4.2 of RFC 9000).
+	// ECN validation starts again.
+	if h.appData.ecnTracker != nil {
+		h.appData.ecnTracker.Restart()
+	}
 	h.setLossDetectionTimer(now)
+}
+
+// SetECNEnabled enables or disables sending of ECN-marked packets, without IETF Multipath QUIC.
+// It is called when the client switched to a path whose connection can or can't set the ECN bits.
+// Enabling ECN starts ECN validation (section 13.4.2 of RFC 9000).
+// With IETF Multipath QUIC, the ECN marking is chosen for every path, see ECNModeForPath.
+func (h *sentPacketHandler) SetECNEnabled(enabled bool) {
+	if h.multipath || enabled == h.enableECN {
+		return
+	}
+	h.enableECN = enabled
+	if enabled {
+		h.appData.ecnTracker = newECNTracker(h.logger, h.qlogger)
+	} else {
+		h.appData.ecnTracker = nil
+	}
+}
+
+// MigratedPathForPath resets the RTT estimate and the congestion controller of a path
+// after the path's peer address changed, and declares all packets sent on the path lost.
+// Without IETF Multipath QUIC, it is equivalent to MigratedPath.
+func (h *sentPacketHandler) MigratedPathForPath(pathID protocol.PathID, now monotime.Time, initialMaxDatagramSize protocol.ByteCount) {
+	if !h.multipath {
+		h.MigratedPath(now, initialMaxDatagramSize)
+		return
+	}
+	r := h.path(pathID)
+	if r == nil {
+		return
+	}
+	r.rttStats.ResetForPathMigration()
+	r.firstRTTSampleTime = 0
+	h.declareAllLostForMigration(r)
+	unregisterCongestionController(r.congestion)
+	var qlogger qlogwriter.Recorder
+	if r == &h.appData {
+		qlogger = h.qlogger
+	}
+	r.congestion = h.newPathCongestionController(r.id, r.rttStats, initialMaxDatagramSize, qlogger)
+	// The new path might not have the same ECN capability (section 9.2 of RFC 9000).
+	// ECN validation starts again.
+	if r.ecnTracker != nil {
+		r.ecnTracker.Restart()
+	}
+	h.setLossDetectionTimer(now)
+}
+
+func (h *sentPacketHandler) declareAllLostForMigration(r *pathRecovery) {
+	for pn, p := range r.space.history.Packets() {
+		r.space.history.DeclareLost(pn)
+		if !p.isPathProbePacket {
+			h.removeFromBytesInFlight(p)
+			if p.IsAckEliciting() {
+				h.queueFramesForRetransmission(p)
+			}
+		}
+	}
+	removePathProbes(r.space)
 }

@@ -11,11 +11,11 @@ import (
 	"net"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
-	"github.com/AeonDave/mp-quic-go"
+	quic "github.com/AeonDave/mp-quic-go"
 	"github.com/AeonDave/mp-quic-go/internal/protocol"
-	"github.com/AeonDave/mp-quic-go/internal/synctest"
 	"github.com/AeonDave/mp-quic-go/qlog"
 	"github.com/AeonDave/mp-quic-go/qlogwriter"
 	"github.com/AeonDave/mp-quic-go/testutils/simnet"
@@ -26,12 +26,11 @@ import (
 func requireIdleTimeoutError(t *testing.T, err error) {
 	t.Helper()
 
-	require.Error(t, err)
 	var idleTimeoutErr *quic.IdleTimeoutError
 	require.ErrorAs(t, err, &idleTimeoutErr)
 	require.True(t, idleTimeoutErr.Timeout())
-	var nerr net.Error
-	require.True(t, errors.As(err, &nerr))
+	nerr, ok := errors.AsType[net.Error](err)
+	require.True(t, ok)
 	require.True(t, nerr.Timeout())
 }
 
@@ -217,7 +216,7 @@ func TestKeepAlive(t *testing.T) {
 		requireIdleTimeoutError(t, err)
 
 		// can't rely on the server connection closing, since we impose a minimum idle timeout of 5s,
-		// see https://github.com/AeonDave/mp-quic-go/issues/4751
+		// see https://github.com/quic-go/quic-go/issues/4751
 		serverConn.CloseWithError(0, "")
 	})
 }
@@ -262,32 +261,37 @@ func TestTimeoutAfterInactivity(t *testing.T) {
 		_, err = conn.AcceptStream(ctx)
 		requireIdleTimeoutError(t, err)
 
-		var lastAckElicitingPacketSentAt time.Time
+		rcvdPackets := counter.getRcvdShortHeaderPackets()
+		lastPacketRcvdAt := rcvdPackets[len(rcvdPackets)-1].time
+		// The idle timeout starts when the last packet is received,
+		// or when the first ack-eliciting packet is sent after that.
+		idleTimeoutStart := lastPacketRcvdAt
 		for _, p := range counter.getSentShortHeaderPackets() {
+			if p.time.Before(lastPacketRcvdAt) {
+				continue
+			}
 			var hasAckElicitingFrame bool
 			for _, f := range p.frames {
-				if _, ok := f.Frame.(qlog.AckFrame); ok {
+				if _, ok := f.Frame.(*qlog.AckFrame); ok {
 					continue
 				}
 				hasAckElicitingFrame = true
 				break
 			}
 			if hasAckElicitingFrame {
-				lastAckElicitingPacketSentAt = p.time
+				idleTimeoutStart = p.time
+				break
 			}
 		}
-		rcvdPackets := counter.getRcvdShortHeaderPackets()
-		lastPacketRcvdAt := rcvdPackets[len(rcvdPackets)-1].time
-		// We're ignoring here that only the first ack-eliciting packet sent resets the idle timeout.
-		// This is ok since we're dealing with a lossless connection here,
-		// and we'd expect to receive an ACK for additional other ack-eliciting packet sent.
-		timeSinceLastAckEliciting := time.Since(lastAckElicitingPacketSentAt)
-		timeSinceLastRcvd := time.Since(lastPacketRcvdAt)
-		require.Equal(t, idleTimeout, max(timeSinceLastAckEliciting, timeSinceLastRcvd))
+		require.Equal(t, idleTimeout, time.Since(idleTimeoutStart))
 
+		// Once the handshake is confirmed, the client retires the connection ID used during the handshake
+		// (and with IETF Multipath QUIC, it issues a new connection ID after the server retired the one used during the
+		// handshake). If the client receives the acknowledgment for this packet after the server received the packet,
+		// the server's idle timeout expires before the client's.
 		select {
 		case <-serverConn.Context().Done():
-			t.Fatal("server connection closed unexpectedly")
+			requireIdleTimeoutError(t, context.Cause(serverConn.Context()))
 		default:
 		}
 	})
@@ -475,10 +479,10 @@ func testFaultyPacketConn(t *testing.T, pers protocol.Perspective) {
 		}
 		require.Error(t, clientErr)
 		if pers == protocol.PerspectiveClient {
-			require.Contains(t, clientErr.Error(), io.ErrClosedPipe.Error())
+			require.ErrorContains(t, clientErr, io.ErrClosedPipe.Error())
 		} else {
-			var nerr net.Error
-			require.True(t, errors.As(clientErr, &nerr))
+			nerr, ok := errors.AsType[net.Error](clientErr)
+			require.True(t, ok)
 			require.True(t, nerr.Timeout())
 		}
 
@@ -486,10 +490,10 @@ func testFaultyPacketConn(t *testing.T, pers protocol.Perspective) {
 		case serverErr := <-serverErrChan: // The handshake completed on the server side.
 			require.Error(t, serverErr)
 			if pers == protocol.PerspectiveServer {
-				require.Contains(t, serverErr.Error(), io.ErrClosedPipe.Error())
+				require.ErrorContains(t, serverErr, io.ErrClosedPipe.Error())
 			} else {
-				var nerr net.Error
-				require.True(t, errors.As(serverErr, &nerr))
+				nerr, ok := errors.AsType[net.Error](serverErr)
+				require.True(t, ok)
 				require.True(t, nerr.Timeout())
 			}
 		default: // The handshake didn't complete

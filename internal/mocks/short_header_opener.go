@@ -79,6 +79,44 @@ func (c *MockShortHeaderOpenerDecodePacketNumberCall) DoAndReturn(f func(protoco
 	return c
 }
 
+// DecodePacketNumberForPath mocks base method.
+func (m *MockShortHeaderOpener) DecodePacketNumberForPath(pathID protocol.PathID, wirePN protocol.PacketNumber, wirePNLen protocol.PacketNumberLen) protocol.PacketNumber {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "DecodePacketNumberForPath", pathID, wirePN, wirePNLen)
+	ret0, _ := ret[0].(protocol.PacketNumber)
+	return ret0
+}
+
+// DecodePacketNumberForPath indicates an expected call of DecodePacketNumberForPath.
+func (mr *MockShortHeaderOpenerMockRecorder) DecodePacketNumberForPath(pathID, wirePN, wirePNLen any) *MockShortHeaderOpenerDecodePacketNumberForPathCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DecodePacketNumberForPath", reflect.TypeOf((*MockShortHeaderOpener)(nil).DecodePacketNumberForPath), pathID, wirePN, wirePNLen)
+	return &MockShortHeaderOpenerDecodePacketNumberForPathCall{Call: call}
+}
+
+// MockShortHeaderOpenerDecodePacketNumberForPathCall wrap *gomock.Call
+type MockShortHeaderOpenerDecodePacketNumberForPathCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockShortHeaderOpenerDecodePacketNumberForPathCall) Return(arg0 protocol.PacketNumber) *MockShortHeaderOpenerDecodePacketNumberForPathCall {
+	c.Call = c.Call.Return(arg0)
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockShortHeaderOpenerDecodePacketNumberForPathCall) Do(f func(protocol.PathID, protocol.PacketNumber, protocol.PacketNumberLen) protocol.PacketNumber) *MockShortHeaderOpenerDecodePacketNumberForPathCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockShortHeaderOpenerDecodePacketNumberForPathCall) DoAndReturn(f func(protocol.PathID, protocol.PacketNumber, protocol.PacketNumberLen) protocol.PacketNumber) *MockShortHeaderOpenerDecodePacketNumberForPathCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}
+
 // DecryptHeader mocks base method.
 func (m *MockShortHeaderOpener) DecryptHeader(sample []byte, firstByte *byte, pnBytes []byte) {
 	m.ctrl.T.Helper()
@@ -150,6 +188,45 @@ func (c *MockShortHeaderOpenerOpenCall) Do(f func([]byte, []byte, monotime.Time,
 
 // DoAndReturn rewrite *gomock.Call.DoAndReturn
 func (c *MockShortHeaderOpenerOpenCall) DoAndReturn(f func([]byte, []byte, monotime.Time, protocol.PacketNumber, protocol.KeyPhaseBit, []byte) ([]byte, error)) *MockShortHeaderOpenerOpenCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}
+
+// OpenForPath mocks base method.
+func (m *MockShortHeaderOpener) OpenForPath(dst, src []byte, rcvTime monotime.Time, pathID protocol.PathID, pn protocol.PacketNumber, kp protocol.KeyPhaseBit, associatedData []byte) ([]byte, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "OpenForPath", dst, src, rcvTime, pathID, pn, kp, associatedData)
+	ret0, _ := ret[0].([]byte)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// OpenForPath indicates an expected call of OpenForPath.
+func (mr *MockShortHeaderOpenerMockRecorder) OpenForPath(dst, src, rcvTime, pathID, pn, kp, associatedData any) *MockShortHeaderOpenerOpenForPathCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "OpenForPath", reflect.TypeOf((*MockShortHeaderOpener)(nil).OpenForPath), dst, src, rcvTime, pathID, pn, kp, associatedData)
+	return &MockShortHeaderOpenerOpenForPathCall{Call: call}
+}
+
+// MockShortHeaderOpenerOpenForPathCall wrap *gomock.Call
+type MockShortHeaderOpenerOpenForPathCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockShortHeaderOpenerOpenForPathCall) Return(arg0 []byte, arg1 error) *MockShortHeaderOpenerOpenForPathCall {
+	c.Call = c.Call.Return(arg0, arg1)
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockShortHeaderOpenerOpenForPathCall) Do(f func([]byte, []byte, monotime.Time, protocol.PathID, protocol.PacketNumber, protocol.KeyPhaseBit, []byte) ([]byte, error)) *MockShortHeaderOpenerOpenForPathCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockShortHeaderOpenerOpenForPathCall) DoAndReturn(f func([]byte, []byte, monotime.Time, protocol.PathID, protocol.PacketNumber, protocol.KeyPhaseBit, []byte) ([]byte, error)) *MockShortHeaderOpenerOpenForPathCall {
 	c.Call = c.Call.DoAndReturn(f)
 	return c
 }

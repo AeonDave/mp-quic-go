@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AeonDave/mp-quic-go"
+	quic "github.com/AeonDave/mp-quic-go"
 	quicproxy "github.com/AeonDave/mp-quic-go/integrationtests/tools/proxy"
 	"github.com/AeonDave/mp-quic-go/internal/protocol"
 

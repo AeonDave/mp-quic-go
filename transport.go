@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,7 +18,8 @@ import (
 	"github.com/AeonDave/mp-quic-go/qlogwriter"
 )
 
-// ErrTransportClosed is returned by the [Transport]'s Listen or Dial method after it was closed.
+// ErrTransportClosed is returned by [Transport.Listen], [Transport.ListenEarly], [Transport.Dial],
+// or [Transport.DialEarly] after [Transport.Close] is called.
 var ErrTransportClosed = &errTransportClosed{}
 
 type errTransportClosed struct {
@@ -52,14 +52,14 @@ type closePacket struct {
 // QUIC demultiplexes connections based on their QUIC Connection IDs, not based on the 4-tuple.
 // This means that a single UDP socket can be used for listening for incoming connections, as well as
 // for dialing an arbitrary number of outgoing connections.
-// A Transport handles a single net.PacketConn, and offers a range of configuration options
+// A Transport handles a single [net.PacketConn], and offers a range of configuration options
 // compared to the simple helper functions like [Listen] and [Dial] that this package provides.
 type Transport struct {
-	// A single net.PacketConn can only be handled by one Transport.
+	// A single [net.PacketConn] can only be handled by one Transport.
 	// Bad things will happen if passed to multiple Transports.
 	//
-	// A number of optimizations will be enabled if the connections implements the OOBCapablePacketConn interface,
-	// as a *net.UDPConn does.
+	// A number of optimizations will be enabled if the connection implements [OOBCapablePacketConn],
+	// as a [net.UDPConn] does.
 	// 1. It enables the Don't Fragment (DF) bit on the IP header.
 	//    This is required to run DPLPMTUD (Path MTU Discovery, RFC 8899).
 	// 2. It enables reading of the ECN bits from the IP header.
@@ -67,7 +67,20 @@ type Transport struct {
 	// 3. It uses batched syscalls (recvmmsg) to more efficiently receive packets from the socket.
 	// 4. It uses Generic Segmentation Offload (GSO) to efficiently send batches of packets (on Linux).
 	//
-	// After passing the connection to the Transport, it's invalid to call ReadFrom or WriteTo on the connection.
+	// After passing the connection to the Transport, it's invalid to call [net.PacketConn.ReadFrom],
+	// [net.PacketConn.WriteTo], [OOBCapablePacketConn.ReadMsgUDP], or
+	// [OOBCapablePacketConn.WriteMsgUDP] on the connection.
+	//
+	// A client discards packets from server addresses other than the one it dialed (and the server's preferred
+	// address), as required by section 9 of RFC 9000. This only applies if the connection reports the source address
+	// of a packet as a [*net.UDPAddr]. A connection reporting other kinds of addresses is responsible for only
+	// passing packets from the server to the client.
+	// If the client dialed an unspecified IP address (e.g. 0.0.0.0 or ::), the operating system chooses where the
+	// packets go, usually to a loopback address. The client then accepts packets from the address that the first
+	// packet it processed came from.
+	// A server with multiple IP addresses has to send its packets from the address the client sent its packets to.
+	// A server using a connection that can't set the source address of packets (e.g. without
+	// [OOBCapablePacketConn], or on Windows) should therefore listen on a specific IP address.
 	Conn net.PacketConn
 
 	// The length of the connection ID in bytes.
@@ -81,6 +94,11 @@ type Transport struct {
 	// which allows routing / load balancing based on connection IDs.
 	// All Connection IDs returned by the ConnectionIDGenerator MUST
 	// have the same length.
+	// A connection never issues the same connection ID twice (section 5.1 of RFC 9000). With the built-in generator,
+	// every connection generates its connection IDs with a keyed permutation, which never repeats a connection ID.
+	// A ConnectionIDGenerator set here MUST never return the same connection ID twice: the connection only checks
+	// that a new connection ID is not used by itself or by another connection of the Transport, but doesn't
+	// remember the connection IDs that were retired.
 	ConnectionIDGenerator ConnectionIDGenerator
 
 	// The StatelessResetKey is used to generate stateless reset tokens.
@@ -124,20 +142,29 @@ type Transport struct {
 	// The context is closed when the connection is closed, or when the handshake fails for any reason.
 	// The context returned from the callback is used to derive every other context used during the
 	// lifetime of the connection:
-	// * the context passed to crypto/tls (and used on the tls.ClientHelloInfo)
-	// * the context used in Config.QlogTrace
-	// * the context returned from Conn.Context
-	// * the context returned from SendStream.Context
+	// * the context passed to crypto/tls (and used on the [tls.ClientHelloInfo])
+	// * the context used by [Config.Tracer]
+	// * the context returned from [Conn.Context]
+	// * the context returned from [SendStream.Context]
 	// It is not used for dialed connections.
 	ConnContext func(context.Context, *ClientInfo) (context.Context, error)
 
 	// A Tracer traces events that don't belong to a single QUIC connection.
-	// Recorder.Close is called when the transport is closed.
+	// The [qlogwriter.Recorder] is closed when the transport is closed.
 	Tracer qlogwriter.Recorder
+
+	// PreferredAddress is the address that the server asks its clients to migrate connections to,
+	// once the handshake is confirmed (section 9.6 of RFC 9000).
+	// It applies to the connections accepted by the Listener of this Transport, and must be set before calling
+	// Listen or ListenEarly. It has no effect for clients.
+	PreferredAddress *PreferredAddress
 
 	mutex       sync.Mutex
 	handlers    map[protocol.ConnectionID]packetHandler
-	resetTokens map[protocol.StatelessResetToken]packetHandler
+	resetTokens *resetTokenMap
+
+	// used by the listeners if Config.ZeroRTTReplayCache is nil
+	defaultZeroRTTReplayCache ZeroRTTReplayCache
 
 	initOnce sync.Once
 	initErr  error
@@ -207,15 +234,31 @@ func (t *Transport) createServer(tlsConf *tls.Config, conf *Config, allow0RTT bo
 		return nil, errListenerAlreadySet
 	}
 	conf = populateConfig(conf)
+	if t.defaultZeroRTTReplayCache == nil {
+		t.defaultZeroRTTReplayCache = NewZeroRTTReplayCache(DefaultZeroRTTReplayWindow, DefaultZeroRTTReplayCacheSize)
+	}
+	conf.zeroRTTReplayCache = conf.ZeroRTTReplayCache
+	if conf.zeroRTTReplayCache == nil {
+		conf.zeroRTTReplayCache = t.defaultZeroRTTReplayCache
+	}
 	if err := t.init(false); err != nil {
 		return nil, err
+	}
+	conn := t.conn
+	var preferredAddr *serverPreferredAddr
+	if t.PreferredAddress != nil {
+		var err error
+		preferredAddr, conn, err = t.PreferredAddress.setup(t)
+		if err != nil {
+			return nil, err
+		}
 	}
 	maxTokenAge := t.MaxTokenAge
 	if maxTokenAge == 0 {
 		maxTokenAge = 24 * time.Hour
 	}
 	s := newServer(
-		t.conn,
+		conn,
 		(*packetHandlerMap)(t),
 		t.connIDGenerator,
 		t.statelessResetter,
@@ -229,6 +272,7 @@ func (t *Transport) createServer(tlsConf *tls.Config, conf *Config, allow0RTT bo
 		t.VerifySourceAddress,
 		t.DisableVersionNegotiationPackets,
 		allow0RTT,
+		preferredAddr,
 	)
 	t.server = s
 	return s, nil
@@ -245,7 +289,9 @@ func (t *Transport) DialEarly(ctx context.Context, addr net.Addr, tlsConf *tls.C
 }
 
 func (t *Transport) dial(ctx context.Context, addr net.Addr, host string, tlsConf *tls.Config, conf *Config, use0RTT bool) (*Conn, error) {
-	if err := t.init(t.isSingleUse); err != nil {
+	// A Transport created for a single connection uses zero-length connection IDs.
+	// IETF Multipath QUIC requires non-zero-length connection IDs (section 2.1 of draft-ietf-quic-multipath-21).
+	if err := t.init(t.isSingleUse && !multipathConfigured(conf)); err != nil {
 		return nil, err
 	}
 	if err := validateConfig(conf); err != nil {
@@ -254,6 +300,10 @@ func (t *Transport) dial(ctx context.Context, addr net.Addr, host string, tlsCon
 	conf = populateConfig(conf)
 	tlsConf = tlsConf.Clone()
 	setTLSConfigServerName(tlsConf, addr, host)
+	version := conf.Versions[0]
+	if conf.InitialVersion != 0 {
+		version = conf.InitialVersion
+	}
 	return t.doDial(ctx,
 		newSendConn(t.conn, addr, packetInfo{}, utils.DefaultLogger),
 		tlsConf,
@@ -261,7 +311,7 @@ func (t *Transport) dial(ctx context.Context, addr net.Addr, host string, tlsCon
 		0,
 		false,
 		use0RTT,
-		conf.Versions[0],
+		version,
 	)
 }
 
@@ -288,6 +338,17 @@ func (t *Transport) doDial(
 	if t.closeErr != nil {
 		t.mutex.Unlock()
 		return nil, t.closeErr
+	}
+	// Connections of a Transport don't share connection IDs (section 10.3.2 of RFC 9000).
+	if _, ok := t.handlers[srcConnID]; ok && srcConnID.Len() > 0 {
+		srcConnID, err = generateUnusedConnID(t.connIDGenerator, func(id protocol.ConnectionID) bool {
+			_, ok := t.handlers[id]
+			return ok
+		})
+		if err != nil {
+			t.mutex.Unlock()
+			return nil, err
+		}
 	}
 
 	var qlogTrace qlogwriter.Trace
@@ -325,8 +386,7 @@ func (t *Transport) doDial(
 	recreateChan := make(chan errCloseForRecreating, 1)
 	go func() {
 		err := conn.run()
-		var recreateErr *errCloseForRecreating
-		if errors.As(err, &recreateErr) {
+		if recreateErr, ok := errors.AsType[*errCloseForRecreating](err); ok {
 			recreateChan <- *recreateErr
 			return
 		}
@@ -390,7 +450,7 @@ func (t *Transport) init(allowZeroLengthConnIDs bool) error {
 		t.logger = utils.DefaultLogger // TODO: make this configurable
 		t.conn = conn
 		t.handlers = make(map[protocol.ConnectionID]packetHandler)
-		t.resetTokens = make(map[protocol.StatelessResetToken]packetHandler)
+		t.resetTokens = newResetTokenMap()
 		t.listening = make(chan struct{})
 
 		t.closeQueue = make(chan closePacket, 4)
@@ -435,18 +495,7 @@ func (t *Transport) WriteTo(b []byte, addr net.Addr) (int, error) {
 	if err := t.init(false); err != nil {
 		return 0, err
 	}
-	// When using a MultiSocketManager as the underlying rawConn (mp-quic-go multipath),
-	// the remote address may require per-destination ancillary data (e.g. per-path
-	// Connection ID selection) to be attached.
-	// The MultiSocketManager builds that OOB data from the destination address,
-	// so we pass it through here.
-	var info packetInfo
-	if a, ok := addr.(*net.UDPAddr); ok {
-		if parsed, ok := netip.AddrFromSlice(a.IP); ok {
-			info.addr = parsed.Unmap()
-		}
-	}
-	return t.conn.WritePacket(b, addr, info.OOB(), 0, protocol.ECNUnsupported)
+	return t.conn.WritePacket(b, addr, nil, 0, protocol.ECNUnsupported)
 }
 
 func (t *Transport) runSendQueue() {
@@ -462,7 +511,7 @@ func (t *Transport) runSendQueue() {
 	}
 }
 
-// Close stops listening for UDP datagrams on the Transport.Conn.
+// Close stops listening for UDP datagrams on [Transport.Conn].
 // It abruptly terminates all existing connections, without sending a CONNECTION_CLOSE
 // to the peers. It is the application's responsibility to cleanly terminate existing
 // connections prior to calling Close.
@@ -523,11 +572,7 @@ func (t *Transport) close(e error) {
 	// Close existing connections
 	var wg sync.WaitGroup
 	for _, handler := range t.handlers {
-		wg.Add(1)
-		go func(handler packetHandler) {
-			handler.destroy(e)
-			wg.Done()
-		}(handler)
+		wg.Go(func() { handler.destroy(e) })
 	}
 	t.mutex.Unlock() // closing connections requires releasing transport mutex
 	wg.Wait()
@@ -546,7 +591,7 @@ func (t *Transport) listen(conn rawConn) {
 		//nolint:staticcheck // SA1019 ignore this!
 		// TODO: This code is used to ignore wsa errors on Windows.
 		// Since net.Error.Temporary is deprecated as of Go 1.18, we should find a better solution.
-		// See https://github.com/AeonDave/mp-quic-go/issues/1737 for details.
+		// See https://github.com/quic-go/quic-go/issues/1737 for details.
 		if nerr, ok := err.(net.Error); ok && nerr.Temporary() {
 			t.mutex.Lock()
 			closed := t.closeErr != nil
@@ -579,7 +624,11 @@ func (t *Transport) handlePacket(p receivedPacket) {
 	if len(p.data) == 0 {
 		return
 	}
+	p.transport = t
 	if !wire.IsPotentialQUICPacket(p.data[0]) && !wire.IsLongHeaderPacket(p.data[0]) {
+		if t.handleGreasedShortHeaderPacket(p) {
+			return
+		}
 		t.handleNonQUICPacket(p)
 		return
 	}
@@ -608,7 +657,7 @@ func (t *Transport) handlePacket(p receivedPacket) {
 	// Stateless resets use random connection IDs, and at reasonable connection ID lengths collisions are
 	// exceedingly rare. In the unlikely event that a stateless reset is misrouted to an existing connection,
 	// it is to be expected that the next stateless reset will be correctly detected.
-	if isStatelessReset := t.maybeHandleStatelessReset(p.data); isStatelessReset {
+	if isStatelessReset := t.maybeHandleStatelessReset(p.data, false); isStatelessReset {
 		return
 	}
 	if !wire.IsLongHeaderPacket(p.data[0]) {
@@ -639,6 +688,32 @@ func (t *Transport) handlePacket(p receivedPacket) {
 		return
 	}
 	t.server.handlePacket(p)
+}
+
+// greasedQUICBitAcceptor is implemented by connections.
+// They accept packets with the QUIC Bit set to 0 if they sent the grease_quic_bit transport parameter (RFC 9287).
+type greasedQUICBitAcceptor interface {
+	acceptsGreasedQUICBit() bool
+}
+
+// handleGreasedShortHeaderPacket handles a short header packet that has the QUIC Bit set to 0.
+// If its connection ID belongs to a connection that accepts such packets, the packet is passed to it.
+// If it is a stateless reset for such a connection, the connection is closed.
+// Otherwise, it is not a QUIC packet, and handleGreasedShortHeaderPacket returns false.
+func (t *Transport) handleGreasedShortHeaderPacket(p receivedPacket) bool {
+	connID, err := wire.ParseConnectionID(p.data, t.connIDLen)
+	if err != nil {
+		return false
+	}
+	handler, ok := (*packetHandlerMap)(t).Get(connID)
+	if !ok {
+		return t.maybeHandleStatelessReset(p.data, true)
+	}
+	if a, ok := handler.(greasedQUICBitAcceptor); !ok || !a.acceptsGreasedQUICBit() {
+		return false
+	}
+	handler.handlePacket(p)
+	return true
 }
 
 func (t *Transport) maybeSendStatelessReset(p receivedPacket) (statelessResetQueued bool) {
@@ -680,19 +755,24 @@ func (t *Transport) sendStatelessReset(p receivedPacket) {
 	}
 }
 
-func (t *Transport) maybeHandleStatelessReset(data []byte) bool {
-	// stateless resets are always short header packets
-	if wire.IsLongHeaderPacket(data[0]) {
-		return false
-	}
+// maybeHandleStatelessReset handles a packet that could be a stateless reset.
+// If greasedQUICBit is set, the packet has the QUIC Bit set to 0. It is then only a stateless reset for a connection
+// that sent the grease_quic_bit transport parameter (RFC 9287).
+func (t *Transport) maybeHandleStatelessReset(data []byte, greasedQUICBit bool) bool {
+	// Stateless resets are sent as short header packets, but any packet ending in a valid stateless reset token
+	// is a stateless reset, since other QUIC versions might use a long header (section 10.3 of RFC 9000).
 	if len(data) < 17 /* type byte + 16 bytes for the reset token */ {
 		return false
 	}
 
 	token := protocol.StatelessResetToken(data[len(data)-16:])
 	t.mutex.Lock()
-	conn, ok := t.resetTokens[token]
+	conn, ok := t.resetTokens.Get(token)
 	t.mutex.Unlock()
+	if ok && greasedQUICBit {
+		a, isAcceptor := conn.(greasedQUICBitAcceptor)
+		ok = isAcceptor && a.acceptsGreasedQUICBit()
+	}
 
 	if ok {
 		t.logger.Debugf("Received a stateless reset with token %#x. Closing connection.", token)
@@ -725,6 +805,8 @@ const maxQueuedNonQUICPackets = 32
 // ReadNonQUICPacket reads non-QUIC packets received on the underlying connection.
 // The detection logic is very simple: Any packet that has the first and second bit of the packet set to 0.
 // Note that this is stricter than the detection logic defined in RFC 9443.
+// Packets whose connection ID belongs to a connection with Config.EnableQUICBitGreasing are QUIC packets,
+// since the peer might set the second bit (the QUIC Bit) to 0 (RFC 9287).
 func (t *Transport) ReadNonQUICPacket(ctx context.Context, b []byte) (int, net.Addr, error) {
 	if err := t.init(false); err != nil {
 		return 0, nil, err
@@ -789,13 +871,13 @@ func (h *packetHandlerMap) Get(connID protocol.ConnectionID) (packetHandler, boo
 
 func (h *packetHandlerMap) AddResetToken(token protocol.StatelessResetToken, handler packetHandler) {
 	h.mutex.Lock()
-	h.resetTokens[token] = handler
+	h.resetTokens.Add(token, handler)
 	h.mutex.Unlock()
 }
 
 func (h *packetHandlerMap) RemoveResetToken(token protocol.StatelessResetToken) {
 	h.mutex.Lock()
-	delete(h.resetTokens, token)
+	h.resetTokens.Remove(token)
 	h.mutex.Unlock()
 }
 
@@ -805,6 +887,10 @@ func (h *packetHandlerMap) AddWithConnID(clientDestConnID, newConnID protocol.Co
 
 	if _, ok := h.handlers[clientDestConnID]; ok {
 		h.logger.Debugf("Not adding connection ID %s for a new connection, as it already exists.", clientDestConnID)
+		return false
+	}
+	if _, ok := h.handlers[newConnID]; ok {
+		h.logger.Debugf("Not adding connection ID %s for a new connection, as it already exists.", newConnID)
 		return false
 	}
 	h.handlers[clientDestConnID] = handler
@@ -836,6 +922,7 @@ func (h *packetHandlerMap) ReplaceWithClosed(ids []protocol.ConnectionID, connCl
 					// Just drop the packet, sending CONNECTION_CLOSE copies is best effort anyway.
 				}
 			},
+			protocol.ByteCount(len(connClosePacket)),
 			h.logger,
 		)
 	} else {
@@ -843,6 +930,14 @@ func (h *packetHandlerMap) ReplaceWithClosed(ids []protocol.ConnectionID, connCl
 	}
 
 	h.mutex.Lock()
+	// If the connection sent the grease_quic_bit transport parameter (RFC 9287),
+	// the peer might set the QUIC Bit of the packets it sends after the connection was closed to 0.
+	for _, id := range ids {
+		if conn, ok := h.handlers[id].(greasedQUICBitAcceptor); ok && conn.acceptsGreasedQUICBit() {
+			handler = &greasedQUICBitClosedConn{packetHandler: handler}
+			break
+		}
+	}
 	for _, id := range ids {
 		h.handlers[id] = handler
 	}

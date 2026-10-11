@@ -14,12 +14,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AeonDave/mp-quic-go"
+	quic "github.com/AeonDave/mp-quic-go"
 	"github.com/AeonDave/mp-quic-go/http3/internal/testdata"
 	"github.com/AeonDave/mp-quic-go/http3/qlog"
 	"github.com/AeonDave/mp-quic-go/qlogwriter"
 	"github.com/AeonDave/mp-quic-go/quicvarint"
 	"github.com/AeonDave/mp-quic-go/testutils/events"
+	"github.com/quic-go/qpack"
 
 	"github.com/stretchr/testify/require"
 )
@@ -253,6 +254,63 @@ func TestServerFirstFrameNotHeaders(t *testing.T) {
 	}
 }
 
+// A request stream that ends in the middle of a frame is a connection error of type H3_FRAME_ERROR
+// (section 7.1 of RFC 9114).
+func TestServerTruncatedHeadersFrame(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		data []byte
+	}{
+		{name: "in the frame header", data: []byte{0x1}},
+		{name: "in the payload", data: append((&headersFrame{Length: 10}).Append(nil), 1, 2, 3)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clientConn, serverConn := newConnPair(t)
+			str, err := clientConn.OpenStream()
+			require.NoError(t, err)
+			_, err = str.Write(tc.data)
+			require.NoError(t, err)
+			require.NoError(t, str.Close())
+
+			go (&Server{}).ServeQUICConn(serverConn)
+
+			select {
+			case <-clientConn.Context().Done():
+				var appErr *quic.ApplicationError
+				require.ErrorAs(t, context.Cause(clientConn.Context()), &appErr)
+				require.Equal(t, quic.ApplicationErrorCode(ErrCodeFrameError), appErr.ErrorCode)
+			case <-time.After(time.Second):
+				t.Fatal("timeout")
+			}
+		})
+	}
+}
+
+func TestServerRejectsPriorityUpdateForPush(t *testing.T) {
+	clientConn, serverConn := newConnPair(t)
+	go (&Server{}).ServeQUICConn(serverConn)
+
+	str, err := clientConn.OpenUniStream()
+	require.NoError(t, err)
+	b := quicvarint.Append(nil, streamTypeControlStream)
+	b = (&settingsFrame{}).Append(b)
+	b = quicvarint.Append(b, 0xf0701)
+	b = quicvarint.Append(b, 42)
+	b = append(b, make([]byte, 42)...)
+	_, err = str.Write(b)
+	require.NoError(t, err)
+
+	select {
+	case <-clientConn.Context().Done():
+		require.ErrorIs(t,
+			context.Cause(clientConn.Context()),
+			&quic.ApplicationError{Remote: true, ErrorCode: quic.ApplicationErrorCode(ErrCodeIDError)},
+		)
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for close")
+	}
+}
+
 func TestServerHandlerBodyNotRead(t *testing.T) {
 	t.Run("GET request with a body", func(t *testing.T) {
 		testServerHandlerBodyNotRead(t,
@@ -461,7 +519,7 @@ func TestServerRequestContext(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timeout")
 	}
-	require.Equal(t, context.Canceled, requestContext.Err())
+	require.ErrorIs(t, requestContext.Err(), context.Canceled)
 	close(block)
 }
 
@@ -773,5 +831,358 @@ func TestServerGracefulShutdown(t *testing.T) {
 		require.ErrorIs(t, err, context.Canceled)
 	case <-time.After(time.Second):
 		t.Fatal("timeout")
+	}
+}
+
+// Malformed requests MUST be treated as a stream error, see section 4.1.2 of RFC 9114.
+// This also applies to malformed trailers.
+func TestServerRequestTrailerValidation(t *testing.T) {
+	for _, tt := range trailerValidationTests(t) {
+		t.Run(tt.name, func(t *testing.T) {
+			clientConn, serverConn := newConnPair(t)
+			str, err := clientConn.OpenStream()
+			require.NoError(t, err)
+			req := httptest.NewRequest(http.MethodPost, "https://www.example.com", bytes.NewBufferString("foobar"))
+			_, err = str.Write(append(encodeRequest(t, req), tt.trailer...))
+			require.NoError(t, err)
+
+			handlerErr := make(chan error, 1)
+			s := &Server{
+				MaxHeaderBytes: tt.maxHeaderBytes,
+				Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					_, err := io.ReadAll(r.Body)
+					handlerErr <- err
+				}),
+			}
+			go s.ServeQUICConn(serverConn)
+
+			select {
+			case err := <-handlerErr:
+				require.Error(t, err)
+			case <-time.After(time.Second):
+				t.Fatal("timeout")
+			}
+			expectStreamReadReset(t, str, quic.StreamErrorCode(tt.errCode))
+			expectStreamWriteReset(t, str, quic.StreamErrorCode(tt.errCode))
+		})
+	}
+}
+
+// A field section that doesn't reference the dynamic table can use any value for the Base,
+// see section 4.5.1.2 of RFC 9204.
+func TestServerRequestNonZeroBase(t *testing.T) {
+	headers := encodeFieldSection(t,
+		qpack.HeaderField{Name: ":method", Value: http.MethodPost},
+		qpack.HeaderField{Name: ":scheme", Value: "https"},
+		qpack.HeaderField{Name: ":authority", Value: "www.example.com"},
+		qpack.HeaderField{Name: ":path", Value: "/foo"},
+	)
+	trailers := encodeFieldSection(t, qpack.HeaderField{Name: "foo", Value: "bar"})
+	require.Equal(t, []byte{0x00, 0x00}, headers[:2])
+	require.Equal(t, []byte{0x00, 0x00}, trailers[:2])
+	headers[1], trailers[1] = 0x05, 0x2a // Sign 0, Delta Base 5 and 42
+
+	clientConn, serverConn := newConnPair(t)
+	str, err := clientConn.OpenStream()
+	require.NoError(t, err)
+	b := encodeHeadersFrame(headers)
+	b = append(b, getDataFrame([]byte("foobar"))...)
+	b = append(b, encodeHeadersFrame(trailers)...)
+	_, err = str.Write(b)
+	require.NoError(t, err)
+	require.NoError(t, str.Close())
+
+	type result struct {
+		path    string
+		body    []byte
+		trailer http.Header
+		err     error
+	}
+	resultChan := make(chan result, 1)
+	s := &Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, err := io.ReadAll(r.Body)
+			resultChan <- result{path: r.URL.Path, body: body, trailer: r.Trailer, err: err}
+		}),
+	}
+	go s.ServeQUICConn(serverConn)
+
+	select {
+	case res := <-resultChan:
+		require.NoError(t, res.err)
+		require.Equal(t, "/foo", res.path)
+		require.Equal(t, []byte("foobar"), res.body)
+		require.Equal(t, http.Header{"Foo": []string{"bar"}}, res.trailer)
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+}
+
+// Some QPACK decoding errors MUST be treated as a connection error,
+// see sections 2.2.3, 3.1 and 4.5.1.1 of RFC 9204.
+func TestServerRequestHeadersQPACKConnectionError(t *testing.T) {
+	for _, tt := range qpackConnectionErrorTests {
+		t.Run(tt.name, func(t *testing.T) {
+			clientConn, serverConn := newConnPair(t)
+			str, err := clientConn.OpenStream()
+			require.NoError(t, err)
+			_, err = str.Write(encodeHeadersFrame(tt.fieldSection))
+			require.NoError(t, err)
+
+			handlerCalled := make(chan struct{})
+			s := &Server{Handler: http.HandlerFunc(func(http.ResponseWriter, *http.Request) { close(handlerCalled) })}
+			go s.ServeQUICConn(serverConn)
+
+			expectConnClosedByPeer(t, clientConn, ErrCodeQPACKDecompressionFailed)
+			select {
+			case <-handlerCalled:
+				t.Fatal("handler should not have been called")
+			default:
+			}
+		})
+	}
+}
+
+func TestServerRequestTrailersQPACKConnectionError(t *testing.T) {
+	for _, tt := range qpackConnectionErrorTests {
+		t.Run(tt.name, func(t *testing.T) {
+			clientConn, serverConn := newConnPair(t)
+			str, err := clientConn.OpenStream()
+			require.NoError(t, err)
+			req := httptest.NewRequest(http.MethodPost, "https://www.example.com", bytes.NewBufferString("foobar"))
+			_, err = str.Write(append(encodeRequest(t, req), encodeHeadersFrame(tt.fieldSection)...))
+			require.NoError(t, err)
+
+			handlerErr := make(chan error, 1)
+			s := &Server{
+				Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					_, err := io.ReadAll(r.Body)
+					handlerErr <- err
+				}),
+			}
+			go s.ServeQUICConn(serverConn)
+
+			select {
+			case err := <-handlerErr:
+				require.Error(t, err)
+			case <-time.After(time.Second):
+				t.Fatal("timeout")
+			}
+			expectConnClosedByPeer(t, clientConn, ErrCodeQPACKDecompressionFailed)
+		})
+	}
+}
+
+// A DATA or HEADERS frame after the trailing HEADERS frame MUST be treated
+// as a connection error of type H3_FRAME_UNEXPECTED, see section 4.1 of RFC 9114.
+func TestServerFramesAfterRequestTrailers(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		frame []byte
+	}{
+		{name: "DATA", frame: getDataFrame([]byte("foo"))},
+		{name: "HEADERS", frame: encodeTrailerFrame(t, qpack.HeaderField{Name: "bar", Value: "baz"})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clientConn, serverConn := newConnPair(t)
+			str, err := clientConn.OpenStream()
+			require.NoError(t, err)
+			req := httptest.NewRequest(http.MethodPost, "https://www.example.com", bytes.NewBufferString("foobar"))
+			b := encodeRequest(t, req)
+			b = append(b, encodeTrailerFrame(t, qpack.HeaderField{Name: "foo", Value: "bar"})...)
+			b = append(b, tc.frame...)
+			_, err = str.Write(b)
+			require.NoError(t, err)
+
+			type result struct {
+				body    []byte
+				trailer http.Header
+				err     error
+			}
+			resultChan := make(chan result, 1)
+			s := &Server{
+				Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					body, err := io.ReadAll(r.Body)
+					resultChan <- result{body: body, trailer: r.Trailer, err: err}
+				}),
+			}
+			go s.ServeQUICConn(serverConn)
+
+			select {
+			case res := <-resultChan:
+				require.Error(t, res.err)
+				require.Equal(t, []byte("foobar"), res.body)
+				require.Equal(t, http.Header{"Foo": []string{"bar"}}, res.trailer)
+			case <-time.After(time.Second):
+				t.Fatal("timeout")
+			}
+			expectConnClosedByPeer(t, clientConn, ErrCodeFrameUnexpected)
+		})
+	}
+}
+
+// On the stream of a CONNECT request, only DATA frames are allowed after the request (section 4.4 of RFC 9114).
+func TestServerConnectStreamHeadersFrame(t *testing.T) {
+	clientConn, serverConn := newConnPair(t)
+	str, err := clientConn.OpenStream()
+	require.NoError(t, err)
+	req := httptest.NewRequest(http.MethodConnect, "https://www.example.com", nil)
+	b := encodeRequest(t, req)
+	b = append(b, getDataFrame([]byte("foo"))...)
+	b = append(b, encodeTrailerFrame(t, qpack.HeaderField{Name: "foo", Value: "bar"})...)
+	_, err = str.Write(b)
+	require.NoError(t, err)
+
+	type result struct {
+		body []byte
+		err  error
+	}
+	resultChan := make(chan result, 1)
+	s := &Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			require.Equal(t, http.MethodConnect, r.Method)
+			w.WriteHeader(http.StatusOK)
+			body, err := io.ReadAll(r.Body)
+			resultChan <- result{body: body, err: err}
+		}),
+	}
+	go s.ServeQUICConn(serverConn)
+
+	select {
+	case res := <-resultChan:
+		require.Error(t, res.err)
+		require.Equal(t, []byte("foo"), res.body)
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+	expectConnClosedByPeer(t, clientConn, ErrCodeFrameUnexpected)
+}
+
+// testServerControlStreamConnError sends the frames on the control stream, after the SETTINGS frame,
+// and expects the server to close the connection.
+func testServerControlStreamConnError(t *testing.T, frames []byte, errCode ErrCode) {
+	t.Helper()
+
+	clientConn, serverConn := newConnPair(t)
+	go (&Server{}).ServeQUICConn(serverConn)
+
+	str, err := clientConn.OpenUniStream()
+	require.NoError(t, err)
+	b := quicvarint.Append(nil, streamTypeControlStream)
+	b = (&settingsFrame{}).Append(b)
+	_, err = str.Write(append(b, frames...))
+	require.NoError(t, err)
+	expectConnClosedByPeer(t, clientConn, errCode)
+}
+
+func TestServerControlStreamPushFrames(t *testing.T) {
+	// The server never sends PUSH_PROMISE frames, so the client can't cancel any push,
+	// see section 7.2.3 of RFC 9114.
+	t.Run("CANCEL_PUSH", func(t *testing.T) {
+		testServerControlStreamConnError(t, (&cancelPushFrame{PushID: 0}).Append(nil), ErrCodeIDError)
+	})
+
+	// section 7.2.5 of RFC 9114
+	t.Run("PUSH_PROMISE", func(t *testing.T) {
+		testServerControlStreamConnError(t, appendPushPromiseFrame(nil, 0), ErrCodeFrameUnexpected)
+	})
+
+	// section 7.2.7 of RFC 9114
+	t.Run("decreasing MAX_PUSH_ID", func(t *testing.T) {
+		b := (&maxPushIDFrame{PushID: 5}).Append(nil)
+		b = (&maxPushIDFrame{PushID: 3}).Append(b)
+		testServerControlStreamConnError(t, b, ErrCodeIDError)
+	})
+
+	// section 5.2 of RFC 9114
+	t.Run("increasing push ID in GOAWAY", func(t *testing.T) {
+		b := (&goAwayFrame{StreamID: 0}).Append(nil)
+		b = (&goAwayFrame{StreamID: 4}).Append(b)
+		testServerControlStreamConnError(t, b, ErrCodeIDError)
+	})
+
+	// Non-decreasing MAX_PUSH_ID frames and GOAWAY frames with non-increasing push IDs are valid.
+	// The PUSH_PROMISE frame at the end shows that the server processed them without closing the connection.
+	t.Run("valid frames", func(t *testing.T) {
+		b := (&maxPushIDFrame{PushID: 3}).Append(nil)
+		b = (&maxPushIDFrame{PushID: 3}).Append(b)
+		b = (&maxPushIDFrame{PushID: 5}).Append(b)
+		b = (&goAwayFrame{StreamID: 9}).Append(b)
+		b = (&goAwayFrame{StreamID: 9}).Append(b)
+		b = (&goAwayFrame{StreamID: 1}).Append(b)
+		b = appendPushPromiseFrame(b, 0)
+		testServerControlStreamConnError(t, b, ErrCodeFrameUnexpected)
+	})
+}
+
+// PUSH_PROMISE, CANCEL_PUSH, MAX_PUSH_ID and SETTINGS frames are not allowed on request streams,
+// see sections 7.2.3, 7.2.4, 7.2.5 and 7.2.7 of RFC 9114.
+func TestServerPushFramesOnRequestStream(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		frame []byte
+	}{
+		{name: "PUSH_PROMISE", frame: appendPushPromiseFrame(nil, 0)},
+		{name: "CANCEL_PUSH", frame: (&cancelPushFrame{PushID: 0}).Append(nil)},
+		{name: "MAX_PUSH_ID", frame: (&maxPushIDFrame{PushID: 0}).Append(nil)},
+		// A frame that is not allowed on the stream is unexpected, even if it is malformed.
+		{name: "CANCEL_PUSH without payload", frame: []byte{0x3, 0x0}},
+		{name: "SETTINGS ending inside a setting", frame: []byte{0x4, 0x1, 0x1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Run("before HEADERS", func(t *testing.T) {
+				clientConn, serverConn := newConnPair(t)
+				str, err := clientConn.OpenStream()
+				require.NoError(t, err)
+				req := httptest.NewRequest(http.MethodGet, "https://www.example.com", nil)
+				_, err = str.Write(append(tc.frame, encodeRequest(t, req)...))
+				require.NoError(t, err)
+
+				handlerCalled := make(chan struct{})
+				s := &Server{Handler: http.HandlerFunc(func(http.ResponseWriter, *http.Request) { close(handlerCalled) })}
+				go s.ServeQUICConn(serverConn)
+
+				expectConnClosedByPeer(t, clientConn, ErrCodeFrameUnexpected)
+				select {
+				case <-handlerCalled:
+					t.Fatal("handler should not have been called")
+				default:
+				}
+			})
+
+			t.Run("in the body", func(t *testing.T) {
+				clientConn, serverConn := newConnPair(t)
+				str, err := clientConn.OpenStream()
+				require.NoError(t, err)
+				req := httptest.NewRequest(http.MethodPost, "https://www.example.com", bytes.NewBufferString("foobar"))
+				b := encodeRequest(t, req)
+				b = append(b, tc.frame...)
+				b = append(b, getDataFrame([]byte("baz"))...)
+				_, err = str.Write(b)
+				require.NoError(t, err)
+
+				type result struct {
+					body []byte
+					err  error
+				}
+				resultChan := make(chan result, 1)
+				s := &Server{
+					Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						body, err := io.ReadAll(r.Body)
+						resultChan <- result{body: body, err: err}
+					}),
+				}
+				go s.ServeQUICConn(serverConn)
+
+				select {
+				case res := <-resultChan:
+					require.Error(t, res.err)
+					require.Equal(t, []byte("foobar"), res.body)
+				case <-time.After(time.Second):
+					t.Fatal("timeout")
+				}
+				expectConnClosedByPeer(t, clientConn, ErrCodeFrameUnexpected)
+			})
+		})
 	}
 }

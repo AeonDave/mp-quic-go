@@ -1,6 +1,8 @@
 package quic
 
 import (
+	"cmp"
+	"slices"
 	"sync"
 	"time"
 
@@ -36,6 +38,10 @@ type MultipathReinjectionPolicy struct {
 
 	// reinjectControlFrames indicates whether to reinject control frames
 	reinjectControlFrames bool
+
+	// reinjectOnPTO indicates whether the frames of the packets outstanding on a path are sent on another path
+	// when the path's probe timeout expires
+	reinjectOnPTO bool
 }
 
 // PacketReinjectionInfo tracks information about a packet pending reinjection
@@ -51,6 +57,13 @@ type PacketReinjectionInfo struct {
 	TargetPathID     protocol.PathID
 }
 
+// A reinjectionKey identifies a packet.
+// With IETF Multipath QUIC, every path has its own packet number space.
+type reinjectionKey struct {
+	pathID protocol.PathID
+	pn     protocol.PacketNumber
+}
+
 // MultipathReinjectionManager manages packet reinjection across paths
 type MultipathReinjectionManager struct {
 	mu sync.RWMutex
@@ -58,10 +71,12 @@ type MultipathReinjectionManager struct {
 	policy *MultipathReinjectionPolicy
 
 	// pendingReinjections tracks packets waiting to be reinjected
-	pendingReinjections map[protocol.PacketNumber]*PacketReinjectionInfo
+	pendingReinjections map[reinjectionKey]*PacketReinjectionInfo
 
 	// reinjectedPackets tracks packets that have been reinjected
-	reinjectedPackets map[protocol.PacketNumber]int
+	reinjectedPackets map[reinjectionKey]int
+	// totalReinjections counts all reinjections (for statistics)
+	totalReinjections int
 
 	// lastReinjectionAt tracks the last reinjection attempt per path
 	lastReinjectionAt map[protocol.PathID]time.Time
@@ -88,8 +103,8 @@ func NewMultipathReinjectionManager(policy *MultipathReinjectionPolicy) *Multipa
 	}
 	return &MultipathReinjectionManager{
 		policy:              policy,
-		pendingReinjections: make(map[protocol.PacketNumber]*PacketReinjectionInfo),
-		reinjectedPackets:   make(map[protocol.PacketNumber]int),
+		pendingReinjections: make(map[reinjectionKey]*PacketReinjectionInfo),
+		reinjectedPackets:   make(map[reinjectionKey]int),
 		lastReinjectionAt:   make(map[protocol.PathID]time.Time),
 	}
 }
@@ -180,6 +195,25 @@ func (p *MultipathReinjectionPolicy) GetMinReinjectionInterval() time.Duration {
 	return p.minReinjectionInterval
 }
 
+// SetReinjectOnPTO sets whether the frames of the packets outstanding on a path are sent on another path
+// when the probe timeout (PTO) of the path expires (section 5.7 of draft-ietf-quic-multipath-21).
+// This only applies to IETF Multipath QUIC. The frames are sent in addition to the probe packets on the path,
+// if the congestion window of the other path allows. The packets are not declared lost:
+// if one of them is lost later, its frames are retransmitted as usual.
+// Like all reinjections, it requires the policy to be enabled.
+func (p *MultipathReinjectionPolicy) SetReinjectOnPTO(enable bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.reinjectOnPTO = enable
+}
+
+// ReinjectsOnPTO returns whether frames are reinjected when the probe timeout of a path expires.
+func (p *MultipathReinjectionPolicy) ReinjectsOnPTO() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.enabled && p.reinjectOnPTO
+}
+
 // AddPreferredPathForReinjection adds a path to the preferred list
 func (p *MultipathReinjectionPolicy) AddPreferredPathForReinjection(pathID protocol.PathID) {
 	p.mu.Lock()
@@ -240,15 +274,17 @@ func (m *MultipathReinjectionManager) OnPacketLost(
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	key := reinjectionKey{pathID: pathID, pn: pn}
+	// Packet numbers are never reused: the packet won't be reported again.
+	count := m.reinjectedPackets[key]
+	delete(m.reinjectedPackets, key)
+
 	if !m.policy.IsEnabled() {
 		return
 	}
-
 	// Check if already reinjected too many times
-	if count, exists := m.reinjectedPackets[pn]; exists {
-		if count >= m.policy.GetMaxReinjections() {
-			return // Exceeded max reinjections
-		}
+	if count >= m.policy.GetMaxReinjections() {
+		return
 	}
 
 	// Check if any frame should be reinjected
@@ -271,59 +307,85 @@ func (m *MultipathReinjectionManager) OnPacketLost(
 		EncryptionLevel:  encLevel,
 		Frames:           frames,
 		LostTime:         time.Now(),
-		ReinjectionCount: m.reinjectedPackets[pn],
+		ReinjectionCount: count,
 		TargetPathID:     protocol.InvalidPathID, // Will be determined by scheduler
 	}
 	info.NextAttemptAt = info.LostTime.Add(m.policy.GetReinjectionDelay())
 
-	m.pendingReinjections[pn] = info
+	m.pendingReinjections[key] = info
 }
 
-// GetPendingReinjections returns packets ready for reinjection
+// GetPendingReinjections returns packets ready for reinjection,
+// in ascending order of their path IDs and packet numbers.
 func (m *MultipathReinjectionManager) GetPendingReinjections(now time.Time) []*PacketReinjectionInfo {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	var ready []*PacketReinjectionInfo
 
-	for pn, info := range m.pendingReinjections {
+	for key, info := range m.pendingReinjections {
 		if info.NextAttemptAt.IsZero() {
 			info.NextAttemptAt = info.LostTime.Add(m.policy.GetReinjectionDelay())
 		}
 		if !now.Before(info.NextAttemptAt) {
 			ready = append(ready, info)
-			delete(m.pendingReinjections, pn)
+			delete(m.pendingReinjections, key)
 		}
 	}
-
+	slices.SortFunc(ready, func(a, b *PacketReinjectionInfo) int {
+		if c := cmp.Compare(a.OriginalPathID, b.OriginalPathID); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.PacketNumber, b.PacketNumber)
+	})
 	return ready
 }
 
-// MarkReinjected marks a packet as having been reinjected
-func (m *MultipathReinjectionManager) MarkReinjected(pn protocol.PacketNumber, targetPath protocol.PathID) {
+// MarkReinjected marks a packet sent on a path as having been reinjected
+func (m *MultipathReinjectionManager) MarkReinjected(pathID protocol.PathID, pn protocol.PacketNumber, targetPath protocol.PathID) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.reinjectedPackets[pn]++
+	m.markReinjectedLocked(reinjectionKey{pathID: pathID, pn: pn}, targetPath)
+}
+
+func (m *MultipathReinjectionManager) markReinjectedLocked(key reinjectionKey, targetPath protocol.PathID) {
+	m.reinjectedPackets[key]++
+	m.totalReinjections++
 	if targetPath != protocol.InvalidPathID {
 		m.lastReinjectionAt[targetPath] = time.Now()
 	}
 
 	// Update info if still in pending (for stats)
-	if info, exists := m.pendingReinjections[pn]; exists {
+	if info, exists := m.pendingReinjections[key]; exists {
 		info.LastReinjectedAt = time.Now()
 		info.TargetPathID = targetPath
 		info.ReinjectionCount++
 	}
 }
 
-// OnPacketAcked is called when a packet is acknowledged, removing it from tracking
-func (m *MultipathReinjectionManager) OnPacketAcked(pn protocol.PacketNumber) {
+// reinjectOnPTO is called when the frames of a packet that is outstanding on a path whose probe timeout expired
+// are sent on another path. It returns false if the packet was reinjected too often already.
+func (m *MultipathReinjectionManager) reinjectOnPTO(pathID protocol.PathID, pn protocol.PacketNumber, targetPath protocol.PathID) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	delete(m.pendingReinjections, pn)
-	delete(m.reinjectedPackets, pn)
+	key := reinjectionKey{pathID: pathID, pn: pn}
+	if m.reinjectedPackets[key] >= m.policy.GetMaxReinjections() {
+		return false
+	}
+	m.markReinjectedLocked(key, targetPath)
+	return true
+}
+
+// OnPacketAcked is called when a packet sent on a path is acknowledged, removing it from tracking
+func (m *MultipathReinjectionManager) OnPacketAcked(pathID protocol.PathID, pn protocol.PacketNumber) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	key := reinjectionKey{pathID: pathID, pn: pn}
+	delete(m.pendingReinjections, key)
+	delete(m.reinjectedPackets, key)
 }
 
 // GetStatistics returns reinjection statistics
@@ -331,11 +393,48 @@ func (m *MultipathReinjectionManager) GetStatistics() (pending, reinjected int) 
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	pending = len(m.pendingReinjections)
-	for _, count := range m.reinjectedPackets {
-		reinjected += count
+	return len(m.pendingReinjections), m.totalReinjections
+}
+
+// forgetPacket removes the reinjection count of a packet.
+func (m *MultipathReinjectionManager) forgetPacket(pathID protocol.PathID, pn protocol.PacketNumber) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.reinjectedPackets, reinjectionKey{pathID: pathID, pn: pn})
+}
+
+// forgetPacketsExcept removes the reinjection counts of the packets sent on a path, except for the given packets
+// (in ascending order). It is called with the packets that are still outstanding on the path: the counts of other
+// packets are not needed anymore. Packets whose frames are sent in a PTO probe packet are removed from the
+// history without being acknowledged or reported lost.
+func (m *MultipathReinjectionManager) forgetPacketsExcept(pathID protocol.PathID, outstanding []protocol.PacketNumber) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for key := range m.reinjectedPackets {
+		if key.pathID != pathID {
+			continue
+		}
+		if _, ok := slices.BinarySearch(outstanding, key.pn); !ok {
+			delete(m.reinjectedPackets, key)
+		}
 	}
-	return
+}
+
+// forgetPath removes the state kept for the packets sent on a path.
+// It is called when a path is abandoned: its packets are neither acknowledged nor reported lost anymore.
+func (m *MultipathReinjectionManager) forgetPath(pathID protocol.PathID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for key := range m.reinjectedPackets {
+		if key.pathID == pathID {
+			delete(m.reinjectedPackets, key)
+		}
+	}
+	for key := range m.pendingReinjections {
+		if key.pathID == pathID {
+			delete(m.pendingReinjections, key)
+		}
+	}
 }
 
 // Reset clears all reinjection state
@@ -343,8 +442,9 @@ func (m *MultipathReinjectionManager) Reset() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.pendingReinjections = make(map[protocol.PacketNumber]*PacketReinjectionInfo)
-	m.reinjectedPackets = make(map[protocol.PacketNumber]int)
+	m.pendingReinjections = make(map[reinjectionKey]*PacketReinjectionInfo)
+	m.reinjectedPackets = make(map[reinjectionKey]int)
+	m.totalReinjections = 0
 	m.lastReinjectionAt = make(map[protocol.PathID]time.Time)
 }
 
@@ -376,5 +476,5 @@ func (m *MultipathReinjectionManager) deferReinjection(info *PacketReinjectionIn
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	info.NextAttemptAt = nextAttempt
-	m.pendingReinjections[info.PacketNumber] = info
+	m.pendingReinjections[reinjectionKey{pathID: info.OriginalPathID, pn: info.PacketNumber}] = info
 }

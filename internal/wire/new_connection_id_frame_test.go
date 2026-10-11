@@ -49,7 +49,7 @@ func TestParseNewConnectionIDInvalidConnIDLength(t *testing.T) {
 	data = append(data, []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}...) // connection ID
 	data = append(data, []byte("deadbeefdecafbad")...)                                                        // stateless reset token
 	_, _, err := parseNewConnectionIDFrame(data, protocol.Version1)
-	require.Equal(t, protocol.ErrInvalidConnectionIDLen, err)
+	require.ErrorIs(t, err, protocol.ErrInvalidConnectionIDLen)
 }
 
 func TestParseNewConnectionIDErrorsOnEOFs(t *testing.T) {
@@ -63,7 +63,7 @@ func TestParseNewConnectionIDErrorsOnEOFs(t *testing.T) {
 	require.Equal(t, len(data), l)
 	for i := range data {
 		_, _, err := parseNewConnectionIDFrame(data[:i], protocol.Version1)
-		require.Equal(t, io.EOF, err)
+		require.ErrorIs(t, err, io.EOF)
 	}
 }
 
@@ -84,5 +84,5 @@ func TestWriteNewConnectionIDFrame(t *testing.T) {
 	expected = append(expected, []byte{1, 2, 3, 4, 5, 6}...)
 	expected = append(expected, token[:]...)
 	require.Equal(t, expected, b)
-	require.Equal(t, int(frame.Length(protocol.Version1)), len(b))
+	require.Len(t, b, int(frame.Length(protocol.Version1)))
 }

@@ -14,6 +14,9 @@ type ResetStreamFrame struct {
 	ErrorCode    qerr.StreamErrorCode
 	FinalSize    protocol.ByteCount
 	ReliableSize protocol.ByteCount
+	// IsResetStreamAt is set for received RESET_STREAM_AT frames, also if their ReliableSize is 0.
+	// When sending, a frame is sent as a RESET_STREAM_AT frame if its ReliableSize is larger than 0.
+	IsResetStreamAt bool
 }
 
 func parseResetStreamFrame(b []byte, isResetStreamAt bool, _ protocol.Version) (*ResetStreamFrame, int, error) {
@@ -47,10 +50,11 @@ func parseResetStreamFrame(b []byte, isResetStreamAt bool, _ protocol.Version) (
 	}
 
 	return &ResetStreamFrame{
-		StreamID:     protocol.StreamID(streamID),
-		ErrorCode:    qerr.StreamErrorCode(errorCode),
-		FinalSize:    protocol.ByteCount(finalSize),
-		ReliableSize: protocol.ByteCount(reliableSize),
+		StreamID:        protocol.StreamID(streamID),
+		ErrorCode:       qerr.StreamErrorCode(errorCode),
+		FinalSize:       protocol.ByteCount(finalSize),
+		ReliableSize:    protocol.ByteCount(reliableSize),
+		IsResetStreamAt: isResetStreamAt,
 	}, startLen - len(b), nil
 }
 

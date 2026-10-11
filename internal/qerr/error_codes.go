@@ -27,6 +27,13 @@ const (
 	KeyUpdateError            TransportErrorCode = 0xe
 	AEADLimitReached          TransportErrorCode = 0xf
 	NoViablePathError         TransportErrorCode = 0x10
+	// VERSION_NEGOTIATION_ERROR (RFC 9368)
+	VersionNegotiationErrorCode TransportErrorCode = 0x11
+	// error codes of the multipath extension, used in PATH_ABANDON frames (draft-ietf-quic-multipath, section 4.2.1)
+	ApplicationAbandonPath   TransportErrorCode = 0x3e
+	PathResourceLimitReached TransportErrorCode = 0x3e75
+	PathUnstableOrPoor       TransportErrorCode = 0x3e76
+	NoCIDAvailableForPath    TransportErrorCode = 0x3e77
 )
 
 func (e TransportErrorCode) IsCryptoError() bool {
@@ -78,6 +85,16 @@ func (e TransportErrorCode) String() string {
 		return "AEAD_LIMIT_REACHED"
 	case NoViablePathError:
 		return "NO_VIABLE_PATH"
+	case VersionNegotiationErrorCode:
+		return "VERSION_NEGOTIATION_ERROR"
+	case ApplicationAbandonPath:
+		return "APPLICATION_ABANDON_PATH"
+	case PathResourceLimitReached:
+		return "PATH_RESOURCE_LIMIT_REACHED"
+	case PathUnstableOrPoor:
+		return "PATH_UNSTABLE_OR_POOR"
+	case NoCIDAvailableForPath:
+		return "NO_CID_AVAILABLE_FOR_PATH"
 	default:
 		if e.IsCryptoError() {
 			return fmt.Sprintf("CRYPTO_ERROR %#x", uint16(e))

@@ -351,3 +351,100 @@ func TestECNCongestionDetection(t *testing.T) {
 	require.True(t, ecnTracker.HandleNewlyAcked(getAckedPackets(7, 8, 9, 14), 7, 0, 2))
 	require.Empty(t, eventRecorder.Events())
 }
+
+// After a restart, ECN is validated again, as for a new path (section 9.2 of RFC 9000).
+// The ECN counts reported by the peer still include the packets sent before the restart.
+func TestECNRestart(t *testing.T) {
+	var eventRecorder events.Recorder
+	ecnTracker := newECNTracker(utils.DefaultLogger, &eventRecorder)
+
+	sendECNTestingPackets(t, ecnTracker, &eventRecorder)
+	require.False(t, ecnTracker.HandleNewlyAcked(getAckedPackets(0, 1, 2), 3, 0, 0))
+	require.Equal(t,
+		[]qlogwriter.Event{qlog.ECNStateUpdated{State: qlog.ECNStateCapable}},
+		eventRecorder.Events(),
+	)
+	for pn := protocol.PacketNumber(10); pn < 15; pn++ {
+		require.Equal(t, protocol.ECT0, ecnTracker.Mode())
+		ecnTracker.SentPacket(pn, protocol.ECT0)
+	}
+	eventRecorder.Clear()
+
+	ecnTracker.Restart()
+	require.Equal(t,
+		[]qlogwriter.Event{qlog.ECNStateUpdated{State: qlog.ECNStateTesting}},
+		eventRecorder.Events(),
+	)
+	eventRecorder.Clear()
+	// 10 testing packets are sent
+	for pn := protocol.PacketNumber(20); pn < 30; pn++ {
+		require.Equal(t, protocol.ECT0, ecnTracker.Mode())
+		ecnTracker.SentPacket(pn, protocol.ECT0)
+	}
+	require.Equal(t,
+		[]qlogwriter.Event{qlog.ECNStateUpdated{State: qlog.ECNStateUnknown}},
+		eventRecorder.Events(),
+	)
+	eventRecorder.Clear()
+	require.Equal(t, protocol.ECNNon, ecnTracker.Mode())
+	// A late acknowledgment for packets sent before the restart doesn't confirm ECN capability.
+	require.False(t, ecnTracker.HandleNewlyAcked(getAckedPackets(10, 11, 12, 13, 14), 8, 0, 0))
+	require.Empty(t, eventRecorder.Events())
+	// an acknowledgment for a testing packet does
+	require.False(t, ecnTracker.HandleNewlyAcked(getAckedPackets(20), 9, 0, 0))
+	require.Equal(t,
+		[]qlogwriter.Event{qlog.ECNStateUpdated{State: qlog.ECNStateCapable}},
+		eventRecorder.Events(),
+	)
+}
+
+// Mangling is detected after a restart, even if packets sent before the restart were marked CE.
+func TestECNRestartMangling(t *testing.T) {
+	var eventRecorder events.Recorder
+	ecnTracker := newECNTracker(utils.DefaultLogger, &eventRecorder)
+
+	sendECNTestingPackets(t, ecnTracker, &eventRecorder)
+	// ECN is validated, and a CE mark is a congestion signal
+	require.True(t, ecnTracker.HandleNewlyAcked(getAckedPackets(0, 1), 1, 0, 1))
+	ecnTracker.Restart()
+	eventRecorder.Clear()
+	for pn := protocol.PacketNumber(20); pn < 30; pn++ {
+		require.Equal(t, protocol.ECT0, ecnTracker.Mode())
+		ecnTracker.SentPacket(pn, protocol.ECT0)
+	}
+	eventRecorder.Clear()
+	// 9 of the testing packets are marked CE, one is lost
+	require.False(t, ecnTracker.HandleNewlyAcked(getAckedPackets(20, 21, 22, 23, 24, 25, 26, 27, 28), 1, 0, 10))
+	require.Empty(t, eventRecorder.Events())
+	ecnTracker.LostPacket(29)
+	require.Equal(t,
+		[]qlogwriter.Event{qlog.ECNStateUpdated{State: qlog.ECNStateFailed, Trigger: ecnFailedManglingDetected}},
+		eventRecorder.Events(),
+	)
+}
+
+// ECN validation also restarts after it failed.
+func TestECNRestartAfterFailure(t *testing.T) {
+	var eventRecorder events.Recorder
+	ecnTracker := newECNTracker(utils.DefaultLogger, &eventRecorder)
+
+	sendECNTestingPackets(t, ecnTracker, &eventRecorder)
+	for pn := range protocol.PacketNumber(10) {
+		ecnTracker.LostPacket(pn)
+	}
+	require.Equal(t, protocol.ECNNon, ecnTracker.Mode())
+	ecnTracker.Restart()
+	require.Equal(t, protocol.ECT0, ecnTracker.Mode())
+	ecnTracker.SentPacket(10, protocol.ECT0)
+	require.False(t, ecnTracker.HandleNewlyAcked(getAckedPackets(10), 1, 0, 0))
+	require.Equal(t, protocol.ECT0, ecnTracker.Mode())
+}
+
+// A tracker that didn't start testing yet isn't affected by a restart.
+func TestECNRestartBeforeTesting(t *testing.T) {
+	var eventRecorder events.Recorder
+	ecnTracker := newECNTracker(utils.DefaultLogger, &eventRecorder)
+	ecnTracker.Restart()
+	require.Empty(t, eventRecorder.Events())
+	sendECNTestingPackets(t, ecnTracker, &eventRecorder)
+}

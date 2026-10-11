@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"slices"
 
 	"github.com/AeonDave/mp-quic-go/internal/ackhandler"
 	"github.com/AeonDave/mp-quic-go/internal/handshake"
@@ -17,17 +18,41 @@ import (
 
 var errNothingToPack = errors.New("nothing to pack")
 
+// errPacketNumbersExhausted is returned when the next packet number reaches the largest packet number.
+// The connection is then closed without sending any further packets (section 12.3 of RFC 9000).
+var errPacketNumbersExhausted = &qerr.TransportError{
+	ErrorCode:    qerr.InternalError,
+	ErrorMessage: "packet numbers exhausted",
+}
+
 type packer interface {
 	PackCoalescedPacket(onlyAck bool, maxPacketSize protocol.ByteCount, now monotime.Time, v protocol.Version, pathID protocol.PathID) (*coalescedPacket, error)
 	PackAckOnlyPacket(maxPacketSize protocol.ByteCount, now monotime.Time, v protocol.Version, pathID protocol.PathID) (shortHeaderPacket, *packetBuffer, error)
 	AppendPacket(_ *packetBuffer, maxPacketSize protocol.ByteCount, now monotime.Time, v protocol.Version, pathID protocol.PathID) (shortHeaderPacket, error)
 	PackPTOProbePacket(_ protocol.EncryptionLevel, _ protocol.ByteCount, addPingIfEmpty bool, now monotime.Time, v protocol.Version, pathID protocol.PathID) (*coalescedPacket, error)
-	PackConnectionClose(*qerr.TransportError, protocol.ByteCount, protocol.Version) (*coalescedPacket, error)
-	PackApplicationClose(*qerr.ApplicationError, protocol.ByteCount, protocol.Version) (*coalescedPacket, error)
-	PackPathProbePacket(protocol.ConnectionID, []ackhandler.Frame, protocol.Version, protocol.PathID) (shortHeaderPacket, *packetBuffer, error)
+	PackConnectionClose(*qerr.TransportError, protocol.ByteCount, protocol.Version, protocol.PathID) (*coalescedPacket, error)
+	PackApplicationClose(*qerr.ApplicationError, protocol.ByteCount, protocol.Version, protocol.PathID) (*coalescedPacket, error)
+	// PackPathProbePacket packs a packet containing PATH_CHALLENGE and PATH_RESPONSE frames, sent to connID.
+	// The datagram is expanded to 1200 bytes, unless maxPacketSize is smaller.
+	PackPathProbePacket(_ protocol.ConnectionID, _ []ackhandler.Frame, maxPacketSize protocol.ByteCount, _ protocol.Version, _ protocol.PathID) (shortHeaderPacket, *packetBuffer, error)
 	PackMTUProbePacket(ping ackhandler.Frame, size protocol.ByteCount, v protocol.Version, pathID protocol.PathID) (shortHeaderPacket, *packetBuffer, error)
+	// PackMultipathProbePacket packs a packet that carries frames bound to a path of IETF Multipath QUIC
+	// (PATH_CHALLENGE and PATH_RESPONSE frames), and the PATH_ACK frame for the path, if one is available.
+	// It is sent to connID, a connection ID of the path.
+	PackMultipathProbePacket(pathID protocol.PathID, connID protocol.ConnectionID, frames []ackhandler.Frame, maxPacketSize, padTo protocol.ByteCount, now monotime.Time, v protocol.Version) (shortHeaderPacket, *packetBuffer, error)
+	// PackPathPacket packs a packet that only carries the given frames, on a path of IETF Multipath QUIC.
+	PackPathPacket(pathID protocol.PathID, frames []ackhandler.Frame, streamFrames []ackhandler.StreamFrame, maxPacketSize protocol.ByteCount, v protocol.Version) (shortHeaderPacket, *packetBuffer, error)
 
 	SetToken([]byte)
+	// EnableMultipath enables IETF Multipath QUIC.
+	// From now on, the path ID of 1-RTT packets selects the destination connection ID, the packet number space
+	// and the nonce, and the packets carry PATH_ACK frames.
+	// getDestConnID returns false if the peer didn't provide a connection ID for a path.
+	EnableMultipath(getDestConnID func(protocol.PathID) (protocol.ConnectionID, bool), pathFrames mpFrameSource)
+	// EnableAddressDiscovery enables sending of the OBSERVED_ADDRESS frames of QUIC Address Discovery.
+	EnableAddressDiscovery(observedAddressSource)
+	// EnableQUICBitGreasing sets the QUIC Bit of all packets packed from now on to a random value (RFC 9287).
+	EnableQUICBitGreasing()
 }
 
 type sealer interface {
@@ -38,7 +63,9 @@ type payload struct {
 	streamFrames []ackhandler.StreamFrame
 	frames       []ackhandler.Frame
 	ack          *wire.AckFrame
-	length       protocol.ByteCount
+	// IETF Multipath QUIC: PATH_ACK frames for other paths than the path the packet is sent on
+	extraAcks []*wire.AckFrame
+	length    protocol.ByteCount
 }
 
 type longHeaderPacket struct {
@@ -54,10 +81,12 @@ type longHeaderPacket struct {
 }
 
 type shortHeaderPacket struct {
-	PacketNumber         protocol.PacketNumber
-	Frames               []ackhandler.Frame
-	StreamFrames         []ackhandler.StreamFrame
-	Ack                  *wire.AckFrame
+	PacketNumber protocol.PacketNumber
+	Frames       []ackhandler.Frame
+	StreamFrames []ackhandler.StreamFrame
+	Ack          *wire.AckFrame
+	// IETF Multipath QUIC: PATH_ACK frames for other paths than the path the packet is sent on
+	ExtraAcks            []*wire.AckFrame
 	Length               protocol.ByteCount
 	IsPathMTUProbePacket bool
 	IsPathProbePacket    bool
@@ -119,6 +148,21 @@ type frameSource interface {
 
 type ackFrameSource interface {
 	GetAckFrame(_ protocol.EncryptionLevel, now monotime.Time, onlyIfQueued bool, pathID protocol.PathID) *wire.AckFrame
+	AckDuePaths(now monotime.Time) []protocol.PathID
+}
+
+// An mpFrameSource provides frames that need to be sent on a specific path of IETF Multipath QUIC,
+// e.g. PATH_RESPONSE frames.
+type mpFrameSource interface {
+	HasPathFrames(protocol.PathID) bool
+	AppendPathFrames(_ []ackhandler.Frame, _ protocol.PathID, maxLen protocol.ByteCount, _ protocol.Version) ([]ackhandler.Frame, protocol.ByteCount)
+}
+
+// An observedAddressSource provides the OBSERVED_ADDRESS frames of QUIC Address Discovery
+// (draft-ietf-quic-address-discovery-01), which need to be sent on a specific path.
+type observedAddressSource interface {
+	HasObservedAddress(protocol.PathID) bool
+	AppendObservedAddress(_ []ackhandler.Frame, _ protocol.PathID, maxLen protocol.ByteCount, _ protocol.Version) ([]ackhandler.Frame, protocol.ByteCount)
 }
 
 type packetPacker struct {
@@ -127,6 +171,9 @@ type packetPacker struct {
 
 	perspective protocol.Perspective
 	cryptoSetup sealingManager
+	// If set, 0-RTT packets use this version, and not the version in use for the connection.
+	// The client sets it to its Chosen Version (section 4.1 of RFC 9369).
+	zeroRTTVersion protocol.Version
 
 	initialStream   *initialCryptoStream
 	handshakeStream *cryptoStream
@@ -142,8 +189,21 @@ type packetPacker struct {
 
 	numNonAckElicitingAcks int
 
-	// Multipath support
-	multipathController MultipathController
+	// IETF Multipath QUIC
+	multipath bool
+	// returns the destination connection ID of paths other than path 0
+	getPathDestConnID func(protocol.PathID) (protocol.ConnectionID, bool)
+	pathFrames        mpFrameSource
+
+	// QUIC Address Discovery
+	observedAddrs observedAddressSource
+
+	// Set once the peer sent the grease_quic_bit transport parameter (RFC 9287), if greasing is enabled locally.
+	greaseQUICBit bool
+
+	// Returns the number of bytes that can be sent on a path before its anti-amplification limit is reached.
+	// If nil, the limit doesn't apply.
+	amplificationBudget func(protocol.PathID) protocol.ByteCount
 }
 
 var _ packer = &packetPacker{}
@@ -160,7 +220,6 @@ func newPacketPacker(
 	acks ackFrameSource,
 	datagramQueue *datagramQueue,
 	perspective protocol.Perspective,
-	multipathController MultipathController,
 ) *packetPacker {
 	var b [16]byte
 	_, _ = crand.Read(b[:])
@@ -178,23 +237,65 @@ func newPacketPacker(
 		acks:                acks,
 		rand:                *rand.New(rand.NewPCG(binary.BigEndian.Uint64(b[:8]), binary.BigEndian.Uint64(b[8:]))),
 		pnManager:           packetNumberManager,
-		multipathController: multipathController,
 	}
 }
 
+// EnableMultipath enables IETF Multipath QUIC.
+func (p *packetPacker) EnableMultipath(getDestConnID func(protocol.PathID) (protocol.ConnectionID, bool), pathFrames mpFrameSource) {
+	p.multipath = true
+	p.getPathDestConnID = getDestConnID
+	p.pathFrames = pathFrames
+}
+
+// EnableAddressDiscovery enables sending of OBSERVED_ADDRESS frames.
+// They are only sent in 1-RTT packets.
+func (p *packetPacker) EnableAddressDiscovery(s observedAddressSource) {
+	p.observedAddrs = s
+}
+
+// EnableQUICBitGreasing sets the QUIC Bit of all packets packed from now on to a random value.
+// It must only be called once the peer's transport parameters were processed,
+// and if the peer sent the grease_quic_bit transport parameter (section 3.1 of RFC 9287).
+func (p *packetPacker) EnableQUICBitGreasing() {
+	p.greaseQUICBit = true
+}
+
+// maybeGreaseQUICBit sets the QUIC Bit of the first byte of the header to a random value, if enabled.
+// The first byte is protected by the AEAD, so this needs to happen before the packet is sealed.
+func (p *packetPacker) maybeGreaseQUICBit(firstByte *byte) {
+	if p.greaseQUICBit && p.rand.Uint32()&1 == 0 {
+		*firstByte &^= 0x40
+	}
+}
+
+// destConnID returns the destination connection ID for a 1-RTT packet sent on a path.
+// Without IETF Multipath QUIC, the same connection ID is used on all paths.
+// With IETF Multipath QUIC, packets are only sent on a path once the peer provided a connection ID for it
+// (section 3.1 of draft-ietf-quic-multipath-21). Packets are never sent with an empty connection ID instead.
+func (p *packetPacker) destConnID(pathID protocol.PathID) (protocol.ConnectionID, error) {
+	if p.multipath && pathID != 0 {
+		connID, ok := p.getPathDestConnID(pathID)
+		if !ok {
+			return protocol.ConnectionID{}, fmt.Errorf("no connection ID available for path %d", pathID)
+		}
+		return connID, nil
+	}
+	return p.getDestConnID(), nil
+}
+
 // PackConnectionClose packs a packet that closes the connection with a transport error.
-func (p *packetPacker) PackConnectionClose(e *qerr.TransportError, maxPacketSize protocol.ByteCount, v protocol.Version) (*coalescedPacket, error) {
+func (p *packetPacker) PackConnectionClose(e *qerr.TransportError, maxPacketSize protocol.ByteCount, v protocol.Version, pathID protocol.PathID) (*coalescedPacket, error) {
 	var reason string
 	// don't send details of crypto errors
 	if !e.ErrorCode.IsCryptoError() {
 		reason = e.ErrorMessage
 	}
-	return p.packConnectionClose(false, uint64(e.ErrorCode), e.FrameType, reason, maxPacketSize, v)
+	return p.packConnectionClose(false, uint64(e.ErrorCode), e.FrameType, reason, maxPacketSize, v, pathID)
 }
 
 // PackApplicationClose packs a packet that closes the connection with an application error.
-func (p *packetPacker) PackApplicationClose(e *qerr.ApplicationError, maxPacketSize protocol.ByteCount, v protocol.Version) (*coalescedPacket, error) {
-	return p.packConnectionClose(true, uint64(e.ErrorCode), 0, e.ErrorMessage, maxPacketSize, v)
+func (p *packetPacker) PackApplicationClose(e *qerr.ApplicationError, maxPacketSize protocol.ByteCount, v protocol.Version, pathID protocol.PathID) (*coalescedPacket, error) {
+	return p.packConnectionClose(true, uint64(e.ErrorCode), 0, e.ErrorMessage, maxPacketSize, v, pathID)
 }
 
 func (p *packetPacker) packConnectionClose(
@@ -204,6 +305,7 @@ func (p *packetPacker) packConnectionClose(
 	reason string,
 	maxPacketSize protocol.ByteCount,
 	v protocol.Version,
+	pathID protocol.PathID,
 ) (*coalescedPacket, error) {
 	var sealers [4]sealer
 	var hdrs [3]*wire.ExtendedHeader
@@ -262,9 +364,12 @@ func (p *packetPacker) packConnectionClose(
 		sealers[i] = sealer
 		var hdr *wire.ExtendedHeader
 		if encLevel == protocol.Encryption1RTT {
-			connID = p.getDestConnID()
-			oneRTTPacketNumber, oneRTTPacketNumberLen = p.pnManager.PeekPacketNumber(protocol.InvalidPathID, protocol.Encryption1RTT)
-			size += p.shortHeaderPacketLength(connID, oneRTTPacketNumberLen, pl)
+			connID, err = p.destConnID(pathID)
+			if err != nil {
+				return nil, err
+			}
+			oneRTTPacketNumber, oneRTTPacketNumberLen = p.pnManager.PeekPacketNumber(pathID, protocol.Encryption1RTT)
+			size += p.shortHeaderPacketLength(connID, oneRTTPacketNumberLen, pl) + protocol.ByteCount(sealer.Overhead())
 		} else {
 			hdr = p.getLongHeader(encLevel, v)
 			hdrs[i] = hdr
@@ -283,7 +388,7 @@ func (p *packetPacker) packConnectionClose(
 			continue
 		}
 		if encLevel == protocol.Encryption1RTT {
-			shp, err := p.appendShortHeaderPacket(buffer, connID, oneRTTPacketNumber, oneRTTPacketNumberLen, keyPhase, payloads[i], 0, maxPacketSize, sealers[i], false, v, protocol.InvalidPathID)
+			shp, err := p.appendShortHeaderPacket(buffer, connID, oneRTTPacketNumber, oneRTTPacketNumberLen, keyPhase, payloads[i], 0, maxPacketSize, sealers[i].(handshake.ShortHeaderSealer), false, v, pathID)
 			if err != nil {
 				return nil, err
 			}
@@ -405,7 +510,10 @@ func (p *packetPacker) PackCoalescedPacket(onlyAck bool, maxSize protocol.ByteCo
 		}
 		if err == nil { // 1-RTT
 			kp = oneRTTSealer.KeyPhase()
-			connID = p.getDestConnID()
+			connID, err = p.destConnID(pathID)
+			if err != nil {
+				return nil, err
+			}
 			oneRTTPacketNumber, oneRTTPacketNumberLen = p.pnManager.PeekPacketNumber(pathID, protocol.Encryption1RTT)
 			hdrLen := wire.ShortHeaderLen(connID, oneRTTPacketNumberLen)
 			oneRTTPayload = p.maybeGetShortHeaderPacket(oneRTTSealer, hdrLen, maxSize-size, onlyAck, now, v, pathID)
@@ -419,9 +527,9 @@ func (p *packetPacker) PackCoalescedPacket(onlyAck bool, maxSize protocol.ByteCo
 				return nil, err
 			}
 			if zeroRTTSealer != nil {
-				zeroRTTHdr, zeroRTTPayload = p.maybeGetAppDataPacketFor0RTT(zeroRTTSealer, maxSize-size, now, v)
+				zeroRTTHdr, zeroRTTPayload = p.maybeGetAppDataPacketFor0RTT(zeroRTTSealer, maxSize-size, now, p.get0RTTVersion(v))
 				if zeroRTTPayload.length > 0 {
-					size += p.longHeaderPacketLength(zeroRTTHdr, zeroRTTPayload, v) + protocol.ByteCount(zeroRTTSealer.Overhead())
+					size += p.longHeaderPacketLength(zeroRTTHdr, zeroRTTPayload, p.get0RTTVersion(v)) + protocol.ByteCount(zeroRTTSealer.Overhead())
 				}
 			}
 		}
@@ -436,9 +544,10 @@ func (p *packetPacker) PackCoalescedPacket(onlyAck bool, maxSize protocol.ByteCo
 		buffer:         buffer,
 		longHdrPackets: make([]*longHeaderPacket, 0, 3),
 	}
+	var initialPadding protocol.ByteCount
 	if initialPayload.length > 0 {
-		padding := p.initialPaddingLen(initialPayload.frames, size, maxSize)
-		cont, err := p.appendLongHeaderPacket(buffer, initialHdr, initialPayload, padding, protocol.EncryptionInitial, initialSealer, v)
+		initialPadding = p.initialPaddingLen(initialPayload.frames, size, maxSize)
+		cont, err := p.appendLongHeaderPacket(buffer, initialHdr, initialPayload, initialPadding, protocol.EncryptionInitial, initialSealer, v)
 		if err != nil {
 			return nil, err
 		}
@@ -452,13 +561,14 @@ func (p *packetPacker) PackCoalescedPacket(onlyAck bool, maxSize protocol.ByteCo
 		packet.longHdrPackets = append(packet.longHdrPackets, cont)
 	}
 	if zeroRTTPayload.length > 0 {
-		longHdrPacket, err := p.appendLongHeaderPacket(buffer, zeroRTTHdr, zeroRTTPayload, 0, protocol.Encryption0RTT, zeroRTTSealer, v)
+		longHdrPacket, err := p.appendLongHeaderPacket(buffer, zeroRTTHdr, zeroRTTPayload, 0, protocol.Encryption0RTT, zeroRTTSealer, p.get0RTTVersion(v))
 		if err != nil {
 			return nil, err
 		}
 		packet.longHdrPackets = append(packet.longHdrPackets, longHdrPacket)
 	} else if oneRTTPayload.length > 0 {
-		shp, err := p.appendShortHeaderPacket(buffer, connID, oneRTTPacketNumber, oneRTTPacketNumberLen, kp, oneRTTPayload, 0, maxSize, oneRTTSealer, false, v, pathID)
+		padding := p.pathValidationPadding(oneRTTPayload, size+initialPadding, maxSize, pathID)
+		shp, err := p.appendShortHeaderPacket(buffer, connID, oneRTTPacketNumber, oneRTTPacketNumberLen, kp, oneRTTPayload, padding, maxSize, oneRTTSealer, false, v, pathID)
 		if err != nil {
 			return nil, err
 		}
@@ -494,7 +604,10 @@ func (p *packetPacker) appendPacket(
 		return shortHeaderPacket{}, err
 	}
 	pn, pnLen := p.pnManager.PeekPacketNumber(pathID, protocol.Encryption1RTT)
-	connID := p.getDestConnID()
+	connID, err := p.destConnID(pathID)
+	if err != nil {
+		return shortHeaderPacket{}, err
+	}
 	hdrLen := wire.ShortHeaderLen(connID, pnLen)
 	pl := p.maybeGetShortHeaderPacket(sealer, hdrLen, maxPacketSize, onlyAck, now, v, pathID)
 	if pl.length == 0 {
@@ -502,8 +615,34 @@ func (p *packetPacker) appendPacket(
 	}
 	kp := sealer.KeyPhase()
 
-	packet, err := p.appendShortHeaderPacket(buf, connID, pn, pnLen, kp, pl, 0, maxPacketSize, sealer, false, v, pathID)
+	size := p.shortHeaderPacketLength(connID, pnLen, pl) + protocol.ByteCount(sealer.Overhead())
+	padding := p.pathValidationPadding(pl, size, maxPacketSize, pathID)
+	packet, err := p.appendShortHeaderPacket(buf, connID, pn, pnLen, kp, pl, padding, maxPacketSize, sealer, false, v, pathID)
 	return packet, err
+}
+
+// pathValidationPadding returns the padding that expands a datagram containing a PATH_CHALLENGE or PATH_RESPONSE
+// frame to 1200 bytes (sections 8.2.1 and 8.2.2 of RFC 9000). size is the size of the datagram without padding,
+// and pl the payload of its 1-RTT packet. The datagram is not expanded beyond maxSize, and not at all if the
+// anti-amplification limit doesn't allow sending a datagram of 1200 bytes.
+func (p *packetPacker) pathValidationPadding(pl payload, size, maxSize protocol.ByteCount, pathID protocol.PathID) protocol.ByteCount {
+	padTo := min(protocol.ByteCount(protocol.MinInitialPacketSize), maxSize)
+	if size >= padTo || !slices.ContainsFunc(pl.frames, isPathValidationFrame) {
+		return 0
+	}
+	if p.amplificationBudget != nil && p.amplificationBudget(pathID) < protocol.MinInitialPacketSize {
+		return 0
+	}
+	return padTo - size
+}
+
+func isPathValidationFrame(f ackhandler.Frame) bool {
+	switch f.Frame.(type) {
+	case *wire.PathChallengeFrame, *wire.PathResponseFrame:
+		return true
+	default:
+		return false
+	}
 }
 
 func (p *packetPacker) maybeGetCryptoPacket(
@@ -515,7 +654,7 @@ func (p *packetPacker) maybeGetCryptoPacket(
 	v protocol.Version,
 ) (*wire.ExtendedHeader, payload) {
 	if onlyAck {
-		if ack := p.acks.GetAckFrame(encLevel, now, true, protocol.InvalidPathID); ack != nil {
+		if ack := p.acks.GetAckFrame(encLevel, now, true, 0); ack != nil {
 			hdr := p.getLongHeader(encLevel, v)
 			maxPacketSize -= hdr.GetLength(v)
 			ack.Truncate(maxPacketSize, v)
@@ -538,7 +677,7 @@ func (p *packetPacker) maybeGetCryptoPacket(
 	handler := p.retransmissionQueue.AckHandler(encLevel)
 	hasRetransmission := p.retransmissionQueue.HasData(encLevel)
 
-	ack := p.acks.GetAckFrame(encLevel, now, !hasRetransmission && !hasCryptoData(), protocol.InvalidPathID)
+	ack := p.acks.GetAckFrame(encLevel, now, !hasRetransmission && !hasCryptoData(), 0)
 	var pl payload
 	if !hasCryptoData() && !hasRetransmission && ack == nil {
 		if !addPingIfEmpty {
@@ -588,6 +727,13 @@ func (p *packetPacker) maybeGetCryptoPacket(
 	return hdr, pl
 }
 
+func (p *packetPacker) get0RTTVersion(v protocol.Version) protocol.Version {
+	if p.zeroRTTVersion != 0 {
+		return p.zeroRTTVersion
+	}
+	return v
+}
+
 func (p *packetPacker) maybeGetAppDataPacketFor0RTT(sealer sealer, maxSize protocol.ByteCount, now monotime.Time, v protocol.Version) (*wire.ExtendedHeader, payload) {
 	if p.perspective != protocol.PerspectiveClient {
 		return nil, payload{}
@@ -595,7 +741,7 @@ func (p *packetPacker) maybeGetAppDataPacketFor0RTT(sealer sealer, maxSize proto
 
 	hdr := p.getLongHeader(protocol.Encryption0RTT, v)
 	maxPayloadSize := maxSize - hdr.GetLength(v) - protocol.ByteCount(sealer.Overhead())
-	return hdr, p.maybeGetAppDataPacket(maxPayloadSize, false, false, now, v, protocol.InvalidPathID)
+	return hdr, p.maybeGetAppDataPacket(maxPayloadSize, false, false, now, v, 0)
 }
 
 func (p *packetPacker) maybeGetShortHeaderPacket(
@@ -621,7 +767,7 @@ func (p *packetPacker) maybeGetAppDataPacket(
 
 	// check if we have anything to send
 	if len(pl.frames) == 0 && len(pl.streamFrames) == 0 {
-		if pl.ack == nil {
+		if pl.ack == nil && len(pl.extraAcks) == 0 {
 			return payload{}
 		}
 		// the packet only contains an ACK
@@ -647,23 +793,45 @@ func (p *packetPacker) composeNextPacket(
 	pathID protocol.PathID,
 ) payload {
 	if onlyAck {
+		var pl payload
 		if ack := p.acks.GetAckFrame(protocol.Encryption1RTT, now, true, pathID); ack != nil {
 			ack.Truncate(maxPayloadSize, v)
-			return payload{ack: ack, length: ack.Length(v)}
+			pl.ack = ack
+			pl.length = ack.Length(v)
 		}
-		return payload{}
+		if p.multipath {
+			p.appendExtraAcks(&pl, maxPayloadSize, now, v, pathID)
+		}
+		return pl
 	}
 
 	hasData := p.framer.HasData()
 	hasRetransmission := p.retransmissionQueue.HasData(protocol.Encryption1RTT)
+	hasPathFrames := p.multipath && p.pathFrames.HasPathFrames(pathID)
+	// OBSERVED_ADDRESS frames are only sent in 1-RTT packets, never in 0-RTT packets (which don't allow ACKs).
+	hasObservedAddr := ackAllowed && p.observedAddrs != nil && p.observedAddrs.HasObservedAddress(pathID)
 
 	var pl payload
 	if ackAllowed {
-		if ack := p.acks.GetAckFrame(protocol.Encryption1RTT, now, !hasRetransmission && !hasData, pathID); ack != nil {
+		if ack := p.acks.GetAckFrame(protocol.Encryption1RTT, now, !hasRetransmission && !hasData && !hasPathFrames && !hasObservedAddr, pathID); ack != nil {
 			ack.Truncate(maxPayloadSize, v)
 			pl.ack = ack
 			pl.length += ack.Length(v)
 		}
+		if p.multipath {
+			p.appendExtraAcks(&pl, maxPayloadSize, now, v, pathID)
+		}
+	}
+
+	if hasPathFrames {
+		var lengthAdded protocol.ByteCount
+		pl.frames, lengthAdded = p.pathFrames.AppendPathFrames(pl.frames, pathID, maxPayloadSize-pl.length, v)
+		pl.length += lengthAdded
+	}
+	if hasObservedAddr {
+		var lengthAdded protocol.ByteCount
+		pl.frames, lengthAdded = p.observedAddrs.AppendObservedAddress(pl.frames, pathID, maxPayloadSize-pl.length, v)
+		pl.length += lengthAdded
 	}
 
 	if p.datagramQueue != nil {
@@ -673,7 +841,7 @@ func (p *packetPacker) composeNextPacket(
 				pl.frames = append(pl.frames, ackhandler.Frame{Frame: f})
 				pl.length += size
 				p.datagramQueue.Pop()
-			} else if pl.ack == nil {
+			} else if pl.ack == nil && len(pl.extraAcks) == 0 {
 				// The DATAGRAM frame doesn't fit, and the packet doesn't contain an ACK.
 				// Discard this frame. There's no point in retrying this in the next packet,
 				// as it's unlikely that the available packet size will increase.
@@ -683,7 +851,7 @@ func (p *packetPacker) composeNextPacket(
 		}
 	}
 
-	if pl.ack != nil && !hasData && !hasRetransmission {
+	if (pl.ack != nil || len(pl.extraAcks) > 0) && !hasData && !hasRetransmission {
 		return pl
 	}
 
@@ -788,7 +956,10 @@ func (p *packetPacker) packPTOProbePacket1RTT(maxPacketSize protocol.ByteCount, 
 		return nil, err
 	}
 	kp := s.KeyPhase()
-	connID := p.getDestConnID()
+	connID, err := p.destConnID(pathID)
+	if err != nil {
+		return nil, err
+	}
 	pn, pnLen := p.pnManager.PeekPacketNumber(pathID, protocol.Encryption1RTT)
 	hdrLen := wire.ShortHeaderLen(connID, pnLen)
 	pl := p.maybeGetAppDataPacket(maxPacketSize-protocol.ByteCount(s.Overhead())-hdrLen, false, true, now, v, pathID)
@@ -820,7 +991,11 @@ func (p *packetPacker) PackMTUProbePacket(ping ackhandler.Frame, size protocol.B
 	if err != nil {
 		return shortHeaderPacket{}, nil, err
 	}
-	connID := p.getDestConnID()
+	connID, err := p.destConnID(pathID)
+	if err != nil {
+		buffer.Release()
+		return shortHeaderPacket{}, nil, err
+	}
 	pn, pnLen := p.pnManager.PeekPacketNumber(pathID, protocol.Encryption1RTT)
 	padding := size - p.shortHeaderPacketLength(connID, pnLen, pl) - protocol.ByteCount(s.Overhead())
 	kp := s.KeyPhase()
@@ -828,13 +1003,23 @@ func (p *packetPacker) PackMTUProbePacket(ping ackhandler.Frame, size protocol.B
 	return packet, buffer, err
 }
 
-func (p *packetPacker) PackPathProbePacket(connID protocol.ConnectionID, frames []ackhandler.Frame, v protocol.Version, pathID protocol.PathID) (shortHeaderPacket, *packetBuffer, error) {
-	pn, pnLen := p.pnManager.PeekPacketNumber(pathID, protocol.Encryption1RTT)
-	buf := getPacketBuffer()
+// PackPathProbePacket packs a packet that only contains the given frames (PATH_CHALLENGE, PATH_RESPONSE and
+// OBSERVED_ADDRESS frames), sent to connID.
+// The datagram is expanded to 1200 bytes (sections 8.2.1 and 8.2.2 of RFC 9000). If the anti-amplification limit
+// doesn't allow sending 1200 bytes, maxPacketSize is smaller, and the datagram is only expanded to maxPacketSize.
+// It returns errNothingToPack if the frames don't fit into maxPacketSize.
+func (p *packetPacker) PackPathProbePacket(
+	connID protocol.ConnectionID,
+	frames []ackhandler.Frame,
+	maxPacketSize protocol.ByteCount,
+	v protocol.Version,
+	pathID protocol.PathID,
+) (shortHeaderPacket, *packetBuffer, error) {
 	s, err := p.cryptoSetup.Get1RTTSealer()
 	if err != nil {
 		return shortHeaderPacket{}, nil, err
 	}
+	pn, pnLen := p.pnManager.PeekPacketNumber(pathID, protocol.Encryption1RTT)
 	var l protocol.ByteCount
 	for _, f := range frames {
 		l += f.Frame.Length(v)
@@ -843,17 +1028,123 @@ func (p *packetPacker) PackPathProbePacket(connID protocol.ConnectionID, frames 
 		frames: frames,
 		length: l,
 	}
-	padding := protocol.MinInitialPacketSize - p.shortHeaderPacketLength(connID, pnLen, payload) - protocol.ByteCount(s.Overhead())
-	packet, err := p.appendShortHeaderPacket(buf, connID, pn, pnLen, s.KeyPhase(), payload, padding, protocol.MinInitialPacketSize, s, false, v, pathID)
+	size := p.shortHeaderPacketLength(connID, pnLen, payload) + protocol.ByteCount(s.Overhead())
+	if size > maxPacketSize {
+		return shortHeaderPacket{}, nil, errNothingToPack
+	}
+	var padding protocol.ByteCount
+	if padTo := min(protocol.ByteCount(protocol.MinInitialPacketSize), maxPacketSize); size < padTo {
+		padding = padTo - size
+	}
+	buf := getPacketBuffer()
+	packet, err := p.appendShortHeaderPacket(buf, connID, pn, pnLen, s.KeyPhase(), payload, padding, maxPacketSize, s, false, v, pathID)
 	if err != nil {
+		buf.Release()
 		return shortHeaderPacket{}, nil, err
 	}
 	packet.IsPathProbePacket = true
-	return packet, buf, err
+	return packet, buf, nil
+}
+
+// PackMultipathProbePacket packs a packet that carries frames bound to a path of IETF Multipath QUIC,
+// i.e. PATH_CHALLENGE and PATH_RESPONSE frames, and the PATH_ACK frame for the path, if one is available
+// (section 3.1 of draft-ietf-quic-multipath-21).
+// The packet is sent to connID, which must be a connection ID of the path. A PATH_RESPONSE sent to another
+// 4-tuple than the one the path uses needs a connection ID that isn't used on any other 4-tuple
+// (section 9.5 of RFC 9000).
+// The packet is padded to padTo bytes, and is never larger than maxPacketSize.
+// It returns errNothingToPack if the frames don't fit.
+// Like the path probe packets of RFC 9000, the packet is not congestion controlled.
+func (p *packetPacker) PackMultipathProbePacket(
+	pathID protocol.PathID,
+	connID protocol.ConnectionID,
+	frames []ackhandler.Frame,
+	maxPacketSize, padTo protocol.ByteCount,
+	now monotime.Time,
+	v protocol.Version,
+) (shortHeaderPacket, *packetBuffer, error) {
+	s, err := p.cryptoSetup.Get1RTTSealer()
+	if err != nil {
+		return shortHeaderPacket{}, nil, err
+	}
+	pn, pnLen := p.pnManager.PeekPacketNumber(pathID, protocol.Encryption1RTT)
+	maxPayloadSize := maxPacketSize - wire.ShortHeaderLen(connID, pnLen) - protocol.ByteCount(s.Overhead())
+	var pl payload
+	for _, f := range frames {
+		// These frames are never retransmitted, but the sent packet handler expects a handler.
+		if f.Handler == nil {
+			f.Handler = emptyHandler{}
+		}
+		pl.frames = append(pl.frames, f)
+		pl.length += f.Frame.Length(v)
+	}
+	if pl.length > maxPayloadSize {
+		return shortHeaderPacket{}, nil, errNothingToPack
+	}
+	if ack := p.acks.GetAckFrame(protocol.Encryption1RTT, now, false, pathID); ack != nil {
+		// Truncation keeps at least one ACK range, so the frame might still not fit.
+		ack.Truncate(maxPayloadSize-pl.length, v)
+		if l := ack.Length(v); pl.length+l <= maxPayloadSize {
+			pl.ack = ack
+			pl.length += l
+		}
+	}
+	var padding protocol.ByteCount
+	if size := p.shortHeaderPacketLength(connID, pnLen, pl) + protocol.ByteCount(s.Overhead()); size < padTo {
+		padding = min(padTo, maxPacketSize) - size
+	}
+	buf := getPacketBuffer()
+	packet, err := p.appendShortHeaderPacket(buf, connID, pn, pnLen, s.KeyPhase(), pl, padding, maxPacketSize, s, false, v, pathID)
+	if err != nil {
+		buf.Release()
+		return shortHeaderPacket{}, nil, err
+	}
+	packet.IsPathProbePacket = true
+	return packet, buf, nil
+}
+
+// PackPathPacket packs a 1-RTT packet that only carries the given frames, on a path of IETF Multipath QUIC.
+// It is used for copies of frames sent on other paths (frame-level duplication and reinjection),
+// and for PING frames sent on a path that potentially failed.
+// Frames without a handler are never retransmitted. The frames must fit into a packet of maxPacketSize bytes.
+// Unlike the probe packets used for path validation, the packet is congestion controlled.
+func (p *packetPacker) PackPathPacket(
+	pathID protocol.PathID,
+	frames []ackhandler.Frame,
+	streamFrames []ackhandler.StreamFrame,
+	maxPacketSize protocol.ByteCount,
+	v protocol.Version,
+) (shortHeaderPacket, *packetBuffer, error) {
+	if len(frames) == 0 && len(streamFrames) == 0 {
+		return shortHeaderPacket{}, nil, errNothingToPack
+	}
+	s, err := p.cryptoSetup.Get1RTTSealer()
+	if err != nil {
+		return shortHeaderPacket{}, nil, err
+	}
+	connID, err := p.destConnID(pathID)
+	if err != nil {
+		return shortHeaderPacket{}, nil, err
+	}
+	pn, pnLen := p.pnManager.PeekPacketNumber(pathID, protocol.Encryption1RTT)
+	pl := payload{frames: frames, streamFrames: streamFrames}
+	for _, f := range frames {
+		pl.length += f.Frame.Length(v)
+	}
+	for _, f := range streamFrames {
+		pl.length += f.Frame.Length(v)
+	}
+	buf := getPacketBuffer()
+	packet, err := p.appendShortHeaderPacket(buf, connID, pn, pnLen, s.KeyPhase(), pl, 0, maxPacketSize, s, false, v, pathID)
+	if err != nil {
+		buf.Release()
+		return shortHeaderPacket{}, nil, err
+	}
+	return packet, buf, nil
 }
 
 func (p *packetPacker) getLongHeader(encLevel protocol.EncryptionLevel, v protocol.Version) *wire.ExtendedHeader {
-	pn, pnLen := p.pnManager.PeekPacketNumber(protocol.InvalidPathID, encLevel)
+	pn, pnLen := p.pnManager.PeekPacketNumber(0, encLevel)
 	hdr := &wire.ExtendedHeader{
 		PacketNumber:    pn,
 		PacketNumberLen: pnLen,
@@ -876,6 +1167,9 @@ func (p *packetPacker) getLongHeader(encLevel protocol.EncryptionLevel, v protoc
 }
 
 func (p *packetPacker) appendLongHeaderPacket(buffer *packetBuffer, header *wire.ExtendedHeader, pl payload, padding protocol.ByteCount, encLevel protocol.EncryptionLevel, sealer sealer, v protocol.Version) (*longHeaderPacket, error) {
+	if header.PacketNumber >= protocol.MaxPacketNumber {
+		return nil, errPacketNumbersExhausted
+	}
 	var paddingLen protocol.ByteCount
 	pnLen := protocol.ByteCount(header.PacketNumberLen)
 	if pl.length < 4-pnLen {
@@ -890,6 +1184,7 @@ func (p *packetPacker) appendLongHeaderPacket(buffer *packetBuffer, header *wire
 	if err != nil {
 		return nil, err
 	}
+	p.maybeGreaseQUICBit(&raw[0])
 	payloadOffset := protocol.ByteCount(len(raw))
 
 	raw, err = p.appendPacketPayload(raw, pl, paddingLen, v)
@@ -899,7 +1194,7 @@ func (p *packetPacker) appendLongHeaderPacket(buffer *packetBuffer, header *wire
 	raw = p.encryptPacket(raw, sealer, header.PacketNumber, payloadOffset, pnLen)
 	buffer.Data = buffer.Data[:len(buffer.Data)+len(raw)]
 
-	if pn := p.pnManager.PopPacketNumber(protocol.InvalidPathID, encLevel); pn != header.PacketNumber {
+	if pn := p.pnManager.PopPacketNumber(0, encLevel); pn != header.PacketNumber {
 		return nil, fmt.Errorf("packetPacker BUG: Peeked and Popped packet numbers do not match: expected %d, got %d", pn, header.PacketNumber)
 	}
 	return &longHeaderPacket{
@@ -919,11 +1214,14 @@ func (p *packetPacker) appendShortHeaderPacket(
 	kp protocol.KeyPhaseBit,
 	pl payload,
 	padding, maxPacketSize protocol.ByteCount,
-	sealer sealer,
+	sealer handshake.ShortHeaderSealer,
 	isMTUProbePacket bool,
 	v protocol.Version,
 	pathID protocol.PathID,
 ) (shortHeaderPacket, error) {
+	if pn >= protocol.MaxPacketNumber {
+		return shortHeaderPacket{}, errPacketNumbersExhausted
+	}
 	var paddingLen protocol.ByteCount
 	if pl.length < 4-protocol.ByteCount(pnLen) {
 		paddingLen = 4 - protocol.ByteCount(pnLen) - pl.length
@@ -936,6 +1234,7 @@ func (p *packetPacker) appendShortHeaderPacket(
 	if err != nil {
 		return shortHeaderPacket{}, err
 	}
+	p.maybeGreaseQUICBit(&raw[0])
 	payloadOffset := protocol.ByteCount(len(raw))
 
 	raw, err = p.appendPacketPayload(raw, pl, paddingLen, v)
@@ -947,7 +1246,14 @@ func (p *packetPacker) appendShortHeaderPacket(
 			return shortHeaderPacket{}, fmt.Errorf("PacketPacker BUG: packet too large (%d bytes, allowed %d bytes)", size, maxPacketSize)
 		}
 	}
-	raw = p.encryptPacket(raw, sealer, pn, payloadOffset, protocol.ByteCount(pnLen))
+	if p.multipath && pathID != 0 {
+		// The nonce of IETF Multipath QUIC contains the path ID (section 2.4 of draft-ietf-quic-multipath-21).
+		// For path 0, it is the nonce of RFC 9001.
+		_ = sealer.SealForPath(raw[payloadOffset:payloadOffset], raw[payloadOffset:], pathID, pn, raw[:payloadOffset])
+		raw = p.protectHeader(raw[:len(raw)+sealer.Overhead()], sealer, payloadOffset, protocol.ByteCount(pnLen))
+	} else {
+		raw = p.encryptPacket(raw, sealer, pn, payloadOffset, protocol.ByteCount(pnLen))
+	}
 	buffer.Data = buffer.Data[:len(buffer.Data)+len(raw)]
 
 	if newPN := p.pnManager.PopPacketNumber(pathID, protocol.Encryption1RTT); newPN != pn {
@@ -960,6 +1266,7 @@ func (p *packetPacker) appendShortHeaderPacket(
 		StreamFrames:         pl.streamFrames,
 		Frames:               pl.frames,
 		Ack:                  pl.ack,
+		ExtraAcks:            pl.extraAcks,
 		Length:               protocol.ByteCount(len(raw)),
 		DestConnID:           connID,
 		IsPathMTUProbePacket: isMTUProbePacket,
@@ -974,6 +1281,13 @@ func (p *packetPacker) appendPacketPayload(raw []byte, pl payload, paddingLen pr
 	if pl.ack != nil {
 		var err error
 		raw, err = pl.ack.Append(raw, v)
+		if err != nil {
+			return nil, err
+		}
+	}
+	for _, ack := range pl.extraAcks {
+		var err error
+		raw, err = ack.Append(raw, v)
 		if err != nil {
 			return nil, err
 		}
@@ -1009,8 +1323,11 @@ func (p *packetPacker) appendPacketPayload(raw []byte, pl payload, paddingLen pr
 
 func (p *packetPacker) encryptPacket(raw []byte, sealer sealer, pn protocol.PacketNumber, payloadOffset, pnLen protocol.ByteCount) []byte {
 	_ = sealer.Seal(raw[payloadOffset:payloadOffset], raw[payloadOffset:], pn, raw[:payloadOffset])
-	raw = raw[:len(raw)+sealer.Overhead()]
-	// apply header protection
+	return p.protectHeader(raw[:len(raw)+sealer.Overhead()], sealer, payloadOffset, pnLen)
+}
+
+// protectHeader applies header protection to a sealed packet.
+func (p *packetPacker) protectHeader(raw []byte, sealer sealer, payloadOffset, pnLen protocol.ByteCount) []byte {
 	pnOffset := payloadOffset - pnLen
 	sealer.EncryptHeader(raw[pnOffset+4:pnOffset+4+16], &raw[0], raw[pnOffset:payloadOffset])
 	return raw
@@ -1018,6 +1335,33 @@ func (p *packetPacker) encryptPacket(raw []byte, sealer sealer, pn protocol.Pack
 
 func (p *packetPacker) SetToken(token []byte) {
 	p.token = token
+}
+
+// maxTruncatedPathAckSize is the largest possible size of a PATH_ACK frame that was truncated to a single ACK range:
+// type (1 byte), path ID, largest acknowledged, ACK delay (8 bytes each), range count (1 byte),
+// first ACK range and three ECN counts (8 bytes each).
+// An additional PATH_ACK frame is only added to a packet if this many bytes are left.
+const maxTruncatedPathAckSize protocol.ByteCount = 1 + 3*8 + 1 + 4*8
+
+// appendExtraAcks adds the PATH_ACK frames that are due for other paths than the path the packet is sent on,
+// in ascending order of their path IDs, as long as they fit into the packet (IETF Multipath QUIC).
+// This way, acknowledgments for paths that are not used for sending (at the moment) are sent as well.
+func (p *packetPacker) appendExtraAcks(pl *payload, maxPayloadSize protocol.ByteCount, now monotime.Time, v protocol.Version, pathID protocol.PathID) {
+	for _, id := range p.acks.AckDuePaths(now) {
+		if id == pathID {
+			continue
+		}
+		if maxPayloadSize-pl.length < maxTruncatedPathAckSize {
+			return
+		}
+		ack := p.acks.GetAckFrame(protocol.Encryption1RTT, now, true, id)
+		if ack == nil {
+			continue
+		}
+		ack.Truncate(maxPayloadSize-pl.length, v)
+		pl.extraAcks = append(pl.extraAcks, ack)
+		pl.length += ack.Length(v)
+	}
 }
 
 type emptyHandler struct{}

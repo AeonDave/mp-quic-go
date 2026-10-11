@@ -7,11 +7,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
-	"github.com/AeonDave/mp-quic-go"
+	quic "github.com/AeonDave/mp-quic-go"
 	"github.com/AeonDave/mp-quic-go/internal/protocol"
-	"github.com/AeonDave/mp-quic-go/internal/synctest"
 	"github.com/AeonDave/mp-quic-go/testutils/simnet"
 
 	"github.com/stretchr/testify/assert"
@@ -61,7 +61,9 @@ func TestConnectionCloseRetransmission(t *testing.T) {
 		sconn, err := server.Accept(ctx)
 		require.NoError(t, err)
 
-		time.Sleep(rtt)
+		// Once the handshake is confirmed, the client switches to a new connection ID, and retires the connection ID
+		// used during the handshake. Make sure that this packet arrives before the server closes the connection.
+		time.Sleep(2 * rtt)
 
 		drop.Store(true)
 		sconn.CloseWithError(1337, "closing")
@@ -201,7 +203,6 @@ func testTransportClose(t *testing.T, conn net.PacketConn, closeFn func(), expec
 
 	select {
 	case err := <-errChan:
-		require.Error(t, err)
 		require.ErrorIs(t, err, quic.ErrTransportClosed)
 		if expectedErr != nil {
 			require.ErrorIs(t, err, expectedErr)
@@ -214,7 +215,6 @@ func testTransportClose(t *testing.T, conn net.PacketConn, closeFn func(), expec
 	ctx, cancel := context.WithTimeout(context.Background(), scaleDuration(50*time.Millisecond))
 	defer cancel()
 	_, err := tr.Dial(ctx, server.LocalAddr(), &tls.Config{}, getQuicConfig(nil))
-	require.Error(t, err)
 	require.ErrorIs(t, err, quic.ErrTransportClosed)
 	if expectedErr != nil {
 		require.ErrorIs(t, err, expectedErr)
@@ -222,7 +222,6 @@ func testTransportClose(t *testing.T, conn net.PacketConn, closeFn func(), expec
 
 	// it's not possible to create new listeners
 	_, err = tr.Listen(&tls.Config{}, nil)
-	require.Error(t, err)
 	require.ErrorIs(t, err, quic.ErrTransportClosed)
 	if expectedErr != nil {
 		require.ErrorIs(t, err, expectedErr)

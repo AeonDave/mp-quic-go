@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AeonDave/mp-quic-go"
+	quic "github.com/AeonDave/mp-quic-go"
 	quicproxy "github.com/AeonDave/mp-quic-go/integrationtests/tools/proxy"
 	"github.com/AeonDave/mp-quic-go/qlog"
 	"github.com/AeonDave/mp-quic-go/qlogwriter"
@@ -98,26 +98,28 @@ func TestNATRebinding(t *testing.T) {
 	conn.CloseWithError(0, "")
 
 	// check that a PATH_CHALLENGE was sent
-	var pathChallenge [8]byte
-	var foundPathChallenge bool
+	var pathChallenges [][8]byte
 	for _, p := range tr.getSentShortHeaderPackets() {
 		for _, f := range p.frames {
 			switch fr := f.Frame.(type) {
 			case *qlog.PathChallengeFrame:
-				pathChallenge = fr.Data
-				foundPathChallenge = true
+				pathChallenges = append(pathChallenges, fr.Data)
 			}
 		}
 	}
-	require.True(t, foundPathChallenge)
+	require.NotEmpty(t, pathChallenges)
 
-	// check that a PATH_RESPONSE with the correct data was received
+	// Check that a PATH_RESPONSE with the correct data was received.
+	// With IETF Multipath QUIC, the server also validates the client's previous address after the path migrated
+	// (section 9.3.3 of RFC 9000), so more than one PATH_CHALLENGE might have been sent.
 	var foundPathResponse bool
 	for _, p := range tr.getRcvdShortHeaderPackets() {
 		for _, f := range p.frames {
 			switch fr := f.Frame.(type) {
 			case *qlog.PathResponseFrame:
-				require.Equal(t, pathChallenge, fr.Data)
+				require.Contains(t, pathChallenges, fr.Data)
+				// datagrams containing a PATH_RESPONSE frame are expanded (section 8.2.2 of RFC 9000)
+				require.GreaterOrEqual(t, p.size, 1200)
 				foundPathResponse = true
 			}
 		}

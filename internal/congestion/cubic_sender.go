@@ -64,6 +64,7 @@ type cubicSender struct {
 var (
 	_ SendAlgorithm               = &cubicSender{}
 	_ SendAlgorithmWithDebugInfos = &cubicSender{}
+	_ StateExporter               = &cubicSender{}
 )
 
 // NewCubicSender makes a new cubic sender
@@ -171,6 +172,17 @@ func (c *cubicSender) GetCongestionWindow() protocol.ByteCount {
 	return c.congestionWindow
 }
 
+// State returns the state of the controller, for a controller that replaces it.
+func (c *cubicSender) State() State {
+	return State{
+		CongestionWindow:         c.congestionWindow,
+		SlowStartThreshold:       c.slowStartThreshold,
+		LargestSentPacketNumber:  c.largestSentPacketNumber,
+		LargestAckedPacketNumber: c.largestAckedPacketNumber,
+		LargestSentAtLastCutback: c.largestSentAtLastCutback,
+	}
+}
+
 func (c *cubicSender) MaybeExitSlowStart() {
 	if c.InSlowStart() &&
 		c.hybridSlowStart.ShouldExitSlowStart(c.rttStats.LatestRTT(), c.rttStats.MinRTT(), c.GetCongestionWindow()/c.maxDatagramSize) {
@@ -221,6 +233,24 @@ func (c *cubicSender) OnCongestionEvent(packetNumber protocol.PacketNumber, lost
 	// reset packet count from congestion avoidance mode. We start
 	// counting again when we're out of recovery.
 	c.numAckedPackets = 0
+}
+
+// OnPersistentCongestion is called when persistent congestion is established (section 7.6 of RFC 9002).
+// The congestion window is reduced to the minimum congestion window, and slow start begins again.
+// The slow start threshold and the recovery period of the preceding congestion event are kept,
+// so that losses of packets sent before that event don't reduce the window again.
+func (c *cubicSender) OnPersistentCongestion() {
+	c.hybridSlowStart.Restart()
+	c.cubic.Reset()
+	c.numAckedPackets = 0
+	c.congestionWindow = c.minCongestionWindow()
+	if c.qlogger != nil {
+		c.qlogger.RecordEvent(qlog.CongestionStateUpdated{
+			State:   qlog.CongestionStateRecovery,
+			Trigger: qlog.CongestionStateTriggerPersistentCongestion,
+		})
+		c.lastState = qlog.CongestionStateRecovery
+	}
 }
 
 // Called when we receive an ack. Normal TCP tracks how many packets one ack

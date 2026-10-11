@@ -11,7 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/AeonDave/mp-quic-go"
+	quic "github.com/AeonDave/mp-quic-go"
 	"github.com/AeonDave/mp-quic-go/http3/qlog"
 	"github.com/AeonDave/mp-quic-go/qlogwriter"
 	"github.com/AeonDave/mp-quic-go/quicvarint"
@@ -31,6 +31,7 @@ type rawConn struct {
 	logger *slog.Logger
 
 	enableDatagrams bool
+	isClient        bool
 
 	streamMx sync.Mutex
 	streams  map[quic.StreamID]*stateTrackingStream
@@ -45,7 +46,8 @@ type rawConn struct {
 	settings         *Settings
 	receivedSettings chan struct{}
 
-	qlogger qlogwriter.Recorder
+	qlogger   qlogwriter.Recorder
+	qloggerWG sync.WaitGroup // tracks goroutines that may produce qlog events
 }
 
 func newRawConn(
@@ -56,7 +58,7 @@ func newRawConn(
 	qlogger qlogwriter.Recorder,
 	logger *slog.Logger,
 ) *rawConn {
-	return &rawConn{
+	c := &rawConn{
 		conn:              quicConn,
 		logger:            logger,
 		enableDatagrams:   enableDatagrams,
@@ -66,6 +68,10 @@ func newRawConn(
 		onStreamsEmpty:    onStreamsEmpty,
 		controlStrHandler: controlStrHandler,
 	}
+	if qlogger != nil {
+		context.AfterFunc(quicConn.Context(), c.closeQlogger)
+	}
+	return c
 }
 
 func (c *rawConn) OpenUniStream() (*quic.SendStream, error) {
@@ -75,6 +81,9 @@ func (c *rawConn) OpenUniStream() (*quic.SendStream, error) {
 // openControlStream opens the control stream and sends the SETTINGS frame.
 // It returns the control stream (needed by the server for sending GOAWAY later).
 func (c *rawConn) openControlStream(settings *settingsFrame) (*quic.SendStream, error) {
+	c.qloggerWG.Add(1)
+	defer c.qloggerWG.Done()
+
 	str, err := c.conn.OpenUniStream()
 	if err != nil {
 		return nil, err
@@ -88,10 +97,10 @@ func (c *rawConn) openControlStream(settings *settingsFrame) (*quic.SendStream, 
 			Other:               maps.Clone(settings.Other),
 		}
 		if settings.Datagram {
-			sf.Datagram = pointer(true)
+			sf.Datagram = new(true)
 		}
 		if settings.ExtendedConnect {
-			sf.ExtendedConnect = pointer(true)
+			sf.ExtendedConnect = new(true)
 		}
 		c.qlogger.RecordEvent(qlog.FrameCreated{
 			StreamID: str.StreamID(),
@@ -110,8 +119,19 @@ func (c *rawConn) TrackStream(str *quic.Stream) *stateTrackingStream {
 
 	c.streamMx.Lock()
 	c.streams[str.StreamID()] = hstr
+	c.qloggerWG.Add(1)
 	c.streamMx.Unlock()
 	return hstr
+}
+
+func (c *rawConn) UpdateStreamPriority(id quic.StreamID, urgency int8, incremental bool) {
+	c.streamMx.Lock()
+	str := c.streams[id]
+	c.streamMx.Unlock()
+	// A PRIORITY_UPDATE can arrive before its request stream. We deliberately ignore such reordered frames.
+	if str != nil {
+		str.SetPriority(urgency, incremental)
+	}
 }
 
 func (c *rawConn) RemoteAddr() net.Addr {
@@ -126,7 +146,10 @@ func (c *rawConn) clearStream(id quic.StreamID) {
 	c.streamMx.Lock()
 	defer c.streamMx.Unlock()
 
-	delete(c.streams, id)
+	if _, ok := c.streams[id]; ok {
+		delete(c.streams, id)
+		c.qloggerWG.Done()
+	}
 	if len(c.streams) == 0 {
 		c.onStreamsEmpty()
 	}
@@ -144,6 +167,9 @@ func (c *rawConn) CloseWithError(code quic.ApplicationErrorCode, msg string) err
 }
 
 func (c *rawConn) handleUnidirectionalStream(str *quic.ReceiveStream, isServer bool) {
+	c.qloggerWG.Add(1)
+	defer c.qloggerWG.Done()
+
 	streamType, err := quicvarint.Read(quicvarint.NewReader(str))
 	if err != nil {
 		if c.logger != nil {
@@ -157,14 +183,16 @@ func (c *rawConn) handleUnidirectionalStream(str *quic.ReceiveStream, isServer b
 	case streamTypeQPACKEncoderStream:
 		if isFirst := c.rcvdQPACKEncoderStr.CompareAndSwap(false, true); !isFirst {
 			c.CloseWithError(quic.ApplicationErrorCode(ErrCodeStreamCreationError), "duplicate QPACK encoder stream")
+			return
 		}
-		// Our QPACK implementation doesn't use the dynamic table yet.
+		c.handleQPACKEncoderStream(str)
 		return
 	case streamTypeQPACKDecoderStream:
 		if isFirst := c.rcvdQPACKDecoderStr.CompareAndSwap(false, true); !isFirst {
 			c.CloseWithError(quic.ApplicationErrorCode(ErrCodeStreamCreationError), "duplicate QPACK decoder stream")
+			return
 		}
-		// Our QPACK implementation doesn't use the dynamic table yet.
+		c.handleQPACKDecoderStream(str)
 		return
 	case streamTypePushStream:
 		if isServer {
@@ -187,16 +215,47 @@ func (c *rawConn) handleUnidirectionalStream(str *quic.ReceiveStream, isServer b
 	c.handleControlStream(str)
 }
 
+// isCriticalStreamClosed says if an error returned when reading from a critical stream
+// means that the peer closed the stream (section 6.2.1 of RFC 9114 and section 4.2 of RFC 9204).
+// minUniStreams is the number of unidirectional streams that both endpoints need to allow:
+// the control stream and the two QPACK streams (section 6.2 of RFC 9114).
+const minUniStreams = 3
+
+// checkUniStreams checks that the QUIC configuration allows the peer to open enough unidirectional streams.
+func checkUniStreams(conf *quic.Config) error {
+	if conf.MaxIncomingUniStreams < 0 || (conf.MaxIncomingUniStreams > 0 && conf.MaxIncomingUniStreams < minUniStreams) {
+		return fmt.Errorf("http3: QUIC Config.MaxIncomingUniStreams must allow at least %d unidirectional streams", minUniStreams)
+	}
+	return nil
+}
+
+func isCriticalStreamClosed(err error) bool {
+	_, isStreamError := errors.AsType[*quic.StreamError](err)
+	return err == io.EOF || err == io.ErrUnexpectedEOF || isStreamError
+}
+
+// controlStreamErrorCode returns the error code for closing the connection
+// when parsing a frame on the control stream failed.
+func controlStreamErrorCode(err error) ErrCode {
+	if _, ok := errors.AsType[*settingsError](err); ok {
+		return ErrCodeSettingsError
+	}
+	if isCriticalStreamClosed(err) {
+		return ErrCodeClosedCriticalStream
+	}
+	return ErrCodeFrameError
+}
+
 func (c *rawConn) handleControlStream(str *quic.ReceiveStream) {
 	fp := &frameParser{closeConn: c.conn.CloseWithError, r: str, streamID: str.StreamID()}
 	f, err := fp.ParseNext(c.qlogger)
 	if err != nil {
-		var serr *quic.StreamError
-		if err == io.EOF || errors.As(err, &serr) {
-			c.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeClosedCriticalStream), "")
+		// The first frame must be a SETTINGS frame (section 6.2.1 of RFC 9114).
+		if fe, ok := errors.AsType[*frameError](err); (ok && fe.Type != 0x4) || errors.Is(err, errPriorityUpdateForPush) {
+			c.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeMissingSettings), "")
 			return
 		}
-		c.conn.CloseWithError(quic.ApplicationErrorCode(ErrCodeFrameError), "")
+		c.conn.CloseWithError(quic.ApplicationErrorCode(controlStreamErrorCode(err)), "")
 		return
 	}
 	sf, ok := f.(*settingsFrame)
@@ -214,25 +273,120 @@ func (c *rawConn) handleControlStream(str *quic.ReceiveStream) {
 		// If datagram support was enabled on our side as well as on the server side,
 		// we can expect it to have been negotiated both on the transport and on the HTTP/3 layer.
 		// Note: ConnectionState() will block until the handshake is complete (relevant when using 0-RTT).
-		if c.enableDatagrams && !c.ConnectionState().SupportsDatagrams {
+		if c.enableDatagrams && !c.ConnectionState().SupportsDatagrams.Remote {
 			c.CloseWithError(quic.ApplicationErrorCode(ErrCodeSettingsError), "missing QUIC Datagram support")
 			return
 		}
-		go func() {
-			if err := c.receiveDatagrams(); err != nil {
-				if c.logger != nil {
-					c.logger.Debug("receiving datagrams failed", "error", err)
-				}
+		c.qloggerWG.Go(func() {
+			err := c.receiveDatagrams()
+			if c.logger != nil {
+				c.logger.Debug("receiving datagrams failed", "error", err)
 			}
-		}()
+		})
 	}
 
-	if c.controlStrHandler != nil {
-		c.controlStrHandler(str, fp)
+	c.controlStrHandler(str, fp)
+}
+
+// handleQPACKEncoderStream reads the peer's QPACK encoder stream.
+// We advertise a dynamic table capacity of 0 (the default value of SETTINGS_QPACK_MAX_TABLE_CAPACITY),
+// so the only valid instruction is Set Dynamic Table Capacity with a capacity of 0 (section 4.3.1 of RFC 9204).
+// Any other instruction either exceeds this capacity or refers to an entry that can't exist.
+func (c *rawConn) handleQPACKEncoderStream(str *quic.ReceiveStream) {
+	r := quicvarint.NewReader(str)
+	for {
+		b, err := r.ReadByte()
+		if err != nil {
+			c.handleQPACKStreamReadError(err)
+			return
+		}
+		// Set Dynamic Table Capacity is encoded as 001 followed by a 5-bit prefix integer.
+		// A capacity of 0 is encoded in a single byte.
+		if b == 0b00100000 {
+			continue
+		}
+		if b&0b11100000 == 0b00100000 && b&0b00011111 == 0b00011111 {
+			// Read the rest of the capacity, so that a stream that ends inside the instruction
+			// is treated as a closed critical stream.
+			if err := skipPrefixedIntegerContinuation(r); err != nil && !errors.Is(err, errPrefixedIntegerTooLong) {
+				c.handleQPACKStreamReadError(err)
+				return
+			}
+		}
+		c.CloseWithError(quic.ApplicationErrorCode(ErrCodeQPACKEncoderStreamError), "")
+		return
 	}
 }
 
+// handleQPACKDecoderStream reads the peer's QPACK decoder stream.
+// Since our encoder never refers to the dynamic table, the only valid instruction is
+// Stream Cancellation (section 4.4.2 of RFC 9204).
+// A Section Acknowledgment or an Insert Count Increment is a connection error (sections 4.4.1 and 4.4.3).
+func (c *rawConn) handleQPACKDecoderStream(str *quic.ReceiveStream) {
+	r := quicvarint.NewReader(str)
+	for {
+		b, err := r.ReadByte()
+		if err != nil {
+			c.handleQPACKStreamReadError(err)
+			return
+		}
+		// Stream Cancellation is encoded as 01 followed by a 6-bit prefix integer.
+		if b&0b11000000 != 0b01000000 {
+			c.CloseWithError(quic.ApplicationErrorCode(ErrCodeQPACKDecoderStreamError), "")
+			return
+		}
+		if b&0b00111111 == 0b00111111 {
+			if err := skipPrefixedIntegerContinuation(r); err != nil {
+				if errors.Is(err, errPrefixedIntegerTooLong) {
+					c.CloseWithError(quic.ApplicationErrorCode(ErrCodeQPACKDecoderStreamError), "")
+					return
+				}
+				c.handleQPACKStreamReadError(err)
+				return
+			}
+		}
+	}
+}
+
+func (c *rawConn) handleQPACKStreamReadError(err error) {
+	// Closure of either QPACK stream is a connection error (section 4.2 of RFC 9204).
+	if isCriticalStreamClosed(err) {
+		c.CloseWithError(quic.ApplicationErrorCode(ErrCodeClosedCriticalStream), "")
+	}
+}
+
+var errPrefixedIntegerTooLong = errors.New("http3: QPACK prefixed integer too long")
+
+// skipPrefixedIntegerContinuation reads the continuation bytes of a prefixed integer
+// whose prefix bits are all set (section 4.1.1 of RFC 9204).
+// Integers larger than 2^62 are rejected.
+func skipPrefixedIntegerContinuation(r io.ByteReader) error {
+	for range 9 {
+		b, err := r.ReadByte()
+		if err != nil {
+			return err
+		}
+		if b&0x80 == 0 {
+			return nil
+		}
+	}
+	return errPrefixedIntegerTooLong
+}
+
 func (c *rawConn) sendDatagram(streamID quic.StreamID, b []byte) error {
+	// QUIC DATAGRAM frames are only sent once SETTINGS_H3_DATAGRAM was sent and received with a value of 1
+	// (section 2.1.1 of RFC 9297).
+	if !c.enableDatagrams {
+		return errors.New("http3: HTTP datagrams not enabled")
+	}
+	select {
+	case <-c.receivedSettings:
+	case <-c.conn.Context().Done():
+		return context.Cause(c.conn.Context())
+	}
+	if !c.settings.EnableDatagrams {
+		return errors.New("http3: peer doesn't support HTTP datagrams")
+	}
 	// TODO: this creates a lot of garbage and an additional copy
 	data := make([]byte, 0, len(b)+8)
 	quarterStreamID := uint64(streamID / 4)
@@ -240,7 +394,7 @@ func (c *rawConn) sendDatagram(streamID quic.StreamID, b []byte) error {
 	data = append(data, b...)
 	if c.qlogger != nil {
 		c.qlogger.RecordEvent(qlog.DatagramCreated{
-			QuaterStreamID: quarterStreamID,
+			QuarterStreamID: quarterStreamID,
 			Raw: qlog.RawInfo{
 				Length:        len(data),
 				PayloadLength: len(b),
@@ -263,7 +417,7 @@ func (c *rawConn) receiveDatagrams() error {
 		}
 		if c.qlogger != nil {
 			c.qlogger.RecordEvent(qlog.DatagramParsed{
-				QuaterStreamID: quarterStreamID,
+				QuarterStreamID: quarterStreamID,
 				Raw: qlog.RawInfo{
 					Length:        len(b),
 					PayloadLength: len(b) - n,
@@ -285,6 +439,17 @@ func (c *rawConn) receiveDatagrams() error {
 	}
 }
 
+// pushPromiseErrorCode is the error code for closing the connection when a PUSH_PROMISE frame is received.
+// A server must not receive PUSH_PROMISE frames (section 7.2.5 of RFC 9114).
+// A client never sends a MAX_PUSH_ID frame, so the push ID of any PUSH_PROMISE frame is larger than
+// the maximum push ID (section 4.6 of RFC 9114).
+func (c *rawConn) pushPromiseErrorCode() ErrCode {
+	if c.isClient {
+		return ErrCodeIDError
+	}
+	return ErrCodeFrameUnexpected
+}
+
 // ReceivedSettings returns a channel that is closed once the peer's SETTINGS frame was received.
 // Settings can be optained from the Settings method after the channel was closed.
 func (c *rawConn) ReceivedSettings() <-chan struct{} { return c.receivedSettings }
@@ -293,5 +458,12 @@ func (c *rawConn) ReceivedSettings() <-chan struct{} { return c.receivedSettings
 // It is only valid to call this function after the channel returned by ReceivedSettings was closed.
 func (c *rawConn) Settings() *Settings { return c.settings }
 
-// Context returns the context of the underlying QUIC connection.
-func (c *rawConn) Context() context.Context { return c.conn.Context() }
+// closeQlogger waits for all goroutines that may produce qlog events to finish,
+// then closes the qlogger.
+func (c *rawConn) closeQlogger() {
+	if c.qlogger == nil {
+		return
+	}
+	c.qloggerWG.Wait()
+	c.qlogger.Close()
+}

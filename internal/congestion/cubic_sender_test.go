@@ -8,6 +8,9 @@ import (
 	"github.com/AeonDave/mp-quic-go/internal/monotime"
 	"github.com/AeonDave/mp-quic-go/internal/protocol"
 	"github.com/AeonDave/mp-quic-go/internal/utils"
+	"github.com/AeonDave/mp-quic-go/qlog"
+	"github.com/AeonDave/mp-quic-go/qlogwriter"
+	"github.com/AeonDave/mp-quic-go/testutils/events"
 
 	"github.com/stretchr/testify/require"
 )
@@ -250,7 +253,7 @@ func TestCubicSenderSlowStartPacketLossPRR(t *testing.T) {
 	// triggered the loss.
 	remainingPacketsInRecovery := sendWindowBeforeLoss/maxDatagramSize - 2
 
-	for i := protocol.ByteCount(0); i < remainingPacketsInRecovery; i++ {
+	for range remainingPacketsInRecovery {
 		sender.AckNPackets(1)
 		sender.SendAvailableSendWindow()
 		require.Equal(t, expectedSendWindow, sender.sender.GetCongestionWindow())
@@ -337,6 +340,58 @@ func TestCubicSenderRTOCongestionWindow(t *testing.T) {
 	require.Equal(t, 5*maxDatagramSize, sender.sender.slowStartThreshold)
 }
 
+func TestCubicSenderPersistentCongestion(t *testing.T) {
+	t.Run("Reno", func(t *testing.T) {
+		testCubicSenderPersistentCongestion(t, false)
+	})
+	t.Run("Cubic", func(t *testing.T) {
+		testCubicSenderPersistentCongestion(t, true)
+	})
+}
+
+func testCubicSenderPersistentCongestion(t *testing.T, cubic bool) {
+	sender := newTestCubicSender(cubic)
+	var eventRecorder events.Recorder
+	sender.sender.qlogger = &eventRecorder
+
+	sender.SendAvailableSendWindow()
+	sender.AckNPackets(2)
+	sender.LoseNPackets(1)
+	cwnd := sender.sender.GetCongestionWindow()
+	require.Less(t, cwnd, defaultWindowTCP)
+	require.True(t, sender.sender.InRecovery())
+	eventRecorder.Clear()
+
+	// The window drops to the minimum window, and slow start begins again.
+	// The slow start threshold of the congestion event is kept, and so is the recovery period.
+	sender.sender.OnPersistentCongestion()
+	require.Equal(t, 2*maxDatagramSize, sender.sender.GetCongestionWindow())
+	require.Equal(t, cwnd, sender.sender.slowStartThreshold)
+	require.True(t, sender.sender.InSlowStart())
+	require.True(t, sender.sender.InRecovery())
+	require.Equal(t,
+		[]qlogwriter.Event{qlog.CongestionStateUpdated{
+			State:   qlog.CongestionStateRecovery,
+			Trigger: qlog.CongestionStateTriggerPersistentCongestion,
+		}},
+		eventRecorder.Events(qlog.CongestionStateUpdated{}),
+	)
+
+	// losses of packets sent before the congestion event don't reduce the window again
+	sender.LoseNPackets(1)
+	require.Equal(t, 2*maxDatagramSize, sender.sender.GetCongestionWindow())
+
+	// The remaining packets sent before the congestion event are declared lost.
+	// Once packets sent afterwards are acknowledged, the window grows in slow start.
+	sender.LoseNPackets(int(sender.packetNumber - 1 - sender.ackedPacketNumber))
+	require.Zero(t, sender.bytesInFlight)
+	sender.SendAvailableSendWindow()
+	sender.AckNPackets(2)
+	require.False(t, sender.sender.InRecovery())
+	require.Equal(t, 4*maxDatagramSize, sender.sender.GetCongestionWindow())
+	require.True(t, sender.sender.InSlowStart())
+}
+
 func TestCubicSenderTCPCubicResetEpochOnQuiescence(t *testing.T) {
 	sender := newTestCubicSender(true)
 
@@ -385,7 +440,7 @@ func TestCubicSenderMultipleLossesInOneWindow(t *testing.T) {
 	initialWindow := sender.sender.GetCongestionWindow()
 	sender.LosePacket(sender.ackedPacketNumber + 1)
 	postLossWindow := sender.sender.GetCongestionWindow()
-	require.True(t, initialWindow > postLossWindow)
+	require.Greater(t, initialWindow, postLossWindow)
 	sender.LosePacket(sender.ackedPacketNumber + 3)
 	require.Equal(t, postLossWindow, sender.sender.GetCongestionWindow())
 	sender.LosePacket(sender.packetNumber - 1)
@@ -393,7 +448,7 @@ func TestCubicSenderMultipleLossesInOneWindow(t *testing.T) {
 
 	// Lose a later packet and ensure the window decreases.
 	sender.LosePacket(sender.packetNumber)
-	require.True(t, postLossWindow > sender.sender.GetCongestionWindow())
+	require.Greater(t, postLossWindow, sender.sender.GetCongestionWindow())
 }
 
 func TestCubicSender1ConnectionCongestionAvoidanceAtEndOfRecovery(t *testing.T) {
@@ -535,8 +590,8 @@ func TestCubicSenderSlowStartsPacketSizeIncrease(t *testing.T) {
 		sender.OnPacketAcked(protocol.PacketNumber(i), packetSize, sender.GetCongestionWindow(), clock.Now())
 	}
 	const maxCwnd = protocol.MaxCongestionWindowPackets * packetSize
-	require.True(t, sender.GetCongestionWindow() > maxCwnd)
-	require.True(t, sender.GetCongestionWindow() <= maxCwnd+packetSize)
+	require.Greater(t, sender.GetCongestionWindow(), maxCwnd)
+	require.LessOrEqual(t, sender.GetCongestionWindow(), maxCwnd+packetSize)
 }
 
 func TestCubicSenderLimitCwndIncreaseInCongestionAvoidance(t *testing.T) {
@@ -570,7 +625,7 @@ func TestCubicSenderLimitCwndIncreaseInCongestionAvoidance(t *testing.T) {
 	for i := 1; i < numSent; i++ {
 		testSender.AckNPackets(1)
 	}
-	require.Equal(t, protocol.ByteCount(0), testSender.bytesInFlight)
+	require.Zero(t, testSender.bytesInFlight)
 
 	savedCwnd = sender.GetCongestionWindow()
 	testSender.SendAvailableSendWindow()
@@ -591,4 +646,30 @@ func TestCubicSenderLimitCwndIncreaseInCongestionAvoidance(t *testing.T) {
 	// Ack two packets.  The CWND should increase by only one packet.
 	testSender.AckNPackets(2)
 	require.Equal(t, savedCwnd+maxDatagramSize, sender.GetCongestionWindow())
+}
+
+// State returns the state that a controller replacing this controller continues with.
+func TestCubicSenderState(t *testing.T) {
+	sender := newTestCubicSender(false)
+	require.Equal(t, State{
+		CongestionWindow:         defaultWindowTCP,
+		SlowStartThreshold:       protocol.MaxByteCount,
+		LargestSentPacketNumber:  protocol.InvalidPacketNumber,
+		LargestAckedPacketNumber: protocol.InvalidPacketNumber,
+		LargestSentAtLastCutback: protocol.InvalidPacketNumber,
+	}, sender.sender.State())
+
+	sender.SendAvailableSendWindow()
+	sender.AckNPackets(2)
+	sender.LoseNPackets(1)
+	cwnd := sender.sender.GetCongestionWindow()
+	require.Less(t, cwnd, defaultWindowTCP)
+	require.True(t, sender.sender.InRecovery())
+	require.Equal(t, State{
+		CongestionWindow:         cwnd,
+		SlowStartThreshold:       cwnd,
+		LargestSentPacketNumber:  sender.packetNumber - 1,
+		LargestAckedPacketNumber: 2,
+		LargestSentAtLastCutback: sender.packetNumber - 1,
+	}, sender.sender.State())
 }

@@ -152,6 +152,42 @@ func (c *MockECNHandlerModeCall) DoAndReturn(f func() protocol.ECN) *MockECNHand
 	return c
 }
 
+// Restart mocks base method.
+func (m *MockECNHandler) Restart() {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "Restart")
+}
+
+// Restart indicates an expected call of Restart.
+func (mr *MockECNHandlerMockRecorder) Restart() *MockECNHandlerRestartCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Restart", reflect.TypeOf((*MockECNHandler)(nil).Restart))
+	return &MockECNHandlerRestartCall{Call: call}
+}
+
+// MockECNHandlerRestartCall wrap *gomock.Call
+type MockECNHandlerRestartCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockECNHandlerRestartCall) Return() *MockECNHandlerRestartCall {
+	c.Call = c.Call.Return()
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockECNHandlerRestartCall) Do(f func()) *MockECNHandlerRestartCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockECNHandlerRestartCall) DoAndReturn(f func()) *MockECNHandlerRestartCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}
+
 // SentPacket mocks base method.
 func (m *MockECNHandler) SentPacket(arg0 protocol.PacketNumber, arg1 protocol.ECN) {
 	m.ctrl.T.Helper()

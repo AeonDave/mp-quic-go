@@ -3,15 +3,19 @@ package self_test
 import (
 	"bytes"
 	"context"
+	"io"
 	mrand "math/rand/v2"
 	"net"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
-	"github.com/AeonDave/mp-quic-go"
-	"github.com/AeonDave/mp-quic-go/internal/synctest"
+	quic "github.com/AeonDave/mp-quic-go"
+	"github.com/AeonDave/mp-quic-go/internal/protocol"
 	"github.com/AeonDave/mp-quic-go/internal/wire"
+	"github.com/AeonDave/mp-quic-go/qlog"
+	"github.com/AeonDave/mp-quic-go/testutils/events"
 	"github.com/AeonDave/mp-quic-go/testutils/simnet"
 
 	"github.com/stretchr/testify/assert"
@@ -58,25 +62,28 @@ func testDatagramNegotiation(t *testing.T, serverEnableDatagram, clientEnableDat
 	require.NoError(t, err)
 	defer serverConn.CloseWithError(0, "")
 
+	serverState := serverConn.ConnectionState().SupportsDatagrams
+	clientState := clientConn.ConnectionState().SupportsDatagrams
+	require.Equal(t, serverEnableDatagram, serverState.Local, "server local datagram support")
+	require.Equal(t, clientEnableDatagram, serverState.Remote, "server view of client datagram support")
+	require.Equal(t, clientEnableDatagram, clientState.Local, "client local datagram support")
+	require.Equal(t, serverEnableDatagram, clientState.Remote, "client view of server datagram support")
+
 	if clientEnableDatagram {
-		require.True(t, serverConn.ConnectionState().SupportsDatagrams)
 		require.NoError(t, serverConn.SendDatagram([]byte("foo")))
 		datagram, err := clientConn.ReceiveDatagram(ctx)
 		require.NoError(t, err)
 		require.Equal(t, []byte("foo"), datagram)
 	} else {
-		require.False(t, serverConn.ConnectionState().SupportsDatagrams)
 		require.Error(t, serverConn.SendDatagram([]byte("foo")))
 	}
 
 	if serverEnableDatagram {
-		require.True(t, clientConn.ConnectionState().SupportsDatagrams)
 		require.NoError(t, clientConn.SendDatagram([]byte("bar")))
 		datagram, err := serverConn.ReceiveDatagram(ctx)
 		require.NoError(t, err)
 		require.Equal(t, []byte("bar"), datagram)
 	} else {
-		require.False(t, clientConn.ConnectionState().SupportsDatagrams)
 		require.Error(t, clientConn.SendDatagram([]byte("bar")))
 	}
 }
@@ -108,7 +115,6 @@ func TestDatagramSizeLimit(t *testing.T) {
 	defer clientConn.CloseWithError(0, "")
 
 	err = clientConn.SendDatagram(bytes.Repeat([]byte("a"), maxDatagramSize+100)) // definitely too large
-	require.Error(t, err)
 	var sizeErr *quic.DatagramTooLargeError
 	require.ErrorAs(t, err, &sizeErr)
 	require.InDelta(t, sizeErr.MaxDatagramPayloadSize, maxDatagramSize, 10)
@@ -122,6 +128,88 @@ func TestDatagramSizeLimit(t *testing.T) {
 	datagram, err := serverConn.ReceiveDatagram(ctx)
 	require.NoError(t, err)
 	require.Equal(t, bytes.Repeat([]byte("b"), int(sizeErr.MaxDatagramPayloadSize)), datagram)
+}
+
+func TestDatagramSizeLimitWithMTUDiscovery(t *testing.T) {
+	server, err := quic.Listen(
+		newUDPConnLocalhost(t),
+		getTLSConfig(),
+		getQuicConfig(&quic.Config{EnableDatagrams: true}),
+	)
+	require.NoError(t, err)
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var eventRecorder events.Recorder
+	clientConn, err := quic.Dial(
+		ctx,
+		newUDPConnLocalhost(t),
+		server.Addr(),
+		getTLSClientConfig(),
+		getQuicConfig(&quic.Config{
+			InitialPacketSize: protocol.MinInitialPacketSize,
+			EnableDatagrams:   true,
+			Tracer:            newTracer(&eventRecorder),
+		}),
+	)
+	require.NoError(t, err)
+	defer clientConn.CloseWithError(0, "")
+
+	serverConn, err := server.Accept(ctx)
+	require.NoError(t, err)
+	defer serverConn.CloseWithError(0, "")
+
+	serverErrChan := make(chan error, 1)
+	go func() {
+		str, err := serverConn.AcceptStream(ctx)
+		if err != nil {
+			serverErrChan <- err
+			return
+		}
+		_, err = io.Copy(io.Discard, str)
+		serverErrChan <- err
+	}()
+
+	str, err := clientConn.OpenStream()
+	require.NoError(t, err)
+
+	data := bytes.Repeat([]byte("d"), 16*1024)
+	var discoveredMTU int
+	for discoveredMTU == 0 {
+		_, err = str.Write(data)
+		require.NoError(t, err)
+		events := eventRecorder.Events(qlog.MTUUpdated{})
+		if len(events) > 0 {
+			update := events[len(events)-1].(qlog.MTUUpdated)
+			if update.Done {
+				discoveredMTU = update.Value
+			}
+		}
+		require.NoError(t, ctx.Err())
+	}
+	require.NoError(t, str.Close())
+
+	// Receiving the stream FIN guarantees that the client applied the MTU update observed above.
+	select {
+	case err := <-serverErrChan:
+		require.NoError(t, err)
+	case <-ctx.Done():
+		require.NoError(t, ctx.Err())
+	}
+
+	err = clientConn.SendDatagram(bytes.Repeat([]byte("x"), 2000))
+	var sizeErr *quic.DatagramTooLargeError
+	require.ErrorAs(t, err, &sizeErr)
+	maxPayloadSize := sizeErr.MaxDatagramPayloadSize
+	require.Greater(t, maxPayloadSize, int64(protocol.MinInitialPacketSize), "MTU discovery should increase the datagram size limit")
+	require.Less(t, maxPayloadSize, int64(discoveredMTU), "datagram payload must leave room for packet overhead")
+
+	datagramData := bytes.Repeat([]byte("z"), int(maxPayloadSize))
+	require.NoError(t, clientConn.SendDatagram(datagramData))
+	datagram, err := serverConn.ReceiveDatagram(ctx)
+	require.NoError(t, err, "datagram should be deliverable when respecting MaxDatagramPayloadSize")
+	require.Equal(t, datagramData, datagram)
 }
 
 func TestDatagramLoss(t *testing.T) {

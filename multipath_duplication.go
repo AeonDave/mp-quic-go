@@ -14,7 +14,8 @@ type MultipathDuplicationPolicy struct {
 	enabled bool
 
 	// DuplicateStreams is a set of stream IDs to always duplicate
-	duplicateStreams map[protocol.StreamID]bool
+	duplicateStreams    map[protocol.StreamID]bool
+	duplicateAllStreams bool
 
 	// DuplicateCryptoFrames indicates whether to duplicate crypto handshake frames
 	duplicateCryptoFrames bool
@@ -80,7 +81,7 @@ func (p *MultipathDuplicationPolicy) RemoveStreamForDuplication(streamID protoco
 func (p *MultipathDuplicationPolicy) ShouldDuplicateStream(streamID protocol.StreamID) bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.enabled && p.duplicateStreams[streamID]
+	return p.enabled && (p.duplicateAllStreams || p.duplicateStreams[streamID])
 }
 
 // ShouldDuplicateCrypto returns whether crypto frames should be duplicated
@@ -129,4 +130,11 @@ func (p *MultipathDuplicationPolicy) SetDuplicateResets(enable bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.duplicateResets = enable
+}
+
+// SetDuplicateAllStreams applies the policy to future as well as current streams.
+func (p *MultipathDuplicationPolicy) SetDuplicateAllStreams(enable bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.duplicateAllStreams = enable
 }

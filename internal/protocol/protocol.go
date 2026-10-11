@@ -2,7 +2,6 @@ package protocol
 
 import (
 	"fmt"
-	"sync/atomic"
 	"time"
 )
 
@@ -96,13 +95,15 @@ func (e ECN) String() string {
 // A ByteCount in QUIC
 type ByteCount int64
 
-type AtomicByteCount atomic.Int64
-
 // A PathID identifies a network path for multipath QUIC.
 type PathID uint64
 
 // InvalidPathID represents an unspecified path.
 const InvalidPathID PathID = ^PathID(0)
+
+// MaxPathID is the largest path ID of the multipath extension.
+// Path IDs are limited to 32 bits by the nonce calculation, see section 2.4 of draft-ietf-quic-multipath.
+const MaxPathID PathID = 1<<32 - 1
 
 // MaxByteCount is the maximum value of a ByteCount
 const MaxByteCount = ByteCount(1<<62 - 1)
@@ -160,6 +161,10 @@ const MaxConnIDLen = 20
 // InvalidPacketLimitAES is the maximum number of packets that we can fail to decrypt when using
 // AEAD_AES_128_GCM or AEAD_AES_265_GCM.
 const InvalidPacketLimitAES = 1 << 52
+
+// ConfidentialityLimitAES is the maximum number of packets that can be encrypted with one set of keys
+// when using AEAD_AES_128_GCM or AEAD_AES_256_GCM, see section 6.6 of RFC 9001.
+const ConfidentialityLimitAES = 1 << 23
 
 // InvalidPacketLimitChaCha is the maximum number of packets that we can fail to decrypt when using AEAD_CHACHA20_POLY1305.
 const InvalidPacketLimitChaCha = 1 << 36

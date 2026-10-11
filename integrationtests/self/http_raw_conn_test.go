@@ -8,11 +8,11 @@ import (
 	"net/http"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
-	"github.com/AeonDave/mp-quic-go"
+	quic "github.com/AeonDave/mp-quic-go"
 	"github.com/AeonDave/mp-quic-go/http3"
-	"github.com/AeonDave/mp-quic-go/internal/synctest"
 	"github.com/AeonDave/mp-quic-go/quicvarint"
 
 	"github.com/stretchr/testify/require"
@@ -64,10 +64,8 @@ func TestHTTPRawConn(t *testing.T) {
 				return
 			}
 			var wg sync.WaitGroup
-			wg.Add(2)
 			// accept and handle unidirectional streams opened by the client
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				for {
 					str, err := serverConn.AcceptUniStream(context.Background())
 					if err != nil {
@@ -75,10 +73,9 @@ func TestHTTPRawConn(t *testing.T) {
 					}
 					go rawServerConn.HandleUnidirectionalStream(str)
 				}
-			}()
+			})
 			// accept and handle bidirectional streams opened by the client
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				for {
 					str, err := serverConn.AcceptStream(context.Background())
 					if err != nil {
@@ -96,7 +93,7 @@ func TestHTTPRawConn(t *testing.T) {
 						go rawServerConn.HandleRequestStream(str)
 					}
 				}
-			}()
+			})
 			wg.Wait()
 			<-serverConn.Context().Done()
 			errChan <- nil

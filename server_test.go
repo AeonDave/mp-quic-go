@@ -51,6 +51,7 @@ type serverOpts struct {
 		*handshake.TokenGenerator,
 		bool, /* client address validated by an address validation token */
 		time.Duration,
+		*serverPreferredAddr,
 		qlogwriter.Trace,
 		utils.Logger,
 		protocol.Version,
@@ -80,9 +81,13 @@ func newTestServer(t *testing.T, serverOpts *serverOpts) *testServer {
 		verifySourceAddress,
 		serverOpts.disableVersionNegotiation,
 		serverOpts.acceptEarly,
+		nil,
 	)
 	s.newConn = serverOpts.newConn
-	t.Cleanup(func() { s.Close() })
+	t.Cleanup(func() {
+		s.Close()
+		tr.Close()
+	})
 	return &testServer{s}
 }
 
@@ -204,12 +209,10 @@ func checkRetry(t *testing.T,
 
 func TestListen(t *testing.T) {
 	_, err := ListenAddr("localhost:0", nil, nil)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "quic: tls.Config not set")
+	require.ErrorContains(t, err, "quic: tls.Config not set")
 
 	_, err = Listen(nil, &tls.Config{}, &Config{Versions: []protocol.Version{0x1234}})
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "invalid QUIC version: 0x1234")
+	require.ErrorContains(t, err, "invalid QUIC version: 0x1234")
 }
 
 func TestListenAddr(t *testing.T) {
@@ -494,6 +497,7 @@ func TestServerTokenValidation(t *testing.T) {
 			&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1337},
 			protocol.ConnectionID{},
 			protocol.ConnectionID{},
+			protocol.Version1,
 		)
 		require.NoError(t, err)
 		var eventRecorder events.Recorder
@@ -516,7 +520,7 @@ func TestServerTokenValidation(t *testing.T) {
 			tokenGeneratorKey: tokenGeneratorKey,
 		})
 
-		token, err := tg.NewRetryToken(conn.LocalAddr(), protocol.ConnectionID{}, protocol.ConnectionID{})
+		token, err := tg.NewRetryToken(conn.LocalAddr(), protocol.ConnectionID{}, protocol.ConnectionID{}, protocol.Version1)
 		require.NoError(t, err)
 		// the maximum retry token age is equivalent to the handshake timeout
 		time.Sleep(time.Millisecond) // make sure the token is expired
@@ -534,7 +538,7 @@ func TestServerTokenValidation(t *testing.T) {
 		})
 
 		conn := newUDPConnLocalhost(t)
-		token, err := tg.NewRetryToken(conn.LocalAddr(), protocol.ConnectionID{}, protocol.ConnectionID{})
+		token, err := tg.NewRetryToken(conn.LocalAddr(), protocol.ConnectionID{}, protocol.ConnectionID{}, protocol.Version1)
 		require.NoError(t, err)
 		time.Sleep(time.Millisecond) // make sure the token is expired
 		testServerTokenValidation(t, server, &eventRecorder, conn, token, true, false, true)
@@ -552,9 +556,41 @@ func TestServerTokenValidation(t *testing.T) {
 		})
 
 		conn := newUDPConnLocalhost(t)
-		token, err := tg.NewToken(conn.LocalAddr(), 10*time.Millisecond)
+		token, err := tg.NewToken(conn.LocalAddr(), 10*time.Millisecond, protocol.Version1)
 		require.NoError(t, err)
 		time.Sleep(3 * time.Millisecond) // make sure the token is expired
+		testServerTokenValidation(t, server, &eventRecorder, conn, token, false, false, true)
+	})
+
+	// The client must not switch versions between the Retry and the Initial packet carrying the token
+	// (section 4.1 of RFC 9369).
+	t.Run("retry token for another version", func(t *testing.T) {
+		conn := newUDPConnLocalhost(t)
+		var eventRecorder events.Recorder
+		server := newTestServer(t, &serverOpts{
+			useRetry:          true,
+			eventRecorder:     &eventRecorder,
+			tokenGeneratorKey: tokenGeneratorKey,
+		})
+
+		token, err := tg.NewRetryToken(conn.LocalAddr(), protocol.ConnectionID{}, protocol.ConnectionID{}, protocol.Version2)
+		require.NoError(t, err)
+		testServerTokenValidation(t, server, &eventRecorder, conn, token, false, true, false)
+	})
+
+	// Tokens are specific to a QUIC version (section 5 of RFC 9369).
+	t.Run("non-retry token for another version", func(t *testing.T) {
+		var eventRecorder events.Recorder
+		server := newTestServer(t, &serverOpts{
+			tokenGeneratorKey: tokenGeneratorKey,
+			useRetry:          true,
+			eventRecorder:     &eventRecorder,
+			maxTokenAge:       time.Hour,
+		})
+
+		conn := newUDPConnLocalhost(t)
+		token, err := tg.NewToken(conn.LocalAddr(), 10*time.Millisecond, protocol.Version2)
+		require.NoError(t, err)
 		testServerTokenValidation(t, server, &eventRecorder, conn, token, false, false, true)
 	})
 
@@ -568,11 +604,43 @@ func TestServerTokenValidation(t *testing.T) {
 		})
 
 		conn := newUDPConnLocalhost(t)
-		token, err := tg.NewToken(conn.LocalAddr(), 100*time.Millisecond)
+		token, err := tg.NewToken(conn.LocalAddr(), 100*time.Millisecond, protocol.Version1)
 		require.NoError(t, err)
 		time.Sleep(3 * time.Millisecond) // make sure the token is expired
 		testServerTokenValidation(t, server, &eventRecorder, conn, token, false, false, true)
 	})
+}
+
+// A server using IETF Multipath QUIC issues tokens that are valid for multiple addresses of the client
+// (section 3.1.3 of draft-ietf-quic-multipath-21). Such a token validates any of these addresses.
+func TestServerTokenValidationMultipleAddresses(t *testing.T) {
+	tokenGeneratorKey := TokenGeneratorKey{1, 2, 3}
+	tg := handshake.NewTokenGenerator(tokenGeneratorKey)
+	server := newTestServer(t, &serverOpts{tokenGeneratorKey: tokenGeneratorKey, maxTokenAge: time.Hour})
+
+	addrs := []net.Addr{
+		&net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 1000},
+		&net.UDPAddr{IP: net.IPv4(192, 0, 2, 2), Port: 2000},
+		&net.UDPAddr{IP: net.ParseIP("2001:db8::1"), Port: 3000},
+	}
+	encoded, err := tg.NewToken(addrs[0], 10*time.Millisecond, protocol.Version1, addrs[1:]...)
+	require.NoError(t, err)
+	token, err := server.tokenGenerator.DecodeToken(encoded)
+	require.NoError(t, err)
+	for _, addr := range addrs {
+		require.True(t, server.validateToken(token, addr, protocol.Version1), "address %s", addr)
+	}
+	require.False(t, server.validateToken(token, &net.UDPAddr{IP: net.IPv4(192, 0, 2, 3), Port: 1000}, protocol.Version1))
+
+	// tokens for a single address are still accepted
+	encoded, err = tg.NewToken(addrs[1], 10*time.Millisecond, protocol.Version1)
+	require.NoError(t, err)
+	token, err = server.tokenGenerator.DecodeToken(encoded)
+	require.NoError(t, err)
+	require.True(t, server.validateToken(token, addrs[1], protocol.Version1))
+	require.False(t, server.validateToken(token, addrs[0], protocol.Version1))
+	// tokens are specific to a QUIC version
+	require.False(t, server.validateToken(token, addrs[1], protocol.Version2))
 }
 
 func testServerTokenValidation(
@@ -677,6 +745,7 @@ func (r *connConstructorRecorder) NewConn(
 	_ *handshake.TokenGenerator,
 	_ bool,
 	_ time.Duration,
+	_ *serverPreferredAddr,
 	_ qlogwriter.Trace,
 	_ utils.Logger,
 	_ protocol.Version,
@@ -732,6 +801,7 @@ func testServerCreateConnection(t *testing.T, useRetry bool) {
 			conn.LocalAddr(),
 			protocol.ParseConnectionID([]byte{0xde, 0xad, 0xc0, 0xde}),
 			protocol.ParseConnectionID([]byte{0xde, 0xca, 0xfb, 0xad}),
+			protocol.Version1,
 		)
 		require.NoError(t, err)
 	}
@@ -908,6 +978,7 @@ func TestServerReceiveQueue(t *testing.T) {
 			_ *handshake.TokenGenerator,
 			_ bool,
 			_ time.Duration,
+			_ *serverPreferredAddr,
 			_ qlogwriter.Trace,
 			_ utils.Logger,
 			_ protocol.Version,
@@ -1383,5 +1454,88 @@ func TestServer0RTTQueueing(t *testing.T) {
 	// queues are dropped in random order
 	for _, event := range expectedEvents {
 		require.Contains(t, eventRecorder.Events(qlog.PacketDropped{}), event)
+	}
+}
+
+// A client sets the QUIC Bit of an Initial packet to 0 only if the server sent the grease_quic_bit transport parameter
+// in a previous connection (section 3.1 of RFC 9287). Such Initial packets are accepted if the server enables the
+// extension.
+func TestServerGreasedQUICBitInitial(t *testing.T) {
+	t.Run("greasing enabled", func(t *testing.T) {
+		testServerGreasedQUICBitInitial(t, true)
+	})
+	t.Run("greasing disabled", func(t *testing.T) {
+		testServerGreasedQUICBitInitial(t, false)
+	})
+}
+
+func testServerGreasedQUICBitInitial(t *testing.T, enableGreasing bool) {
+	var eventRecorder events.Recorder
+	server := newTestServer(t, &serverOpts{
+		config:        &Config{EnableQUICBitGreasing: enableGreasing},
+		eventRecorder: &eventRecorder,
+	})
+	handledPackets := make(chan receivedPacket, 1)
+	recorder := newConnConstructorRecorder(&connTestHooks{
+		run:               func() error { return nil },
+		context:           func() context.Context { return context.Background() },
+		handshakeComplete: func() <-chan struct{} { return make(chan struct{}) },
+		handlePacket:      func(p receivedPacket) { handledPackets <- p },
+	})
+	server.newConn = recorder.NewConn
+
+	conn := newUDPConnLocalhost(t)
+	extHdr := &wire.ExtendedHeader{
+		Header: wire.Header{
+			Type:             protocol.PacketTypeInitial,
+			SrcConnectionID:  protocol.ParseConnectionID([]byte{5, 4, 3, 2, 1}),
+			DestConnectionID: protocol.ParseConnectionID([]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}),
+			Length:           protocol.MinInitialPacketSize + protocol.ByteCount(protocol.PacketNumberLen4) + 16,
+			Version:          protocol.Version1,
+		},
+		PacketNumberLen: protocol.PacketNumberLen4,
+	}
+	payload := make([]byte, protocol.MinInitialPacketSize)
+	packet := getLongHeaderPacket(t, conn.LocalAddr(), extHdr, payload)
+	packet.data[0] &^= 0x40
+	// The QUIC Bit is protected by the AEAD, so it needs to be cleared before sealing the packet.
+	sealer, _ := handshake.NewInitialAEAD(extHdr.DestConnectionID, protocol.PerspectiveClient, protocol.Version1)
+	n := len(packet.data) - len(payload)
+	packet.data = slices.Grow(packet.data, 16)
+	_ = sealer.Seal(packet.data[n:n], packet.data[n:], extHdr.PacketNumber, packet.data[:n])
+	packet.data = packet.data[:len(packet.data)+16]
+	sealer.EncryptHeader(packet.data[n:n+16], &packet.data[0], packet.data[n-int(extHdr.PacketNumberLen):n])
+	require.Zero(t, packet.data[0]&0x40)
+
+	server.handlePacket(packet)
+
+	if enableGreasing {
+		select {
+		case p := <-handledPackets:
+			require.Equal(t, packet, p)
+		case <-time.After(time.Second):
+			t.Fatal("timeout")
+		}
+		select {
+		case <-recorder.Args():
+		case <-time.After(time.Second):
+			t.Fatal("timeout")
+		}
+		return
+	}
+	require.Eventually(t, func() bool { return len(eventRecorder.Events(qlog.PacketDropped{})) > 0 }, time.Second, time.Millisecond)
+	require.Equal(t,
+		[]qlogwriter.Event{
+			qlog.PacketDropped{
+				Raw:     qlog.RawInfo{Length: int(packet.Size())},
+				Trigger: qlog.PacketDropHeaderParseError,
+			},
+		},
+		eventRecorder.Events(qlog.PacketDropped{}),
+	)
+	select {
+	case <-recorder.Args():
+		t.Fatal("didn't expect a connection to be created")
+	default:
 	}
 }

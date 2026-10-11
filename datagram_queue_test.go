@@ -3,8 +3,8 @@ package quic
 import (
 	"context"
 	"testing"
+	"testing/synctest"
 
-	"github.com/AeonDave/mp-quic-go/internal/synctest"
 	"github.com/AeonDave/mp-quic-go/internal/utils"
 	"github.com/AeonDave/mp-quic-go/internal/wire"
 

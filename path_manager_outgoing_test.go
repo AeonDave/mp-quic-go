@@ -3,10 +3,10 @@ package quic
 import (
 	"context"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/AeonDave/mp-quic-go/internal/protocol"
-	"github.com/AeonDave/mp-quic-go/internal/synctest"
 	"github.com/AeonDave/mp-quic-go/internal/wire"
 
 	"github.com/stretchr/testify/require"
@@ -25,6 +25,7 @@ func TestPathManagerOutgoingPathProbing(t *testing.T) {
 			},
 			func(id pathID) { t.Fatal("didn't expect any connection ID to be retired") },
 			func() {},
+			nil,
 		)
 
 		_, _, _, ok := pm.NextPathToProbe()
@@ -44,7 +45,7 @@ func TestPathManagerOutgoingPathProbing(t *testing.T) {
 		require.False(t, enabled)
 		connID, f, tr, ok := pm.NextPathToProbe()
 		require.True(t, ok)
-		require.Equal(t, tr1, tr)
+		require.Same(t, tr1, tr)
 		require.Equal(t, protocol.ParseConnectionID([]byte{1, 2, 3, 4, 5, 6, 7, 8}), connID)
 		require.IsType(t, &wire.PathChallengeFrame{}, f.Frame)
 		pc := f.Frame.(*wire.PathChallengeFrame)
@@ -68,7 +69,7 @@ func TestPathManagerOutgoingPathProbing(t *testing.T) {
 		}
 
 		require.ErrorIs(t, p.Switch(), ErrPathNotValidated)
-		_, ok = pm.ShouldSwitchPath()
+		_, _, ok = pm.ShouldSwitchPath(func(pathID) bool { return true })
 		require.False(t, ok)
 
 		// ... neither does receiving a random PATH_RESPONSE...
@@ -97,14 +98,28 @@ func TestPathManagerOutgoingPathProbing(t *testing.T) {
 		pm.HandlePathResponseFrame(&wire.PathResponseFrame{Data: pc.Data})
 
 		// now switch to the other path
-		_, ok = pm.ShouldSwitchPath()
+		_, _, ok = pm.ShouldSwitchPath(func(pathID) bool { return true })
 		require.False(t, ok)
 		require.NoError(t, p.Switch())
 		// the active path can't be closed
 		require.EqualError(t, p.Close(), "cannot close active path")
-		switchToTransport, ok := pm.ShouldSwitchPath()
+		// the switch is delayed until a connection ID is available for the path
+		var checked []pathID
+		_, _, ok = pm.ShouldSwitchPath(func(id pathID) bool {
+			checked = append(checked, id)
+			return false
+		})
+		require.False(t, ok)
+		switchToTransport, id, ok := pm.ShouldSwitchPath(func(id pathID) bool {
+			checked = append(checked, id)
+			return true
+		})
 		require.True(t, ok)
-		require.Equal(t, tr1, switchToTransport)
+		require.Same(t, tr1, switchToTransport)
+		require.Equal(t, p.id, id)
+		require.Equal(t, []pathID{p.id, p.id}, checked)
+		_, _, ok = pm.ShouldSwitchPath(func(pathID) bool { return true })
+		require.False(t, ok)
 	})
 }
 
@@ -120,6 +135,7 @@ func TestPathManagerOutgoingRetransmissions(t *testing.T) {
 			func(id pathID) (protocol.ConnectionID, bool) { return connIDs[id], true },
 			func(id pathID) { retiredConnIDs = append(retiredConnIDs, connIDs[id]) },
 			func() { scheduledSending <- struct{}{} },
+			nil,
 		)
 
 		_, _, _, ok := pm.NextPathToProbe()
@@ -239,6 +255,7 @@ func TestPathManagerOutgoingAbandonPath(t *testing.T) {
 			},
 			func(id pathID) { retiredPaths = append(retiredPaths, id) },
 			func() {},
+			nil,
 		)
 
 		// path abandoned before the PATH_CHALLENGE is sent out
@@ -264,7 +281,7 @@ func TestPathManagerOutgoingAbandonPath(t *testing.T) {
 		default:
 			t.Fatal("should have received a path closed error")
 		}
-		require.Empty(t, retiredPaths)
+		require.Equal(t, []pathID{p1.id}, retiredPaths)
 
 		p2 := pm.NewPath(&Transport{}, time.Second, func() {})
 		go func() { errChan <- p2.Probe(context.Background()) }()
@@ -277,11 +294,55 @@ func TestPathManagerOutgoingAbandonPath(t *testing.T) {
 		require.Equal(t, protocol.ParseConnectionID([]byte{1, 2, 3, 4, 5, 6, 7, 8}), connID)
 
 		require.NoError(t, p2.Close())
-		require.Equal(t, []pathID{p2.id}, retiredPaths)
+		require.Equal(t, []pathID{p1.id, p2.id}, retiredPaths)
 		pm.HandlePathResponseFrame(&wire.PathResponseFrame{Data: f.Frame.(*wire.PathChallengeFrame).Data})
 		_, _, _, ok = pm.NextPathToProbe()
 		require.False(t, ok)
 		// it's not possible to switch to an abandoned path
 		require.ErrorIs(t, p2.Switch(), ErrPathClosed)
+	})
+}
+
+// TestPathManagerOutgoingAbandonValidatedPath tests that closing a path that has
+// already been validated retires the connection ID allocated to it.
+// TestPathManagerOutgoingAbandonPath covers closing a path before validation,
+// which is a different case: pathChallenges is cleared once the path validates.
+func TestPathManagerOutgoingAbandonValidatedPath(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		connIDs := []protocol.ConnectionID{
+			protocol.ParseConnectionID([]byte{1, 2, 3, 4, 5, 6, 7, 8}),
+		}
+		var retiredPaths []pathID
+		pm := newPathManagerOutgoing(
+			func(id pathID) (protocol.ConnectionID, bool) {
+				if len(connIDs) == 0 {
+					return protocol.ConnectionID{}, false
+				}
+				connID := connIDs[0]
+				connIDs = connIDs[1:]
+				return connID, true
+			},
+			func(id pathID) { retiredPaths = append(retiredPaths, id) },
+			func() {},
+			nil,
+		)
+
+		p := pm.NewPath(&Transport{}, time.Second, func() {})
+		errChan := make(chan error, 1)
+		go func() { errChan <- p.Probe(context.Background()) }()
+		synctest.Wait()
+
+		_, f, _, ok := pm.NextPathToProbe()
+		require.True(t, ok)
+
+		// Validate the path before abandoning it. This is the ordering an
+		// application produces: probe, use the path, and abandon it later.
+		pm.HandlePathResponseFrame(&wire.PathResponseFrame{Data: f.Frame.(*wire.PathChallengeFrame).Data})
+		synctest.Wait()
+		require.NoError(t, <-errChan)
+
+		require.NoError(t, p.Close())
+		require.Equal(t, []pathID{p.id}, retiredPaths,
+			"the connection ID of a validated path must be retired when the path is abandoned")
 	})
 }

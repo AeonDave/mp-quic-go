@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AeonDave/mp-quic-go"
+	quic "github.com/AeonDave/mp-quic-go"
 	quicproxy "github.com/AeonDave/mp-quic-go/integrationtests/tools/proxy"
 	"github.com/AeonDave/mp-quic-go/internal/protocol"
 	"github.com/AeonDave/mp-quic-go/internal/wire"
@@ -23,6 +23,39 @@ import (
 )
 
 const mitmTestConnIDLen = 6
+
+// A mitmInjector injects packets into a connection established through a proxy.
+// The client discards packets from server addresses other than the one it sends its packets to (section 9 of
+// RFC 9000), so packets towards the client are sent from the proxy's socket. Packets towards the server that
+// would make the server migrate to the client's address are sent through the proxy as well.
+type mitmInjector struct {
+	// the proxy's socket, which the client sends its packets to
+	proxyConn *net.UDPConn
+	// packets sent through the proxy, which the proxy's callbacks forward unchanged
+	injected sync.Map
+}
+
+func newMITMInjector(t *testing.T) *mitmInjector {
+	return &mitmInjector{proxyConn: newUDPConnLocalhost(t)}
+}
+
+// toClient sends a packet to the client, from the address that the client sends its packets to.
+func (m *mitmInjector) toClient(b []byte, clientTransport *quic.Transport) error {
+	_, err := m.proxyConn.WriteTo(b, clientTransport.Conn.LocalAddr())
+	return err
+}
+
+// toServerViaProxy sends a packet from the client's address to the proxy, which forwards it to the server.
+func (m *mitmInjector) toServerViaProxy(b []byte, clientTransport *quic.Transport) {
+	m.injected.Store(string(b), struct{}{})
+	clientTransport.WriteTo(b, m.proxyConn.LocalAddr())
+}
+
+// wasInjected says if a packet seen by the proxy was sent by toServerViaProxy.
+func (m *mitmInjector) wasInjected(b []byte) bool {
+	_, ok := m.injected.LoadAndDelete(string(b))
+	return ok
+}
 
 func getTransportsForMITMTest(t *testing.T) (serverTransport, clientTransport *quic.Transport) {
 	serverTransport = &quic.Transport{
@@ -120,6 +153,7 @@ func testMITMInjectRandomPackets(t *testing.T, direction quicproxy.Direction) {
 
 	rtt := scaleDuration(10 * time.Millisecond)
 	serverTransport, clientTransport := getTransportsForMITMTest(t)
+	injector := newMITMInjector(t)
 
 	dropCallback := func(dir quicproxy.Direction, _, _ net.Addr, b []byte) bool {
 		if dir != direction {
@@ -133,7 +167,7 @@ func testMITMInjectRandomPackets(t *testing.T, direction quicproxy.Direction) {
 				case quicproxy.DirectionIncoming:
 					clientTransport.WriteTo(createRandomPacketOfSameType(b), serverTransport.Conn.LocalAddr())
 				case quicproxy.DirectionOutgoing:
-					serverTransport.WriteTo(createRandomPacketOfSameType(b), clientTransport.Conn.LocalAddr())
+					injector.toClient(createRandomPacketOfSameType(b), clientTransport)
 				}
 				<-ticker.C
 			}
@@ -141,36 +175,40 @@ func testMITMInjectRandomPackets(t *testing.T, direction quicproxy.Direction) {
 		return false
 	}
 
-	runMITMTest(t, serverTransport, clientTransport, rtt, dropCallback)
+	runMITMTest(t, serverTransport, clientTransport, injector, rtt, dropCallback)
 }
 
 func testMITMDuplicatePackets(t *testing.T, direction quicproxy.Direction) {
 	serverTransport, clientTransport := getTransportsForMITMTest(t)
+	injector := newMITMInjector(t)
 	rtt := scaleDuration(10 * time.Millisecond)
 
 	dropCallback := func(dir quicproxy.Direction, _, _ net.Addr, b []byte) bool {
-		if dir != direction {
+		if dir != direction || injector.wasInjected(b) {
 			return false
 		}
+		// The duplicated packets arrive before the packets sent through the proxy towards the client,
+		// and after them towards the server.
 		switch direction {
 		case quicproxy.DirectionIncoming:
-			clientTransport.WriteTo(b, serverTransport.Conn.LocalAddr())
+			injector.toServerViaProxy(b, clientTransport)
 		case quicproxy.DirectionOutgoing:
-			serverTransport.WriteTo(b, clientTransport.Conn.LocalAddr())
+			injector.toClient(b, clientTransport)
 		}
 		return false
 	}
 
-	runMITMTest(t, serverTransport, clientTransport, rtt, dropCallback)
+	runMITMTest(t, serverTransport, clientTransport, injector, rtt, dropCallback)
 }
 
 func testMITMCorruptPackets(t *testing.T, direction quicproxy.Direction) {
 	serverTransport, clientTransport := getTransportsForMITMTest(t)
+	injector := newMITMInjector(t)
 	rtt := scaleDuration(5 * time.Millisecond)
 
 	var numCorrupted atomic.Int32
 	dropCallback := func(dir quicproxy.Direction, _, _ net.Addr, b []byte) bool {
-		if dir != direction {
+		if dir != direction || injector.wasInjected(b) {
 			return false
 		}
 		isLongHeaderPacket := wire.IsLongHeaderPacket(b[0])
@@ -184,27 +222,29 @@ func testMITMCorruptPackets(t *testing.T, direction quicproxy.Direction) {
 		numCorrupted.Add(1)
 		pos := mrand.IntN(len(b))
 		b[pos] = byte(mrand.IntN(256))
+		// A packet in a corrupted datagram is still processed if the corruption only affects another packet
+		// coalesced into the datagram, or if the byte is replaced by the same value.
 		switch direction {
 		case quicproxy.DirectionIncoming:
-			clientTransport.WriteTo(b, serverTransport.Conn.LocalAddr())
+			injector.toServerViaProxy(b, clientTransport)
 		case quicproxy.DirectionOutgoing:
-			serverTransport.WriteTo(b, clientTransport.Conn.LocalAddr())
+			injector.toClient(b, clientTransport)
 		}
 		return true
 	}
 
-	runMITMTest(t, serverTransport, clientTransport, rtt, dropCallback)
+	runMITMTest(t, serverTransport, clientTransport, injector, rtt, dropCallback)
 	t.Logf("corrupted %d packets", numCorrupted.Load())
 	require.NotZero(t, int(numCorrupted.Load()))
 }
 
-func runMITMTest(t *testing.T, serverTr, clientTr *quic.Transport, rtt time.Duration, dropCb quicproxy.DropCallback) {
+func runMITMTest(t *testing.T, serverTr, clientTr *quic.Transport, injector *mitmInjector, rtt time.Duration, dropCb quicproxy.DropCallback) {
 	ln, err := serverTr.Listen(getTLSConfig(), getQuicConfig(nil))
 	require.NoError(t, err)
 	defer ln.Close()
 
 	proxy := quicproxy.Proxy{
-		Conn:        newUDPConnLocalhost(t),
+		Conn:        injector.proxyConn,
 		ServerAddr:  ln.Addr().(*net.UDPAddr),
 		DelayPacket: func(quicproxy.Direction, net.Addr, net.Addr, []byte) time.Duration { return rtt / 2 },
 		DropPacket:  dropCb,
@@ -264,6 +304,7 @@ func runMITMTest(t *testing.T, serverTr, clientTr *quic.Transport, rtt time.Dura
 
 func TestMITMForgedVersionNegotiationPacket(t *testing.T) {
 	serverTransport, clientTransport := getTransportsForMITMTest(t)
+	injector := newMITMInjector(t)
 	rtt := scaleDuration(10 * time.Millisecond)
 
 	const supportedVersion protocol.Version = 42
@@ -284,14 +325,14 @@ func TestMITMForgedVersionNegotiationPacket(t *testing.T) {
 				protocol.ArbitraryLenConnectionID(hdr.DestConnectionID.Bytes()),
 				[]protocol.Version{supportedVersion},
 			)
-			if _, err := serverTransport.WriteTo(packet, clientTransport.Conn.LocalAddr()); err != nil {
+			if err := injector.toClient(packet, clientTransport); err != nil {
 				panic("failed to write packet: " + err.Error())
 			}
 		})
 		return rtt / 2
 	}
 
-	err := runMITMTestSuccessful(t, serverTransport, clientTransport, delayCb)
+	err := runMITMTestSuccessful(t, serverTransport, clientTransport, injector, delayCb)
 	var vnErr *quic.VersionNegotiationError
 	require.ErrorAs(t, err, &vnErr)
 	require.Contains(t, vnErr.Theirs, supportedVersion) // might contain greased versions
@@ -302,6 +343,7 @@ func TestMITMForgedVersionNegotiationPacket(t *testing.T) {
 // TODO: determine behavior when server does not send Retry packets
 func TestMITMForgedRetryPacket(t *testing.T) {
 	serverTransport, clientTransport := getTransportsForMITMTest(t)
+	injector := newMITMInjector(t)
 	serverTransport.VerifySourceAddress = func(net.Addr) bool { return true }
 	rtt := scaleDuration(10 * time.Millisecond)
 
@@ -315,14 +357,14 @@ func TestMITMForgedRetryPacket(t *testing.T) {
 			once.Do(func() {
 				fakeSrcConnID := protocol.ParseConnectionID([]byte{0x12, 0x12, 0x12, 0x12, 0x12, 0x12, 0x12, 0x12})
 				retryPacket := testutils.ComposeRetryPacket(fakeSrcConnID, hdr.SrcConnectionID, hdr.DestConnectionID, []byte("token"), hdr.Version)
-				if _, err := serverTransport.WriteTo(retryPacket, clientTransport.Conn.LocalAddr()); err != nil {
+				if err := injector.toClient(retryPacket, clientTransport); err != nil {
 					panic("failed to write packet: " + err.Error())
 				}
 			})
 		}
 		return rtt / 2
 	}
-	err := runMITMTestSuccessful(t, serverTransport, clientTransport, delayCb)
+	err := runMITMTestSuccessful(t, serverTransport, clientTransport, injector, delayCb)
 	var nerr net.Error
 	require.ErrorAs(t, err, &nerr)
 	require.True(t, nerr.Timeout())
@@ -330,6 +372,7 @@ func TestMITMForgedRetryPacket(t *testing.T) {
 
 func TestMITMForgedInitialPacket(t *testing.T) {
 	serverTransport, clientTransport := getTransportsForMITMTest(t)
+	injector := newMITMInjector(t)
 	rtt := scaleDuration(10 * time.Millisecond)
 
 	var once sync.Once
@@ -352,14 +395,14 @@ func TestMITMForgedInitialPacket(t *testing.T) {
 					protocol.PerspectiveServer,
 					hdr.Version,
 				)
-				if _, err := serverTransport.WriteTo(initialPacket, clientTransport.Conn.LocalAddr()); err != nil {
+				if err := injector.toClient(initialPacket, clientTransport); err != nil {
 					panic("failed to write packet: " + err.Error())
 				}
 			})
 		}
 		return rtt / 2
 	}
-	err := runMITMTestSuccessful(t, serverTransport, clientTransport, delayCb)
+	err := runMITMTestSuccessful(t, serverTransport, clientTransport, injector, delayCb)
 	var nerr net.Error
 	require.ErrorAs(t, err, &nerr)
 	require.True(t, nerr.Timeout())
@@ -367,6 +410,7 @@ func TestMITMForgedInitialPacket(t *testing.T) {
 
 func TestMITMForgedInitialPacketWithAck(t *testing.T) {
 	serverTransport, clientTransport := getTransportsForMITMTest(t)
+	injector := newMITMInjector(t)
 	rtt := scaleDuration(10 * time.Millisecond)
 
 	var once sync.Once
@@ -391,7 +435,7 @@ func TestMITMForgedInitialPacketWithAck(t *testing.T) {
 					protocol.PerspectiveServer,
 					hdr.Version,
 				)
-				if _, err := serverTransport.WriteTo(initialPacket, clientTransport.Conn.LocalAddr()); err != nil {
+				if err := injector.toClient(initialPacket, clientTransport); err != nil {
 					panic("failed to write packet: " + err.Error())
 				}
 			})
@@ -399,21 +443,21 @@ func TestMITMForgedInitialPacketWithAck(t *testing.T) {
 		return rtt / 2
 	}
 
-	err := runMITMTestSuccessful(t, serverTransport, clientTransport, delayCb)
+	err := runMITMTestSuccessful(t, serverTransport, clientTransport, injector, delayCb)
 	var transportErr *quic.TransportError
 	require.ErrorAs(t, err, &transportErr)
 	require.Equal(t, quic.ProtocolViolation, transportErr.ErrorCode)
 	require.Contains(t, transportErr.ErrorMessage, "received ACK for an unsent packet")
 }
 
-func runMITMTestSuccessful(t *testing.T, serverTransport, clientTransport *quic.Transport, delayCb quicproxy.DelayCallback) error {
+func runMITMTestSuccessful(t *testing.T, serverTransport, clientTransport *quic.Transport, injector *mitmInjector, delayCb quicproxy.DelayCallback) error {
 	t.Helper()
 	ln, err := serverTransport.Listen(getTLSConfig(), getQuicConfig(nil))
 	require.NoError(t, err)
 	defer ln.Close()
 
 	proxy := quicproxy.Proxy{
-		Conn:        newUDPConnLocalhost(t),
+		Conn:        injector.proxyConn,
 		ServerAddr:  ln.Addr().(*net.UDPAddr),
 		DelayPacket: delayCb,
 	}

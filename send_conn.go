@@ -11,11 +11,16 @@ import (
 // A sendConn allows sending using a simple Write() on a non-connected packet conn.
 type sendConn interface {
 	Write(b []byte, gsoSize uint16, ecn protocol.ECN) error
-	WriteTo([]byte, net.Addr) error
+	WriteTo([]byte, net.Addr, packetInfo) error
 	Close() error
 	LocalAddr() net.Addr
 	RemoteAddr() net.Addr
 	ChangeRemoteAddr(addr net.Addr, info packetInfo)
+
+	// newPathConn returns a sendConn that sends on the same underlying connection,
+	// to the remote address, from the local address contained in the packet info.
+	// It is used for the paths of IETF Multipath QUIC.
+	newPathConn(remote net.Addr, info packetInfo) sendConn
 
 	capabilities() connCapabilities
 }
@@ -26,13 +31,36 @@ type packetInfoWriter interface {
 
 type remoteAddrInfo struct {
 	addr net.Addr
+	info packetInfo
 	oob  []byte
+	// the local address, which depends on the packet info
+	localAddr net.Addr
+}
+
+// A localAddrSelector is a connection that sends from multiple sockets, depending on the packet info.
+type localAddrSelector interface {
+	// localAddrFor returns the local address that packets with this packet info are sent from.
+	localAddrFor(packetInfo) net.Addr
+}
+
+// sendLocalAddr returns the local address that packets with the packet info are sent from.
+func sendLocalAddr(c rawConn, info packetInfo) net.Addr {
+	if s, ok := c.(localAddrSelector); ok {
+		return s.localAddrFor(info)
+	}
+	localAddr := c.LocalAddr()
+	if info.addr.IsValid() {
+		if udpAddr, ok := localAddr.(*net.UDPAddr); ok {
+			addrCopy := *udpAddr
+			addrCopy.IP = info.addr.AsSlice()
+			localAddr = &addrCopy
+		}
+	}
+	return localAddr
 }
 
 type sconn struct {
 	rawConn
-
-	localAddr net.Addr
 
 	remoteAddrInfo atomic.Pointer[remoteAddrInfo]
 
@@ -48,33 +76,34 @@ type sconn struct {
 var _ sendConn = &sconn{}
 
 func newSendConn(c rawConn, remote net.Addr, info packetInfo, logger utils.Logger) *sconn {
-	localAddr := c.LocalAddr()
-	if info.addr.IsValid() {
-		if udpAddr, ok := localAddr.(*net.UDPAddr); ok {
-			addrCopy := *udpAddr
-			addrCopy.IP = info.addr.AsSlice()
-			localAddr = &addrCopy
-		}
-	}
-
 	oob := info.OOB()
 	// increase oob slice capacity, so we can add the UDP_SEGMENT and ECN control messages without allocating
 	l := len(oob)
 	oob = append(oob, make([]byte, 64)...)[:l]
 	sc := &sconn{
-		rawConn:   c,
-		localAddr: localAddr,
-		logger:    logger,
+		rawConn: c,
+		logger:  logger,
 	}
 	sc.remoteAddrInfo.Store(&remoteAddrInfo{
-		addr: remote,
-		oob:  oob,
+		addr:      remote,
+		info:      info,
+		oob:       oob,
+		localAddr: sendLocalAddr(c, info),
 	})
 	return sc
 }
 
+func (c *sconn) newPathConn(remote net.Addr, info packetInfo) sendConn {
+	return newSendConn(c.rawConn, remote, info, c.logger)
+}
+
 func (c *sconn) Write(p []byte, gsoSize uint16, ecn protocol.ECN) error {
 	ai := c.remoteAddrInfo.Load()
+	// A connection that manages multiple sockets (e.g. the MultiSocketManager)
+	// selects the socket based on the local address in the packet info.
+	if writer, ok := c.rawConn.(packetInfoWriter); ok {
+		return c.writeWithInfo(writer, p, ai.addr, ai.info, gsoSize, ecn)
+	}
 	err := c.writePacket(p, ai.addr, ai.oob, gsoSize, ecn)
 	if err != nil && isGSOError(err) {
 		// disable GSO for future calls
@@ -84,10 +113,7 @@ func (c *sconn) Write(p []byte, gsoSize uint16, ecn protocol.ECN) error {
 		}
 		// send out the packets one by one
 		for len(p) > 0 {
-			l := len(p)
-			if l > int(gsoSize) {
-				l = int(gsoSize)
-			}
+			l := min(len(p), int(gsoSize))
 			if err := c.writePacket(p[:l], ai.addr, ai.oob, 0, ecn); err != nil {
 				return err
 			}
@@ -98,43 +124,8 @@ func (c *sconn) Write(p []byte, gsoSize uint16, ecn protocol.ECN) error {
 	return err
 }
 
-func (c *sconn) WritePath(p []byte, gsoSize uint16, ecn protocol.ECN, addr net.Addr, info packetInfo) error {
-	ai := c.remoteAddrInfo.Load()
-	if addr == nil {
-		addr = ai.addr
-	}
-
-	if writer, ok := c.rawConn.(packetInfoWriter); ok {
-		_, err := writer.WritePacketWithInfo(p, addr, info, gsoSize, ecn)
-		if err != nil && isGSOError(err) {
-			c.gotGSOError = true
-			if c.logger.Debug() {
-				c.logger.Debugf("GSO failed when sending to %s", addr)
-			}
-			for len(p) > 0 {
-				l := len(p)
-				if l > int(gsoSize) {
-					l = int(gsoSize)
-				}
-				if _, err := writer.WritePacketWithInfo(p[:l], addr, info, 0, ecn); err != nil {
-					return err
-				}
-				p = p[l:]
-			}
-			return nil
-		}
-		return err
-	}
-
-	oob := info.OOB()
-	if len(oob) == 0 {
-		oob = ai.oob
-	} else {
-		l := len(oob)
-		oob = append(oob, make([]byte, 64)...)[:l]
-	}
-
-	err := c.writePacket(p, addr, oob, gsoSize, ecn)
+func (c *sconn) writeWithInfo(writer packetInfoWriter, p []byte, addr net.Addr, info packetInfo, gsoSize uint16, ecn protocol.ECN) error {
+	_, err := writer.WritePacketWithInfo(p, addr, info, gsoSize, ecn)
 	if err != nil && isGSOError(err) {
 		// disable GSO for future calls
 		c.gotGSOError = true
@@ -143,11 +134,8 @@ func (c *sconn) WritePath(p []byte, gsoSize uint16, ecn protocol.ECN, addr net.A
 		}
 		// send out the packets one by one
 		for len(p) > 0 {
-			l := len(p)
-			if l > int(gsoSize) {
-				l = int(gsoSize)
-			}
-			if err := c.writePacket(p[:l], addr, oob, 0, ecn); err != nil {
+			l := min(len(p), int(gsoSize))
+			if _, err := writer.WritePacketWithInfo(p[:l], addr, info, 0, ecn); err != nil {
 				return err
 			}
 			p = p[l:]
@@ -166,8 +154,14 @@ func (c *sconn) writePacket(p []byte, addr net.Addr, oob []byte, gsoSize uint16,
 	return err
 }
 
-func (c *sconn) WriteTo(b []byte, addr net.Addr) error {
-	_, err := c.WritePacket(b, addr, nil, 0, protocol.ECNUnsupported)
+func (c *sconn) WriteTo(b []byte, addr net.Addr, info packetInfo) error {
+	// A connection that manages multiple sockets (e.g. the MultiSocketManager)
+	// selects the socket based on the local address in the packet info.
+	if writer, ok := c.rawConn.(packetInfoWriter); ok {
+		_, err := writer.WritePacketWithInfo(b, addr, info, 0, protocol.ECNUnsupported)
+		return err
+	}
+	_, err := c.WritePacket(b, addr, info.OOB(), 0, protocol.ECNUnsupported)
 	return err
 }
 
@@ -179,12 +173,28 @@ func (c *sconn) capabilities() connCapabilities {
 	return capabilities
 }
 
+// ChangeRemoteAddr changes the remote address.
+// If the packet info contains a local address, packets are sent from that address from now on.
 func (c *sconn) ChangeRemoteAddr(addr net.Addr, info packetInfo) {
+	localAddr := c.remoteAddrInfo.Load().localAddr
+	if info.addr.IsValid() {
+		localAddr = sendLocalAddr(c.rawConn, info)
+	}
 	c.remoteAddrInfo.Store(&remoteAddrInfo{
-		addr: addr,
-		oob:  info.OOB(),
+		addr:      addr,
+		info:      info,
+		oob:       info.OOB(),
+		localAddr: localAddr,
 	})
 }
 
+// sendConnInfo returns the packet info that a sendConn sends with.
+func sendConnInfo(c sendConn) packetInfo {
+	if sc, ok := c.(*sconn); ok {
+		return sc.remoteAddrInfo.Load().info
+	}
+	return packetInfo{}
+}
+
 func (c *sconn) RemoteAddr() net.Addr { return c.remoteAddrInfo.Load().addr }
-func (c *sconn) LocalAddr() net.Addr  { return c.localAddr }
+func (c *sconn) LocalAddr() net.Addr  { return c.remoteAddrInfo.Load().localAddr }

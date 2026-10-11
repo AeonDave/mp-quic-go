@@ -34,6 +34,30 @@ func TestParseShortHeaderNoQUICBit(t *testing.T) {
 	require.EqualError(t, err, "not a QUIC packet")
 }
 
+// An endpoint that sent the grease_quic_bit transport parameter accepts packets with the QUIC Bit set to 0
+// (section 3 of RFC 9287).
+func TestParseShortHeaderWithGreasedQUICBit(t *testing.T) {
+	for _, firstByte := range []byte{0b00000110, 0b01000110} {
+		data := []byte{
+			firstByte,
+			0xde, 0xad, 0xbe, 0xef,
+			0x13, 0x37, 0x99,
+		}
+		l, pn, pnLen, kp, err := ParseShortHeaderWithGreasedQUICBit(data, 4)
+		require.NoError(t, err)
+		require.Equal(t, len(data), l)
+		require.Equal(t, protocol.KeyPhaseOne, kp)
+		require.Equal(t, protocol.PacketNumber(0x133799), pn)
+		require.Equal(t, protocol.PacketNumberLen3, pnLen)
+	}
+
+	// the reserved bits are still checked
+	_, _, _, _, err := ParseShortHeaderWithGreasedQUICBit([]byte{0b00010101, 0xde, 0xad, 0xbe, 0xef, 0x13, 0x37}, 4)
+	require.ErrorIs(t, err, ErrInvalidReservedBits)
+	_, _, _, _, err = ParseShortHeaderWithGreasedQUICBit([]byte{0x80}, 4)
+	require.EqualError(t, err, "not a short header packet")
+}
+
 func TestParseShortHeaderReservedBitsSet(t *testing.T) {
 	data := []byte{
 		0b01010101,
@@ -41,7 +65,7 @@ func TestParseShortHeaderReservedBitsSet(t *testing.T) {
 		0x13, 0x37,
 	}
 	_, pn, _, _, err := ParseShortHeader(data, 4)
-	require.EqualError(t, err, ErrInvalidReservedBits.Error())
+	require.ErrorIs(t, err, ErrInvalidReservedBits)
 	require.Equal(t, protocol.PacketNumber(0x1337), pn)
 }
 
@@ -60,7 +84,7 @@ func TestParseShortHeaderErrorsOnEOF(t *testing.T) {
 	require.NoError(t, err)
 	for i := range data {
 		_, _, _, _, err := ParseShortHeader(data[:i], 4)
-		require.EqualError(t, err, io.EOF.Error())
+		require.ErrorIs(t, err, io.EOF)
 	}
 }
 

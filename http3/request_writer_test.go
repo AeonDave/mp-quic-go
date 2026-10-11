@@ -7,7 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/AeonDave/mp-quic-go"
+	quic "github.com/AeonDave/mp-quic-go"
 	"github.com/AeonDave/mp-quic-go/http3/qlog"
 	"github.com/AeonDave/mp-quic-go/qlogwriter"
 	"github.com/AeonDave/mp-quic-go/testutils/events"
@@ -96,6 +96,13 @@ func TestRequestWriterInvalidHostHeader(t *testing.T) {
 	)
 }
 
+func TestRequestWriterInvalidHeaderValue(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "https://quic-go.net", nil)
+	req.Header.Set("Authorization", "Bearer secret\x00")
+	err := newRequestWriter().WriteRequestHeader(&bytes.Buffer{}, req, false, 0, nil)
+	require.EqualError(t, err, `invalid HTTP header value for header "Authorization"`)
+}
+
 func TestRequestWriterConnect(t *testing.T) {
 	// httptest.NewRequest does not properly support the CONNECT method
 	req, err := http.NewRequest(http.MethodConnect, "https://quic-go.net/", nil)
@@ -127,6 +134,18 @@ func TestRequestWriterExtendedConnect(t *testing.T) {
 	require.Equal(t, "/", headerFields[":path"])
 	require.Equal(t, "https", headerFields[":scheme"])
 	require.Equal(t, "webtransport", headerFields[":protocol"])
+}
+
+func TestRequestWriterExtendedConnectInvalidProtocol(t *testing.T) {
+	// httptest.NewRequest does not properly support the CONNECT method
+	req, err := http.NewRequest(http.MethodConnect, "https://quic-go.net/", nil)
+	require.NoError(t, err)
+	req.Proto = "HTTP/3.0"
+	rw := newRequestWriter()
+	require.EqualError(t,
+		rw.WriteRequestHeader(&bytes.Buffer{}, req, false, 0, nil),
+		`invalid request :protocol "HTTP/3.0"`,
+	)
 }
 
 func TestRequestWriterTrailers(t *testing.T) {

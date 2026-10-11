@@ -5,9 +5,11 @@ import (
 	"crypto/tls"
 	"errors"
 	"io"
+	"time"
 
 	"github.com/AeonDave/mp-quic-go/internal/monotime"
 	"github.com/AeonDave/mp-quic-go/internal/protocol"
+	"github.com/AeonDave/mp-quic-go/internal/qerr"
 	"github.com/AeonDave/mp-quic-go/internal/wire"
 )
 
@@ -21,6 +23,16 @@ var (
 	ErrKeysDropped = errors.New("CryptoSetup: keys were already dropped")
 	// ErrDecryptionFailed is returned when the AEAD fails to open the packet.
 	ErrDecryptionFailed = errors.New("decryption failed")
+	// ErrConfidentialityLimitReached is returned by Get1RTTSealer when the confidentiality limit of the AEAD
+	// was reached, and the keys can't be updated. The connection can't send any more packets (section 6.6 of
+	// RFC 9001).
+	ErrConfidentialityLimitReached = &qerr.TransportError{
+		ErrorCode:    qerr.AEADLimitReached,
+		ErrorMessage: "confidentiality limit reached",
+	}
+	// ErrUnexpectedVersion is returned when an opener is requested for Initial packets of a QUIC version
+	// that is not in use for this connection.
+	ErrUnexpectedVersion = errors.New("CryptoSetup: unexpected QUIC version")
 )
 
 type headerDecryptor interface {
@@ -34,11 +46,14 @@ type LongHeaderOpener interface {
 	Open(dst, src []byte, pn protocol.PacketNumber, associatedData []byte) ([]byte, error)
 }
 
-// ShortHeaderOpener opens a short header packet
+// ShortHeaderOpener opens a short header packet.
+// The methods without a path ID operate on path 0.
 type ShortHeaderOpener interface {
 	headerDecryptor
 	DecodePacketNumber(wirePN protocol.PacketNumber, wirePNLen protocol.PacketNumberLen) protocol.PacketNumber
+	DecodePacketNumberForPath(pathID protocol.PathID, wirePN protocol.PacketNumber, wirePNLen protocol.PacketNumberLen) protocol.PacketNumber
 	Open(dst, src []byte, rcvTime monotime.Time, pn protocol.PacketNumber, kp protocol.KeyPhaseBit, associatedData []byte) ([]byte, error)
+	OpenForPath(dst, src []byte, rcvTime monotime.Time, pathID protocol.PathID, pn protocol.PacketNumber, kp protocol.KeyPhaseBit, associatedData []byte) ([]byte, error)
 }
 
 // LongHeaderSealer seals a long header packet
@@ -48,9 +63,11 @@ type LongHeaderSealer interface {
 	Overhead() int
 }
 
-// ShortHeaderSealer seals a short header packet
+// ShortHeaderSealer seals a short header packet.
+// Seal seals a packet sent on path 0.
 type ShortHeaderSealer interface {
 	LongHeaderSealer
+	SealForPath(dst, src []byte, pathID protocol.PathID, packetNumber protocol.PacketNumber, associatedData []byte) []byte
 	KeyPhase() protocol.KeyPhaseBit
 }
 
@@ -69,9 +86,12 @@ const (
 	EventWriteInitialData
 	// EventWriteHandshakeData contains new CRYPTO data to send at the Handshake encryption level
 	EventWriteHandshakeData
-	// EventReceivedReadKeys signals that new decryption keys are available.
-	// It doesn't say which encryption level those keys are for.
-	EventReceivedReadKeys
+	// EventReceived0RTTReadKeys signals that 0-RTT decryption keys are available.
+	EventReceived0RTTReadKeys
+	// EventReceivedHandshakeReadKeys signals that Handshake decryption keys are available.
+	EventReceivedHandshakeReadKeys
+	// EventReceived1RTTReadKeys signals that 1-RTT decryption keys are available.
+	EventReceived1RTTReadKeys
 	// EventDiscard0RTTKeys signals that the Handshake keys were discarded.
 	EventDiscard0RTTKeys
 	// EventReceivedTransportParameters contains the transport parameters sent by the peer.
@@ -81,6 +101,10 @@ const (
 	EventRestoredTransportParameters
 	// EventHandshakeComplete signals that the TLS handshake was completed.
 	EventHandshakeComplete
+	// EventVersionNegotiated signals that the server switched to a different version,
+	// using compatible version negotiation (RFC 9368).
+	// It is only used for the server.
+	EventVersionNegotiated
 )
 
 func (k EventKind) String() string {
@@ -91,8 +115,12 @@ func (k EventKind) String() string {
 		return "EventWriteInitialData"
 	case EventWriteHandshakeData:
 		return "EventWriteHandshakeData"
-	case EventReceivedReadKeys:
-		return "EventReceivedReadKeys"
+	case EventReceived0RTTReadKeys:
+		return "EventReceived0RTTReadKeys"
+	case EventReceivedHandshakeReadKeys:
+		return "EventReceivedHandshakeReadKeys"
+	case EventReceived1RTTReadKeys:
+		return "EventReceived1RTTReadKeys"
 	case EventDiscard0RTTKeys:
 		return "EventDiscard0RTTKeys"
 	case EventReceivedTransportParameters:
@@ -101,6 +129,8 @@ func (k EventKind) String() string {
 		return "EventRestoredTransportParameters"
 	case EventHandshakeComplete:
 		return "EventHandshakeComplete"
+	case EventVersionNegotiated:
+		return "EventVersionNegotiated"
 	default:
 		return "Unknown EventKind"
 	}
@@ -111,6 +141,8 @@ type Event struct {
 	Kind                EventKind
 	Data                []byte
 	TransportParameters *wire.TransportParameters
+	// the Negotiated Version, only set for EventVersionNegotiated
+	Version protocol.Version
 }
 
 // CryptoSetup handles the handshake and protecting / unprotecting packets
@@ -124,11 +156,18 @@ type CryptoSetup interface {
 	NextEvent() Event
 
 	SetLargest1RTTAcked(protocol.PacketNumber) error
+	SetLargest1RTTAckedForPath(pathID protocol.PathID, pn protocol.PacketNumber, now monotime.Time) error
+	EnableMultipath(maxPTO func() time.Duration) error
+	DropPath(protocol.PathID)
 	DiscardInitialKeys()
 	SetHandshakeConfirmed()
 	ConnectionState() ConnectionState
 
-	GetInitialOpener() (LongHeaderOpener, error)
+	// SwitchVersion is called by the client when it learns the Negotiated Version of compatible version negotiation.
+	SwitchVersion(protocol.Version)
+
+	// GetInitialOpener returns the opener for Initial packets using the version v.
+	GetInitialOpener(v protocol.Version) (LongHeaderOpener, error)
 	GetHandshakeOpener() (LongHeaderOpener, error)
 	Get0RTTOpener() (LongHeaderOpener, error)
 	Get1RTTOpener() (ShortHeaderOpener, error)

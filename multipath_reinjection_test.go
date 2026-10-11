@@ -98,7 +98,7 @@ func TestMultipathReinjectionManager_PathBackoff(t *testing.T) {
 	ok, _ := manager.canReinjectOnPath(pathID, now)
 	require.True(t, ok)
 
-	manager.MarkReinjected(1, pathID)
+	manager.MarkReinjected(2, 1, pathID)
 	ok, next := manager.canReinjectOnPath(pathID, now)
 	require.False(t, ok)
 	require.True(t, next.After(now))
@@ -210,6 +210,9 @@ func TestMultipathReinjectionManager_GetPendingReinjections(t *testing.T) {
 	require.Equal(t, pathID, ready[0].OriginalPathID)
 }
 
+// Every packet is reinjected at most GetMaxReinjections times:
+// when its frames are sent on another path because the PTO expired, and when it is lost.
+// A packet is only reported lost once, so its reinjection count is removed when it is lost.
 func TestMultipathReinjectionManager_MaxReinjections(t *testing.T) {
 	policy := NewMultipathReinjectionPolicy()
 	policy.Enable()
@@ -218,32 +221,49 @@ func TestMultipathReinjectionManager_MaxReinjections(t *testing.T) {
 	manager := NewMultipathReinjectionManager(policy)
 
 	pathID := protocol.PathID(1)
-	pn := protocol.PacketNumber(42)
 	encLevel := protocol.Encryption1RTT
-
 	frames := []ackhandler.Frame{
 		{Frame: &wire.StreamFrame{StreamID: 1, Data: []byte("test")}},
 	}
 
-	// First loss
-	manager.OnPacketLost(pathID, pn, encLevel, frames)
-	time.Sleep(5 * time.Millisecond)
-	ready := manager.GetPendingReinjections(time.Now())
+	// packet 42 is reinjected when the PTO expires, and then lost
+	require.True(t, manager.reinjectOnPTO(pathID, 42, 2))
+	manager.OnPacketLost(pathID, 42, encLevel, frames)
+	require.Empty(t, manager.reinjectedPackets)
+	ready := manager.GetPendingReinjections(time.Now().Add(time.Second))
 	require.Len(t, ready, 1)
-	manager.MarkReinjected(pn, protocol.PathID(2))
+	require.Equal(t, protocol.PacketNumber(42), ready[0].PacketNumber)
+	require.Equal(t, 1, ready[0].ReinjectionCount)
 
-	// Second loss
-	manager.OnPacketLost(pathID, pn, encLevel, frames)
-	time.Sleep(5 * time.Millisecond)
-	ready = manager.GetPendingReinjections(time.Now())
-	require.Len(t, ready, 1)
-	manager.MarkReinjected(pn, protocol.PathID(3))
+	// packet 43 is reinjected twice when the PTO expires: it's not reinjected again when it is lost
+	require.True(t, manager.reinjectOnPTO(pathID, 43, 2))
+	require.True(t, manager.reinjectOnPTO(pathID, 43, 3))
+	require.False(t, manager.reinjectOnPTO(pathID, 43, 2))
+	manager.OnPacketLost(pathID, 43, encLevel, frames)
+	require.Empty(t, manager.GetPendingReinjections(time.Now().Add(time.Second)))
+	require.Empty(t, manager.reinjectedPackets)
 
-	// Third loss - should be rejected (exceeded max)
-	manager.OnPacketLost(pathID, pn, encLevel, frames)
-	time.Sleep(5 * time.Millisecond)
-	ready = manager.GetPendingReinjections(time.Now())
-	require.Empty(t, ready) // Exceeded max reinjections
+	// packet 44 is reinjected when the PTO expires, and then lost while reinjection is disabled
+	require.True(t, manager.reinjectOnPTO(pathID, 44, 2))
+	policy.Disable()
+	manager.OnPacketLost(pathID, 44, encLevel, frames)
+	require.Empty(t, manager.reinjectedPackets)
+}
+
+// The reinjection counts of packets that are not outstanding anymore are removed.
+func TestMultipathReinjectionManagerForgetPacketsExcept(t *testing.T) {
+	policy := NewMultipathReinjectionPolicy()
+	policy.Enable()
+	manager := NewMultipathReinjectionManager(policy)
+	for pn := range protocol.PacketNumber(5) {
+		require.True(t, manager.reinjectOnPTO(1, pn, 2))
+	}
+	require.True(t, manager.reinjectOnPTO(2, 1, 1))
+
+	manager.forgetPacketsExcept(1, []protocol.PacketNumber{1, 3, 7})
+	require.Equal(t, map[reinjectionKey]int{{pathID: 1, pn: 1}: 1, {pathID: 1, pn: 3}: 1, {pathID: 2, pn: 1}: 1}, manager.reinjectedPackets)
+	manager.forgetPacketsExcept(1, nil)
+	require.Equal(t, map[reinjectionKey]int{{pathID: 2, pn: 1}: 1}, manager.reinjectedPackets)
 }
 
 func TestMultipathReinjectionManager_OnPacketAcked(t *testing.T) {
@@ -266,7 +286,7 @@ func TestMultipathReinjectionManager_OnPacketAcked(t *testing.T) {
 	require.Equal(t, 1, pending)
 
 	// ACK the packet
-	manager.OnPacketAcked(pn)
+	manager.OnPacketAcked(pathID, pn)
 
 	// Should be removed from pending
 	pending, _ = manager.GetStatistics()
@@ -280,7 +300,7 @@ func TestMultipathReinjectionManager_Statistics(t *testing.T) {
 	manager := NewMultipathReinjectionManager(policy)
 
 	// Add 3 lost packets
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		frames := []ackhandler.Frame{
 			{Frame: &wire.StreamFrame{StreamID: 1, Data: []byte("test")}},
 		}
@@ -295,7 +315,7 @@ func TestMultipathReinjectionManager_Statistics(t *testing.T) {
 	time.Sleep(5 * time.Millisecond)
 	ready := manager.GetPendingReinjections(time.Now())
 	for _, info := range ready {
-		manager.MarkReinjected(info.PacketNumber, protocol.PathID(2))
+		manager.MarkReinjected(info.OriginalPathID, info.PacketNumber, protocol.PathID(2))
 	}
 
 	pending, reinjected = manager.GetStatistics()
@@ -309,7 +329,7 @@ func TestMultipathReinjectionManager_Reset(t *testing.T) {
 	manager := NewMultipathReinjectionManager(policy)
 
 	// Add some packets
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		frames := []ackhandler.Frame{
 			{Frame: &wire.StreamFrame{StreamID: 1, Data: []byte("test")}},
 		}
@@ -325,4 +345,62 @@ func TestMultipathReinjectionManager_Reset(t *testing.T) {
 	pending, reinjected := manager.GetStatistics()
 	require.Equal(t, 0, pending)
 	require.Equal(t, 0, reinjected)
+}
+
+// With IETF Multipath QUIC, every path has its own packet number space.
+// Packets with the same packet number that were sent on different paths are tracked separately.
+func TestMultipathReinjectionManager_PacketNumbersOfDifferentPaths(t *testing.T) {
+	policy := NewMultipathReinjectionPolicy()
+	policy.Enable()
+	policy.SetReinjectionDelay(0)
+	policy.SetMaxReinjections(1)
+	manager := NewMultipathReinjectionManager(policy)
+	frames := func() []ackhandler.Frame {
+		return []ackhandler.Frame{{Frame: &wire.StreamFrame{StreamID: 1, Data: []byte("test")}}}
+	}
+
+	manager.OnPacketLost(1, 5, protocol.Encryption1RTT, frames())
+	manager.OnPacketLost(2, 5, protocol.Encryption1RTT, frames())
+	pending, _ := manager.GetStatistics()
+	require.Equal(t, 2, pending)
+	// acknowledging the packet sent on path 1 doesn't affect the packet sent on path 2
+	manager.OnPacketAcked(1, 5)
+	ready := manager.GetPendingReinjections(time.Now())
+	require.Len(t, ready, 1)
+	require.Equal(t, protocol.PathID(2), ready[0].OriginalPathID)
+	require.Equal(t, protocol.PacketNumber(5), ready[0].PacketNumber)
+	manager.MarkReinjected(2, 5, 0)
+
+	// The packet sent on path 2 was reinjected as often as allowed.
+	manager.OnPacketLost(2, 5, protocol.Encryption1RTT, frames())
+	pending, _ = manager.GetStatistics()
+	require.Zero(t, pending)
+	// The packet with the same packet number sent on path 1 can still be reinjected.
+	manager.OnPacketLost(1, 5, protocol.Encryption1RTT, frames())
+	pending, _ = manager.GetStatistics()
+	require.Equal(t, 1, pending)
+	// the state kept for path 1 is removed when it is abandoned
+	manager.forgetPath(1)
+	pending, _ = manager.GetStatistics()
+	require.Zero(t, pending)
+}
+
+// The packets ready for reinjection are returned in ascending order of their path IDs and packet numbers.
+func TestMultipathReinjectionManager_PendingReinjectionsOrder(t *testing.T) {
+	policy := NewMultipathReinjectionPolicy()
+	policy.Enable()
+	policy.SetReinjectionDelay(0)
+	manager := NewMultipathReinjectionManager(policy)
+	type packet struct {
+		pathID protocol.PathID
+		pn     protocol.PacketNumber
+	}
+	for _, p := range []packet{{3, 1}, {1, 7}, {0, 9}, {1, 2}, {3, 0}} {
+		manager.OnPacketLost(p.pathID, p.pn, protocol.Encryption1RTT, []ackhandler.Frame{{Frame: &wire.StreamFrame{StreamID: 1, Data: []byte("test")}}})
+	}
+	var order []packet
+	for _, info := range manager.GetPendingReinjections(time.Now()) {
+		order = append(order, packet{info.OriginalPathID, info.PacketNumber})
+	}
+	require.Equal(t, []packet{{0, 9}, {1, 2}, {1, 7}, {3, 0}, {3, 1}}, order)
 }

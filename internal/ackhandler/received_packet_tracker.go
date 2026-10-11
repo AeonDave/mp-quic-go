@@ -52,6 +52,12 @@ func (h *receivedPacketTracker) GetAckFrame() *wire.AckFrame {
 	if !h.hasNewAck {
 		return nil
 	}
+	// All packets might have been deleted from the history, see appDataReceivedPacketTracker.IgnoreBelow.
+	// An ACK frame must contain at least one ACK range.
+	if len(h.packetHistory.ranges) == 0 {
+		h.hasNewAck = false
+		return nil
+	}
 
 	// This function always returns the same ACK frame struct, filled with the most recent values.
 	ack := h.lastAck
@@ -93,6 +99,9 @@ type appDataReceivedPacketTracker struct {
 
 	ackElicitingPacketsReceivedSinceLastAck int
 	ackAlarm                                monotime.Time
+
+	// The path was abandoned (IETF Multipath QUIC): every ack-eliciting packet is acknowledged immediately.
+	abandoned bool
 
 	logger utils.Logger
 }
@@ -144,6 +153,14 @@ func (h *appDataReceivedPacketTracker) IgnoreBelow(pn protocol.PacketNumber) {
 	if h.logger.Debug() {
 		h.logger.Debugf("\tIgnoring all packets below %d.", pn)
 	}
+	// A packet that was reordered might have been received after the ACK frame that acknowledged later packets.
+	// If that packet was the only one that wasn't acknowledged yet, there's nothing left to acknowledge.
+	if len(h.packetHistory.ranges) == 0 {
+		h.hasNewAck = false
+		h.ackQueued = false
+		h.ackAlarm = 0
+		h.ackElicitingPacketsReceivedSinceLastAck = 0
+	}
 }
 
 // isMissing says if a packet was reported missing in the last ACK.
@@ -172,7 +189,29 @@ func (h *appDataReceivedPacketTracker) hasNewMissingPackets() bool {
 	return highestMissing > h.lastAck.LargestAcked()-reorderingThreshold
 }
 
+// Abandon is called when the path is abandoned.
+// All packets received on the path are acknowledged promptly (draft-ietf-quic-multipath, section 3.4.3):
+// an ACK is queued for the packets received so far, and for every ack-eliciting packet received afterwards.
+func (h *appDataReceivedPacketTracker) Abandon() {
+	h.abandoned = true
+	if h.hasNewAck {
+		h.ackQueued = true
+		h.ackAlarm = 0
+	}
+}
+
+// ackDue says if an ACK frame should be sent now.
+func (h *appDataReceivedPacketTracker) ackDue(now monotime.Time) bool {
+	return h.ackQueued || (!h.ackAlarm.IsZero() && !h.ackAlarm.After(now))
+}
+
 func (h *appDataReceivedPacketTracker) shouldQueueACK(pn protocol.PacketNumber, ecn protocol.ECN, wasMissing bool) bool {
+	if h.abandoned {
+		if h.logger.Debug() {
+			h.logger.Debugf("\tQueueing ACK because packet %d was received on an abandoned path.", pn)
+		}
+		return true
+	}
 	// Send an ACK if this packet was reported missing in an ACK sent before.
 	// Ack decimation with reordering relies on the timer to send an ACK, but if
 	// missing packets we reported in the previous ACK, send an ACK immediately.

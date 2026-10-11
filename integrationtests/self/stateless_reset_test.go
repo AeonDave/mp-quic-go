@@ -5,10 +5,10 @@ import (
 	"crypto/rand"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
-	"github.com/AeonDave/mp-quic-go"
-	"github.com/AeonDave/mp-quic-go/internal/synctest"
+	quic "github.com/AeonDave/mp-quic-go"
 	"github.com/AeonDave/mp-quic-go/testutils/simnet"
 
 	"github.com/stretchr/testify/require"

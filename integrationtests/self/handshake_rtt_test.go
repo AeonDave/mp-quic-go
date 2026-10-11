@@ -6,10 +6,10 @@ import (
 	"io"
 	"net"
 	"testing"
+	"testing/synctest"
 	"time"
 
-	"github.com/AeonDave/mp-quic-go"
-	"github.com/AeonDave/mp-quic-go/internal/synctest"
+	quic "github.com/AeonDave/mp-quic-go"
 
 	"github.com/stretchr/testify/require"
 )
@@ -49,7 +49,13 @@ func testHandshakeRTTRetry(t *testing.T, doRetry bool) {
 func TestHandshakeRTTHelloRetryRequest(t *testing.T) {
 	tlsConf := getTLSConfig()
 	tlsConf.CurvePreferences = []tls.CurveID{tls.CurveP384}
+	var helloRetryRequest bool
+	tlsConf.GetCertificate = func(info *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		helloRetryRequest = info.HelloRetryRequest
+		return nil, nil
+	}
 	rtts := testHandshakeMeasureHandshake(t, nil, tlsConf, getQuicConfig(nil))
+	require.True(t, helloRetryRequest)
 	require.GreaterOrEqual(t, rtts, float64(2))
 	require.Less(t, rtts, float64(2.1))
 }

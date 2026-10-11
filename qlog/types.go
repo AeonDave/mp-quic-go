@@ -13,6 +13,7 @@ type (
 	ArbitraryLenConnectionID = protocol.ArbitraryLenConnectionID
 	Version                  = protocol.Version
 	PacketNumber             = protocol.PacketNumber
+	PathID                   = protocol.PathID
 	EncryptionLevel          = protocol.EncryptionLevel
 	KeyPhaseBit              = protocol.KeyPhaseBit
 	KeyPhase                 = protocol.KeyPhase
@@ -155,6 +156,16 @@ func (e transportError) String() string {
 		return "aead_limit_reached"
 	case qerr.NoViablePathError:
 		return "no_viable_path"
+	case qerr.VersionNegotiationErrorCode:
+		return "version_negotiation_error"
+	case qerr.ApplicationAbandonPath:
+		return "application_abandon_path"
+	case qerr.PathResourceLimitReached:
+		return "path_resource_limit_reached"
+	case qerr.PathUnstableOrPoor:
+		return "path_unstable_or_poor"
+	case qerr.NoCIDAvailableForPath:
+		return "no_cid_available_for_path"
 	default:
 		return ""
 	}
@@ -295,10 +306,11 @@ const (
 	ConnectionCloseTriggerStatelessReset ConnectionCloseTrigger = "stateless_reset"
 )
 
-// DatagramID is a unique identifier for a datagram
-type DatagramID uint32
+// DatagramPayloadChecksum is the CRC32c checksum of a UDP datagram payload.
+// ponytail: zero means absent; use an optional value if zero-valued checksums need to be logged.
+type DatagramPayloadChecksum uint32
 
-// CalculateDatagramID computes a DatagramID for a given packet
-func CalculateDatagramID(packet []byte) DatagramID {
-	return DatagramID(crc32.ChecksumIEEE(packet))
+// CalculateDatagramPayloadChecksum computes the checksum of a UDP datagram payload.
+func CalculateDatagramPayloadChecksum(payload []byte) DatagramPayloadChecksum {
+	return DatagramPayloadChecksum(crc32.Checksum(payload, crc32.MakeTable(crc32.Castagnoli)))
 }

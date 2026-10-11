@@ -45,6 +45,17 @@ func TestIsFrameTypeAckEliciting(t *testing.T) {
 		wire.FrameTypeDatagramWithLength: true,
 		wire.FrameTypeAckFrequency:       true,
 		wire.FrameTypeImmediateAck:       true,
+		// multipath extension
+		wire.FrameTypePathAck:                false,
+		wire.FrameTypePathAckECN:             false,
+		wire.FrameTypePathAbandon:            true,
+		wire.FrameTypePathStatusBackup:       true,
+		wire.FrameTypePathStatusAvailable:    true,
+		wire.FrameTypePathNewConnectionID:    true,
+		wire.FrameTypePathRetireConnectionID: true,
+		wire.FrameTypeMaxPathID:              true,
+		wire.FrameTypePathsBlocked:           true,
+		wire.FrameTypePathCIDsBlocked:        true,
 	}
 
 	for ft, expected := range testCases {
@@ -66,6 +77,16 @@ func TestAckElicitingFrames(t *testing.T) {
 		&wire.StopSendingFrame{}:     true,
 		&wire.AckFrequencyFrame{}:    true,
 		&wire.ImmediateAckFrame{}:    true,
+		// multipath extension
+		&wire.AckFrame{PathID: 1, HasPathID: true}: false,
+		&wire.PathAbandonFrame{}:                   true,
+		&wire.PathStatusFrame{Backup: true}:        true,
+		&wire.PathStatusFrame{}:                    true,
+		&wire.PathNewConnectionIDFrame{}:           true,
+		&wire.PathRetireConnectionIDFrame{}:        true,
+		&wire.MaxPathIDFrame{}:                     true,
+		&wire.PathsBlockedFrame{}:                  true,
+		&wire.PathCIDsBlockedFrame{}:               true,
 	}
 
 	for f, expected := range testCases {

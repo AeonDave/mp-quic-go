@@ -89,7 +89,7 @@ func TestRoundRobinScheduler_RoundRobinDistribution(t *testing.T) {
 	selections := make(map[PathID]int)
 
 	// Select 100 times
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		selected := scheduler.SelectPath(paths, false)
 		require.NotNil(t, selected)
 		selections[selected.PathID]++
@@ -110,7 +110,7 @@ func TestRoundRobinScheduler_SkipPotentiallyFailed(t *testing.T) {
 	}
 
 	// Should skip path 1 and select path 2
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		selected := scheduler.SelectPath(paths, false)
 		require.NotNil(t, selected)
 		require.Equal(t, PathID(2), selected.PathID)
@@ -167,7 +167,7 @@ func TestLowLatencyScheduler_SelectLowestRTT(t *testing.T) {
 	}
 
 	// Should always select path 2 (lowest RTT)
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		selected := scheduler.SelectPath(paths, false)
 		require.NotNil(t, selected)
 		require.Equal(t, PathID(2), selected.PathID, "iteration %d", i)
@@ -186,7 +186,7 @@ func TestLowLatencyScheduler_UnprobedPaths(t *testing.T) {
 	selections := make(map[PathID]int)
 
 	// For unprobed paths, should use round-robin
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		selected := scheduler.SelectPath(paths, false)
 		require.NotNil(t, selected)
 		selections[selected.PathID]++
@@ -207,7 +207,7 @@ func TestLowLatencyScheduler_MixedProbedUnprobed(t *testing.T) {
 	}
 
 	// Should prefer probed path with known RTT
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		selected := scheduler.SelectPath(paths, false)
 		require.NotNil(t, selected)
 		require.Equal(t, PathID(1), selected.PathID)
@@ -224,7 +224,7 @@ func TestLowLatencyScheduler_PreferLowerRTTOverQuota(t *testing.T) {
 	}
 
 	// Give path 1 much lower quota
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		scheduler.UpdateQuota(2, 1200)
 	}
 
@@ -257,7 +257,7 @@ func TestMinRTTScheduler_PureRTTBias(t *testing.T) {
 	}
 
 	// Give path 2 much higher quota
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		scheduler.UpdateQuota(2, 1200)
 	}
 
@@ -275,8 +275,13 @@ func TestMinRTTScheduler_BalancedBias(t *testing.T) {
 		{PathID: 2, SendingAllowed: true, SmoothedRTT: 51 * time.Millisecond}, // Slightly higher
 	}
 
+	// Both paths are known to the scheduler before path 1 gets used.
+	// (A path that the scheduler sees for the first time starts at the lowest quota
+	// of the other paths, see TestScheduler_NewPathDoesNotCatchUp.)
+	require.NotNil(t, scheduler.SelectPath(paths, false))
+
 	// Give path 1 much higher quota
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		scheduler.UpdateQuota(1, 1200)
 	}
 
@@ -297,7 +302,7 @@ func TestMinRTTScheduler_ZeroBias(t *testing.T) {
 	selections := make(map[PathID]int)
 
 	// With zero bias, should distribute evenly regardless of RTT
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		selected := scheduler.SelectPath(paths, false)
 		require.NotNil(t, selected)
 		selections[selected.PathID]++
@@ -356,9 +361,9 @@ func TestScheduler_ConcurrentAccess(t *testing.T) {
 		done := make(chan bool)
 
 		// Concurrent selections
-		for i := 0; i < 10; i++ {
+		for range 10 {
 			go func() {
-				for j := 0; j < 100; j++ {
+				for range 100 {
 					selected := scheduler.SelectPath(paths, false)
 					if selected != nil {
 						scheduler.UpdateQuota(selected.PathID, 1200)
@@ -369,12 +374,157 @@ func TestScheduler_ConcurrentAccess(t *testing.T) {
 		}
 
 		// Wait for all goroutines
-		for i := 0; i < 10; i++ {
+		for range 10 {
 			<-done
 		}
 
 		// Should not panic and should have processed all updates
 		scheduler.Reset()
+	}
+}
+
+func newTestSchedulers() map[string]PathScheduler {
+	return map[string]PathScheduler{
+		"RoundRobin": NewRoundRobinScheduler(),
+		"LowLatency": NewLowLatencyScheduler(),
+		"MinRTT":     NewMinRTTScheduler(0),
+	}
+}
+
+func schedulerPathQuotas(t *testing.T, s PathScheduler) *pathQuotas {
+	t.Helper()
+	switch s := s.(type) {
+	case *RoundRobinScheduler:
+		return &s.pathQuotas
+	case *LowLatencyScheduler:
+		return &s.pathQuotas
+	case *MinRTTScheduler:
+		return &s.pathQuotas
+	}
+	t.Fatalf("unexpected scheduler type %T", s)
+	return nil
+}
+
+// sendOnScheduler runs n rounds of SelectPath and UpdateQuota, and returns the selected path IDs.
+func sendOnScheduler(t *testing.T, s PathScheduler, paths []SchedulerPathInfo, n int) []PathID {
+	t.Helper()
+	selected := make([]PathID, 0, n)
+	for range n {
+		p := s.SelectPath(paths, false)
+		require.NotNil(t, p)
+		selected = append(selected, p.PathID)
+		s.UpdateQuota(p.PathID, 1200)
+	}
+	return selected
+}
+
+// requireAlternating checks that two paths share the selections evenly,
+// without either path being selected more than twice in a row.
+func requireAlternating(t *testing.T, selected []PathID) {
+	t.Helper()
+	counts := make(map[PathID]int)
+	run := 0
+	for i, id := range selected {
+		counts[id]++
+		if i > 0 && selected[i-1] == id {
+			run++
+		} else {
+			run = 1
+		}
+		require.LessOrEqual(t, run, 2, "path %d selected %d times in a row: %v", id, run, selected)
+	}
+	require.Len(t, counts, 2, "selections: %v", selected)
+	for id, c := range counts {
+		require.InDelta(t, len(selected)/2, c, 1, "path %d: %v", id, selected)
+	}
+}
+
+func TestScheduler_NewPathDoesNotCatchUp(t *testing.T) {
+	for name, scheduler := range newTestSchedulers() {
+		t.Run(name, func(t *testing.T) {
+			path0 := SchedulerPathInfo{PathID: 0, SendingAllowed: true, SmoothedRTT: 20 * time.Millisecond}
+			path1 := SchedulerPathInfo{PathID: 1, SendingAllowed: true, SmoothedRTT: 20 * time.Millisecond}
+
+			for _, id := range sendOnScheduler(t, scheduler, []SchedulerPathInfo{path0}, 1000) {
+				require.Equal(t, PathID(0), id)
+			}
+
+			// Path 1 is added: the paths alternate right away,
+			// instead of path 1 getting the next 1000 packets.
+			requireAlternating(t, sendOnScheduler(t, scheduler, []SchedulerPathInfo{path0, path1}, 20))
+
+			// Path 1 disappears for a while, then returns: same thing.
+			sendOnScheduler(t, scheduler, []SchedulerPathInfo{path0}, 500)
+			requireAlternating(t, sendOnScheduler(t, scheduler, []SchedulerPathInfo{path1, path0}, 20))
+
+			// A path that was used (UpdateQuota) before it was passed to SelectPath.
+			path2 := SchedulerPathInfo{PathID: 2, SendingAllowed: true, SmoothedRTT: 20 * time.Millisecond}
+			scheduler.UpdateQuota(2, 1200)
+			selected := sendOnScheduler(t, scheduler, []SchedulerPathInfo{path0, path1, path2}, 30)
+			counts := make(map[PathID]int)
+			for _, id := range selected {
+				counts[id]++
+			}
+			require.Len(t, counts, 3, "selections: %v", selected)
+			for id, c := range counts {
+				require.InDelta(t, 10, c, 1, "path %d: %v", id, selected)
+			}
+		})
+	}
+}
+
+func TestScheduler_NewPathAfterReset(t *testing.T) {
+	for name, scheduler := range newTestSchedulers() {
+		t.Run(name, func(t *testing.T) {
+			path0 := SchedulerPathInfo{PathID: 0, SendingAllowed: true}
+			path1 := SchedulerPathInfo{PathID: 1, SendingAllowed: true}
+			sendOnScheduler(t, scheduler, []SchedulerPathInfo{path0}, 100)
+			scheduler.Reset()
+			sendOnScheduler(t, scheduler, []SchedulerPathInfo{path0}, 100)
+			requireAlternating(t, sendOnScheduler(t, scheduler, []SchedulerPathInfo{path0, path1}, 20))
+		})
+	}
+}
+
+func TestScheduler_QuotaMapsBoundedUnderPathChurn(t *testing.T) {
+	const maxEntries = 3*schedulerQuotaPruneInterval + 2
+
+	for name, scheduler := range newTestSchedulers() {
+		t.Run(name, func(t *testing.T) {
+			q := schedulerPathQuotas(t, scheduler)
+			for i := range 20 * schedulerQuotaPruneInterval {
+				// path 0 stays, the second path is a different one every time
+				paths := []SchedulerPathInfo{
+					{PathID: 0, SendingAllowed: true},
+					{PathID: PathID(i + 1), SendingAllowed: true},
+				}
+				p := scheduler.SelectPath(paths, false)
+				require.NotNil(t, p)
+				scheduler.UpdateQuota(p.PathID, 1200)
+				// packets sent on a path the scheduler is never asked about
+				scheduler.UpdateQuota(PathID(1_000_000+i), 1200)
+
+				require.LessOrEqual(t, len(q.quotas), maxEntries)
+				require.LessOrEqual(t, len(q.lastSeen), maxEntries)
+			}
+
+			// once the paths settle, the counters of the old paths are dropped
+			paths := []SchedulerPathInfo{
+				{PathID: 0, SendingAllowed: true},
+				{PathID: 1, SendingAllowed: true},
+			}
+			sendOnScheduler(t, scheduler, paths, 2*schedulerQuotaPruneInterval)
+			require.Len(t, q.quotas, 2)
+			require.Len(t, q.lastSeen, 2)
+			require.Contains(t, q.quotas, PathID(0))
+			require.Contains(t, q.quotas, PathID(1))
+
+			if s, ok := scheduler.(*MinRTTScheduler); ok {
+				require.Len(t, s.bytesPerPath, 2)
+				require.Len(t, s.packetsPerPath, 2)
+				require.Len(t, s.GetStatistics(), 2)
+			}
+		})
 	}
 }
 
@@ -426,5 +576,59 @@ func BenchmarkMinRTTScheduler_SelectPath(b *testing.B) {
 		if selected != nil {
 			scheduler.UpdateQuota(selected.PathID, 1200)
 		}
+	}
+}
+
+// Backup paths are only selected if no other path can be selected (section 3.3 of draft-ietf-quic-multipath-21),
+// even if they have a lower RTT or a lower quota.
+func TestSchedulersSkipBackupPaths(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		scheduler func() PathScheduler
+	}{
+		{name: "round-robin", scheduler: func() PathScheduler { return NewRoundRobinScheduler() }},
+		{name: "low latency", scheduler: func() PathScheduler { return NewLowLatencyScheduler() }},
+		{name: "minimum RTT", scheduler: func() PathScheduler { return NewMinRTTScheduler(1) }},
+		{name: "minimum RTT, balanced", scheduler: func() PathScheduler { return NewMinRTTScheduler(0.5) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := tc.scheduler()
+			paths := func() []SchedulerPathInfo {
+				return []SchedulerPathInfo{
+					{PathID: 1, SendingAllowed: true, SmoothedRTT: 5 * time.Millisecond, Backup: true},
+					{PathID: 2, SendingAllowed: true, SmoothedRTT: 50 * time.Millisecond},
+					{PathID: 3, SendingAllowed: true, SmoothedRTT: 10 * time.Millisecond, Backup: true},
+				}
+			}
+			for range 10 {
+				selected := s.SelectPath(paths(), false)
+				require.NotNil(t, selected)
+				require.Equal(t, PathID(2), selected.PathID)
+				s.UpdateQuota(selected.PathID, 1200)
+			}
+
+			// the available path can't send
+			p := paths()
+			p[1].SendingAllowed = false
+			selected := s.SelectPath(p, false)
+			require.NotNil(t, selected)
+			require.True(t, selected.Backup)
+			// retransmissions can be sent on paths that are congestion limited
+			selected = s.SelectPath(p, true)
+			require.NotNil(t, selected)
+			require.Equal(t, PathID(2), selected.PathID)
+
+			// the available path potentially failed
+			p = paths()
+			p[1].PotentiallyFailed = true
+			selected = s.SelectPath(p, false)
+			require.NotNil(t, selected)
+			require.True(t, selected.Backup)
+
+			// only backup paths
+			p = paths()
+			p[1].Backup = true
+			require.NotNil(t, s.SelectPath(p, false))
+		})
 	}
 }

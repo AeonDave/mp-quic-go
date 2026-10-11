@@ -6,7 +6,7 @@ import (
 	"os"
 	"sync"
 
-	"github.com/AeonDave/mp-quic-go"
+	quic "github.com/AeonDave/mp-quic-go"
 )
 
 const streamDatagramQueueLen = 32
@@ -98,6 +98,14 @@ func (s *stateTrackingStream) Write(b []byte) (int, error) {
 		s.closeSend(err)
 	}
 	return n, err
+}
+
+func (s *stateTrackingStream) TryWriteAll(b []byte) error {
+	err := s.Stream.TryWriteAll(b)
+	if err != nil && !errors.Is(err, quic.ErrWouldBlock) {
+		s.closeSend(err)
+	}
+	return err
 }
 
 func (s *stateTrackingStream) CancelRead(e quic.StreamErrorCode) {

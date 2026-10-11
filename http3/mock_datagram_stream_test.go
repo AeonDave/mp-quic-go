@@ -382,6 +382,42 @@ func (c *MockDatagramStreamSetDeadlineCall) DoAndReturn(f func(time.Time) error)
 	return c
 }
 
+// SetPriority mocks base method.
+func (m *MockDatagramStream) SetPriority(urgency int8, incremental bool) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "SetPriority", urgency, incremental)
+}
+
+// SetPriority indicates an expected call of SetPriority.
+func (mr *MockDatagramStreamMockRecorder) SetPriority(urgency, incremental any) *MockDatagramStreamSetPriorityCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetPriority", reflect.TypeOf((*MockDatagramStream)(nil).SetPriority), urgency, incremental)
+	return &MockDatagramStreamSetPriorityCall{Call: call}
+}
+
+// MockDatagramStreamSetPriorityCall wrap *gomock.Call
+type MockDatagramStreamSetPriorityCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockDatagramStreamSetPriorityCall) Return() *MockDatagramStreamSetPriorityCall {
+	c.Call = c.Call.Return()
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockDatagramStreamSetPriorityCall) Do(f func(int8, bool)) *MockDatagramStreamSetPriorityCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockDatagramStreamSetPriorityCall) DoAndReturn(f func(int8, bool)) *MockDatagramStreamSetPriorityCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}
+
 // SetReadDeadline mocks base method.
 func (m *MockDatagramStream) SetReadDeadline(arg0 time.Time) error {
 	m.ctrl.T.Helper()
@@ -492,6 +528,44 @@ func (c *MockDatagramStreamStreamIDCall) Do(f func() quic.StreamID) *MockDatagra
 
 // DoAndReturn rewrite *gomock.Call.DoAndReturn
 func (c *MockDatagramStreamStreamIDCall) DoAndReturn(f func() quic.StreamID) *MockDatagramStreamStreamIDCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}
+
+// TryWriteAll mocks base method.
+func (m *MockDatagramStream) TryWriteAll(arg0 []byte) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "TryWriteAll", arg0)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// TryWriteAll indicates an expected call of TryWriteAll.
+func (mr *MockDatagramStreamMockRecorder) TryWriteAll(arg0 any) *MockDatagramStreamTryWriteAllCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "TryWriteAll", reflect.TypeOf((*MockDatagramStream)(nil).TryWriteAll), arg0)
+	return &MockDatagramStreamTryWriteAllCall{Call: call}
+}
+
+// MockDatagramStreamTryWriteAllCall wrap *gomock.Call
+type MockDatagramStreamTryWriteAllCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockDatagramStreamTryWriteAllCall) Return(arg0 error) *MockDatagramStreamTryWriteAllCall {
+	c.Call = c.Call.Return(arg0)
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockDatagramStreamTryWriteAllCall) Do(f func([]byte) error) *MockDatagramStreamTryWriteAllCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockDatagramStreamTryWriteAllCall) DoAndReturn(f func([]byte) error) *MockDatagramStreamTryWriteAllCall {
 	c.Call = c.Call.DoAndReturn(f)
 	return c
 }

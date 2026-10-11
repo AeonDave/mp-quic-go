@@ -3,11 +3,12 @@ package http3
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"testing"
 	"time"
 
-	"github.com/AeonDave/mp-quic-go"
+	quic "github.com/AeonDave/mp-quic-go"
 	"github.com/AeonDave/mp-quic-go/http3/qlog"
 	"github.com/AeonDave/mp-quic-go/qlogwriter"
 	"github.com/AeonDave/mp-quic-go/quicvarint"
@@ -16,11 +17,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func nopControlStrHandler(*quic.ReceiveStream, *frameParser) {}
+
 func TestConnReceiveSettings(t *testing.T) {
 	var eventRecorder events.Recorder
 	clientConn, serverConn := newConnPair(t, withServerRecorder(&eventRecorder))
 
-	conn := newRawConn(serverConn, false, nil, nil, &eventRecorder, nil)
+	conn := newRawConn(serverConn, false, nil, nopControlStrHandler, &eventRecorder, nil)
 	b := quicvarint.Append(nil, streamTypeControlStream)
 	sf := &settingsFrame{
 		MaxFieldSectionSize: 1234,
@@ -63,8 +66,8 @@ func TestConnReceiveSettings(t *testing.T) {
 				Frame: qlog.Frame{
 					Frame: qlog.SettingsFrame{
 						MaxFieldSectionSize: 1234,
-						Datagram:            pointer(true),
-						ExtendedConnect:     pointer(true),
+						Datagram:            new(true),
+						ExtendedConnect:     new(true),
 						Other:               map[uint64]uint64{1337: 42},
 					},
 				},
@@ -89,7 +92,7 @@ func TestConnRejectDuplicateStreams(t *testing.T) {
 func testConnRejectDuplicateStreams(t *testing.T, typ uint64) {
 	clientConn, serverConn := newConnPair(t)
 
-	conn := newRawConn(serverConn, false, nil, nil, nil, nil)
+	conn := newRawConn(serverConn, false, nil, nopControlStrHandler, nil, nil)
 	b := quicvarint.Append(nil, typ)
 	if typ == streamTypeControlStream {
 		b = (&settingsFrame{}).Append(b)
@@ -140,7 +143,7 @@ func testConnRejectDuplicateStreams(t *testing.T, typ uint64) {
 func TestConnResetUnknownUniStream(t *testing.T) {
 	clientConn, serverConn := newConnPair(t)
 
-	conn := newRawConn(serverConn, false, nil, nil, nil, nil)
+	conn := newRawConn(serverConn, false, nil, nopControlStrHandler, nil, nil)
 	buf := bytes.NewBuffer(quicvarint.Append(nil, 0x1337))
 	str, err := clientConn.OpenUniStream()
 	require.NoError(t, err)
@@ -169,13 +172,60 @@ func TestConnControlStreamFailures(t *testing.T) {
 	t.Run("missing SETTINGS", func(t *testing.T) {
 		testConnControlStreamFailures(t, (&dataFrame{}).Append(nil), nil, ErrCodeMissingSettings)
 	})
-	t.Run("frame error", func(t *testing.T) {
+	// section 6.2.1 of RFC 9114
+	t.Run("MAX_PUSH_ID before SETTINGS", func(t *testing.T) {
+		b := (&maxPushIDFrame{PushID: 1}).Append(nil)
+		b = (&settingsFrame{}).Append(b)
+		testConnControlStreamFailures(t, b, nil, ErrCodeMissingSettings)
+	})
+	t.Run("CANCEL_PUSH before SETTINGS", func(t *testing.T) {
+		b := (&cancelPushFrame{PushID: 1}).Append(nil)
+		b = (&settingsFrame{}).Append(b)
+		testConnControlStreamFailures(t, b, nil, ErrCodeMissingSettings)
+	})
+	t.Run("malformed MAX_PUSH_ID before SETTINGS", func(t *testing.T) {
+		b := quicvarint.Append(nil, 0xd)
+		b = quicvarint.Append(b, 0)
+		b = (&settingsFrame{}).Append(b)
+		testConnControlStreamFailures(t, b, nil, ErrCodeMissingSettings)
+	})
+	t.Run("PUSH_PROMISE before SETTINGS", func(t *testing.T) {
+		b := quicvarint.Append(nil, 0x5)
+		b = quicvarint.Append(b, 2)
+		b = append(b, 0, 0)
+		b = (&settingsFrame{}).Append(b)
+		testConnControlStreamFailures(t, b, nil, ErrCodeMissingSettings)
+	})
+	t.Run("settings error", func(t *testing.T) {
 		testConnControlStreamFailures(t,
 			// 1337 is invalid value for the Extended CONNECT setting
 			(&settingsFrame{Other: map[uint64]uint64{settingExtendedConnect: 1337}}).Append(nil),
 			nil,
-			ErrCodeFrameError,
+			ErrCodeSettingsError,
 		)
+	})
+	// section 2.1.1 of RFC 9297
+	t.Run("invalid SETTINGS_H3_DATAGRAM value", func(t *testing.T) {
+		testConnControlStreamFailures(t,
+			(&settingsFrame{Other: map[uint64]uint64{settingDatagram: 2}}).Append(nil),
+			nil,
+			ErrCodeSettingsError,
+		)
+	})
+	// section 7.2.4.1 of RFC 9114
+	t.Run("HTTP/2 setting", func(t *testing.T) {
+		testConnControlStreamFailures(t,
+			(&settingsFrame{Other: map[uint64]uint64{0x5: 1337}}).Append(nil),
+			nil,
+			ErrCodeSettingsError,
+		)
+	})
+	// section 7.1 of RFC 9114
+	t.Run("SETTINGS ending inside a setting", func(t *testing.T) {
+		b := quicvarint.Append(nil, 0x4)
+		b = quicvarint.Append(b, 1)
+		b = quicvarint.Append(b, 0x1)
+		testConnControlStreamFailures(t, b, nil, ErrCodeFrameError)
 	})
 	t.Run("control stream closed before SETTINGS", func(t *testing.T) {
 		testConnControlStreamFailures(t, nil, io.EOF, ErrCodeClosedCriticalStream)
@@ -192,7 +242,7 @@ func TestConnControlStreamFailures(t *testing.T) {
 func testConnControlStreamFailures(t *testing.T, data []byte, readErr error, expectedErr ErrCode) {
 	clientConn, serverConn := newConnPair(t)
 
-	conn := newRawConn(clientConn, false, nil, nil, nil, nil)
+	conn := newRawConn(clientConn, false, nil, nopControlStrHandler, nil, nil)
 	controlStr, err := serverConn.OpenUniStream()
 	require.NoError(t, err)
 	_, err = controlStr.Write(quicvarint.Append(nil, streamTypeControlStream))
@@ -240,19 +290,10 @@ func testConnControlStreamFailures(t *testing.T, data []byte, readErr error, exp
 }
 
 func TestConnControlStreamHandler(t *testing.T) {
-	t.Run("with handler", func(t *testing.T) { testConnControlStreamHandler(t, true) })
-	t.Run("without handler", func(t *testing.T) { testConnControlStreamHandler(t, false) })
-}
-
-func testConnControlStreamHandler(t *testing.T, useHandler bool) {
 	localConn, peerConn := newConnPair(t)
 
 	handlerCalled := make(chan struct{})
-	var controlStrHandler func(*quic.ReceiveStream, *frameParser)
-	if useHandler {
-		controlStrHandler = func(*quic.ReceiveStream, *frameParser) { close(handlerCalled) }
-	}
-	conn := newRawConn(localConn, false, nil, controlStrHandler, nil, nil)
+	conn := newRawConn(localConn, false, nil, func(*quic.ReceiveStream, *frameParser) { close(handlerCalled) }, nil, nil)
 
 	b := quicvarint.Append(nil, streamTypeControlStream)
 	b = (&settingsFrame{}).Append(b)
@@ -266,29 +307,17 @@ func testConnControlStreamHandler(t *testing.T, useHandler bool) {
 	localStr, err := localConn.AcceptUniStream(ctx)
 	require.NoError(t, err)
 
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		conn.handleUnidirectionalStream(localStr, false)
-	}()
+	go conn.handleUnidirectionalStream(localStr, false)
 
 	select {
 	case <-conn.ReceivedSettings():
 	case <-time.After(time.Second):
 		t.Fatal("timeout waiting for settings")
 	}
-	if useHandler {
-		select {
-		case <-handlerCalled:
-		case <-time.After(time.Second):
-			t.Fatal("timeout waiting for handler to be called")
-		}
-	} else {
-		select {
-		case <-done:
-		case <-time.After(time.Second):
-			t.Fatal("timeout waiting for handler to return")
-		}
+	select {
+	case <-handlerCalled:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for handler to be called")
 	}
 }
 
@@ -304,7 +333,7 @@ func TestConnRejectPushStream(t *testing.T) {
 func testConnRejectPushStream(t *testing.T, isServer bool, expectedErr ErrCode) {
 	localConn, peerConn := newConnPair(t)
 
-	conn := newRawConn(localConn, false, nil, nil, nil, nil)
+	conn := newRawConn(localConn, false, nil, nopControlStrHandler, nil, nil)
 	buf := bytes.NewBuffer(quicvarint.Append(nil, streamTypePushStream))
 	str, err := peerConn.OpenUniStream()
 	require.NoError(t, err)
@@ -340,7 +369,7 @@ func testConnRejectPushStream(t *testing.T, isServer bool, expectedErr ErrCode) 
 func TestConnInconsistentDatagramSupport(t *testing.T) {
 	clientConn, serverConn := newConnPair(t)
 
-	conn := newRawConn(clientConn, true, nil, nil, nil, nil)
+	conn := newRawConn(clientConn, true, nil, nopControlStrHandler, nil, nil)
 	b := quicvarint.Append(nil, streamTypeControlStream)
 	b = (&settingsFrame{Datagram: true}).Append(b)
 	controlStr, err := serverConn.OpenUniStream()
@@ -373,7 +402,7 @@ func TestConnSendAndReceiveDatagram(t *testing.T) {
 	var eventRecorder events.Recorder
 	clientConn, serverConn := newConnPair(t, withDatagrams(), withClientRecorder(&eventRecorder))
 
-	conn := newRawConn(clientConn, true, nil, nil, &eventRecorder, nil)
+	conn := newRawConn(clientConn, true, nil, nopControlStrHandler, &eventRecorder, nil)
 	b := quicvarint.Append(nil, streamTypeControlStream)
 	b = (&settingsFrame{Datagram: true}).Append(b)
 	controlStr, err := serverConn.OpenUniStream()
@@ -405,8 +434,8 @@ func TestConnSendAndReceiveDatagram(t *testing.T) {
 	require.Equal(t,
 		[]qlogwriter.Event{
 			qlog.DatagramParsed{
-				QuaterStreamID: strID / 4,
-				Raw:            qlog.RawInfo{Length: len(datagram), PayloadLength: 3},
+				QuarterStreamID: strID / 4,
+				Raw:             qlog.RawInfo{Length: len(datagram), PayloadLength: 3},
 			},
 		},
 		eventRecorder.Events(qlog.DatagramParsed{}),
@@ -439,8 +468,8 @@ func TestConnSendAndReceiveDatagram(t *testing.T) {
 	require.Equal(t,
 		[]qlogwriter.Event{
 			qlog.DatagramCreated{
-				QuaterStreamID: strID / 4,
-				Raw:            qlog.RawInfo{PayloadLength: 6, Length: len(expected)},
+				QuarterStreamID: strID / 4,
+				Raw:             qlog.RawInfo{PayloadLength: 6, Length: len(expected)},
 			},
 		},
 		eventRecorder.Events(qlog.DatagramCreated{}),
@@ -465,7 +494,7 @@ func TestConnDatagramFailures(t *testing.T) {
 func testConnDatagramFailures(t *testing.T, datagram []byte) {
 	localConn, peerConn := newConnPair(t, withDatagrams())
 
-	conn := newRawConn(localConn, true, nil, nil, nil, nil)
+	conn := newRawConn(localConn, true, nil, nopControlStrHandler, nil, nil)
 
 	b := quicvarint.Append(nil, streamTypeControlStream)
 	b = (&settingsFrame{Datagram: true}).Append(b)
@@ -498,5 +527,164 @@ func testConnDatagramFailures(t *testing.T, datagram []byte) {
 		)
 	case <-time.After(time.Second):
 		t.Fatal("timeout waiting for close")
+	}
+}
+
+// The QPACK encoder and decoder streams are read, see section 4.2 of RFC 9204.
+// We don't allow the peer to use the dynamic table, and we never refer to the dynamic table.
+func TestConnQPACKStreams(t *testing.T) {
+	t.Run("encoder stream: Set Dynamic Table Capacity 0", func(t *testing.T) {
+		// The instruction is valid. The stream is then closed, which is a connection error.
+		testConnQPACKStream(t, streamTypeQPACKEncoderStream, []byte{0x20, 0x20}, io.EOF, ErrCodeClosedCriticalStream)
+	})
+	t.Run("encoder stream: closed", func(t *testing.T) {
+		testConnQPACKStream(t, streamTypeQPACKEncoderStream, nil, io.EOF, ErrCodeClosedCriticalStream)
+	})
+	t.Run("encoder stream: reset", func(t *testing.T) {
+		testConnQPACKStream(t, streamTypeQPACKEncoderStream, []byte{0x20}, &quic.StreamError{ErrorCode: 42}, ErrCodeClosedCriticalStream)
+	})
+	t.Run("encoder stream: closed inside an instruction", func(t *testing.T) {
+		// Set Dynamic Table Capacity with a capacity that doesn't fit into the prefix
+		testConnQPACKStream(t, streamTypeQPACKEncoderStream, []byte{0x3f, 0x80}, io.EOF, ErrCodeClosedCriticalStream)
+	})
+	t.Run("encoder stream: capacity exceeds the limit", func(t *testing.T) {
+		testConnQPACKStream(t, streamTypeQPACKEncoderStream, []byte{0x21}, nil, ErrCodeQPACKEncoderStreamError)
+	})
+	t.Run("encoder stream: large capacity", func(t *testing.T) {
+		testConnQPACKStream(t, streamTypeQPACKEncoderStream, []byte{0x3f, 0xe1, 0x1f}, nil, ErrCodeQPACKEncoderStreamError)
+	})
+	t.Run("encoder stream: Insert with Name Reference", func(t *testing.T) {
+		testConnQPACKStream(t, streamTypeQPACKEncoderStream, []byte{0xc0, 0x03, 'f', 'o', 'o'}, nil, ErrCodeQPACKEncoderStreamError)
+	})
+	t.Run("encoder stream: Insert with Literal Name", func(t *testing.T) {
+		testConnQPACKStream(t, streamTypeQPACKEncoderStream, []byte{0x43, 'f', 'o', 'o', 0x03, 'b', 'a', 'r'}, nil, ErrCodeQPACKEncoderStreamError)
+	})
+	t.Run("encoder stream: Duplicate", func(t *testing.T) {
+		testConnQPACKStream(t, streamTypeQPACKEncoderStream, []byte{0x00}, nil, ErrCodeQPACKEncoderStreamError)
+	})
+	t.Run("decoder stream: Stream Cancellation", func(t *testing.T) {
+		// The instructions are valid. The stream is then closed, which is a connection error.
+		testConnQPACKStream(t, streamTypeQPACKDecoderStream, []byte{0x40, 0x7f, 0x81, 0x01}, io.EOF, ErrCodeClosedCriticalStream)
+	})
+	t.Run("decoder stream: closed", func(t *testing.T) {
+		testConnQPACKStream(t, streamTypeQPACKDecoderStream, nil, io.EOF, ErrCodeClosedCriticalStream)
+	})
+	t.Run("decoder stream: reset", func(t *testing.T) {
+		testConnQPACKStream(t, streamTypeQPACKDecoderStream, []byte{0x44}, &quic.StreamError{ErrorCode: 42}, ErrCodeClosedCriticalStream)
+	})
+	t.Run("decoder stream: closed inside an instruction", func(t *testing.T) {
+		testConnQPACKStream(t, streamTypeQPACKDecoderStream, []byte{0x7f, 0x80}, io.EOF, ErrCodeClosedCriticalStream)
+	})
+	t.Run("decoder stream: stream ID too large", func(t *testing.T) {
+		testConnQPACKStream(t, streamTypeQPACKDecoderStream, append([]byte{0x7f}, bytes.Repeat([]byte{0xff}, 9)...), nil, ErrCodeQPACKDecoderStreamError)
+	})
+	t.Run("decoder stream: Section Acknowledgment", func(t *testing.T) {
+		testConnQPACKStream(t, streamTypeQPACKDecoderStream, []byte{0x80}, nil, ErrCodeQPACKDecoderStreamError)
+	})
+	t.Run("decoder stream: Insert Count Increment 0", func(t *testing.T) {
+		testConnQPACKStream(t, streamTypeQPACKDecoderStream, []byte{0x00}, nil, ErrCodeQPACKDecoderStreamError)
+	})
+	t.Run("decoder stream: Insert Count Increment", func(t *testing.T) {
+		testConnQPACKStream(t, streamTypeQPACKDecoderStream, []byte{0x01}, nil, ErrCodeQPACKDecoderStreamError)
+	})
+}
+
+func testConnQPACKStream(t *testing.T, typ uint64, data []byte, streamEnd error, expectedErr ErrCode) {
+	t.Helper()
+
+	localConn, peerConn := newConnPair(t)
+	conn := newRawConn(localConn, false, nil, nopControlStrHandler, nil, nil)
+	str, err := peerConn.OpenUniStream()
+	require.NoError(t, err)
+	_, err = str.Write(append(quicvarint.Append(nil, typ), data...))
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	localStr, err := localConn.AcceptUniStream(ctx)
+	require.NoError(t, err)
+
+	done := make(chan struct{})
+	switch streamEnd {
+	case nil, io.EOF:
+		go func() {
+			defer close(done)
+			conn.handleUnidirectionalStream(localStr, true)
+		}()
+		if streamEnd == io.EOF {
+			require.NoError(t, str.Close())
+		}
+	default:
+		// Read the stream type and the data before the stream is reset,
+		// since a reset stream doesn't return the data that was not read yet.
+		_, err := io.ReadFull(localStr, make([]byte, quicvarint.Len(typ)+len(data)))
+		require.NoError(t, err)
+		go func() {
+			defer close(done)
+			if typ == streamTypeQPACKEncoderStream {
+				conn.handleQPACKEncoderStream(localStr)
+			} else {
+				conn.handleQPACKDecoderStream(localStr)
+			}
+		}()
+		str.CancelWrite(1337)
+	}
+	expectConnClosedByPeer(t, peerConn, expectedErr)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+}
+
+// QUIC DATAGRAM frames are only sent once SETTINGS_H3_DATAGRAM was sent and received with a value of 1
+// (section 2.1.1 of RFC 9297).
+func TestConnSendDatagramRequiresSettings(t *testing.T) {
+	t.Run("not enabled locally", func(t *testing.T) {
+		clientConn, _ := newConnPair(t, withDatagrams())
+		conn := newRawConn(clientConn, false, nil, nopControlStrHandler, nil, nil)
+		require.EqualError(t, conn.sendDatagram(0, []byte("foo")), "http3: HTTP datagrams not enabled")
+	})
+
+	for _, peerSupport := range []bool{true, false} {
+		t.Run(fmt.Sprintf("peer support: %t", peerSupport), func(t *testing.T) {
+			clientConn, serverConn := newConnPair(t, withDatagrams())
+			conn := newRawConn(clientConn, true, nil, nopControlStrHandler, nil, nil)
+
+			// sending blocks until the peer's SETTINGS frame was received
+			errChan := make(chan error, 1)
+			go func() { errChan <- conn.sendDatagram(0, []byte("foo")) }()
+			select {
+			case err := <-errChan:
+				t.Fatalf("sendDatagram returned before receiving the SETTINGS: %v", err)
+			case <-time.After(scaleDuration(10 * time.Millisecond)):
+			}
+
+			b := quicvarint.Append(nil, streamTypeControlStream)
+			b = (&settingsFrame{Datagram: peerSupport}).Append(b)
+			controlStr, err := serverConn.OpenUniStream()
+			require.NoError(t, err)
+			_, err = controlStr.Write(b)
+			require.NoError(t, err)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			clientStr, err := clientConn.AcceptUniStream(ctx)
+			require.NoError(t, err)
+			go conn.handleUnidirectionalStream(clientStr, false)
+
+			select {
+			case err := <-errChan:
+				if peerSupport {
+					require.NoError(t, err)
+					data, err := serverConn.ReceiveDatagram(ctx)
+					require.NoError(t, err)
+					require.Equal(t, append([]byte{0}, []byte("foo")...), data)
+				} else {
+					require.EqualError(t, err, "http3: peer doesn't support HTTP datagrams")
+				}
+			case <-time.After(time.Second):
+				t.Fatal("timeout")
+			}
+		})
 	}
 }

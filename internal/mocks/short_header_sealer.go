@@ -189,3 +189,41 @@ func (c *MockShortHeaderSealerSealCall) DoAndReturn(f func([]byte, []byte, proto
 	c.Call = c.Call.DoAndReturn(f)
 	return c
 }
+
+// SealForPath mocks base method.
+func (m *MockShortHeaderSealer) SealForPath(dst, src []byte, pathID protocol.PathID, packetNumber protocol.PacketNumber, associatedData []byte) []byte {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "SealForPath", dst, src, pathID, packetNumber, associatedData)
+	ret0, _ := ret[0].([]byte)
+	return ret0
+}
+
+// SealForPath indicates an expected call of SealForPath.
+func (mr *MockShortHeaderSealerMockRecorder) SealForPath(dst, src, pathID, packetNumber, associatedData any) *MockShortHeaderSealerSealForPathCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SealForPath", reflect.TypeOf((*MockShortHeaderSealer)(nil).SealForPath), dst, src, pathID, packetNumber, associatedData)
+	return &MockShortHeaderSealerSealForPathCall{Call: call}
+}
+
+// MockShortHeaderSealerSealForPathCall wrap *gomock.Call
+type MockShortHeaderSealerSealForPathCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockShortHeaderSealerSealForPathCall) Return(arg0 []byte) *MockShortHeaderSealerSealForPathCall {
+	c.Call = c.Call.Return(arg0)
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockShortHeaderSealerSealForPathCall) Do(f func([]byte, []byte, protocol.PathID, protocol.PacketNumber, []byte) []byte) *MockShortHeaderSealerSealForPathCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockShortHeaderSealerSealForPathCall) DoAndReturn(f func([]byte, []byte, protocol.PathID, protocol.PacketNumber, []byte) []byte) *MockShortHeaderSealerSealForPathCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}

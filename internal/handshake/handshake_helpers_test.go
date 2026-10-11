@@ -1,6 +1,7 @@
 package handshake
 
 import (
+	"crypto/fips140"
 	"crypto/tls"
 	"encoding/hex"
 	"strings"
@@ -11,7 +12,7 @@ import (
 
 func splitHexString(t *testing.T, s string) (slice []byte) {
 	t.Helper()
-	for _, ss := range strings.Split(s, " ") {
+	for ss := range strings.SplitSeq(s, " ") {
 		if ss[0:2] == "0x" {
 			ss = ss[2:]
 		}
@@ -31,5 +32,10 @@ func TestSplitHexString(t *testing.T) {
 var cipherSuites = []cipherSuite{
 	getCipherSuite(tls.TLS_AES_128_GCM_SHA256),
 	getCipherSuite(tls.TLS_AES_256_GCM_SHA384),
-	getCipherSuite(tls.TLS_CHACHA20_POLY1305_SHA256),
+}
+
+func init() {
+	if !fips140.Enabled() {
+		cipherSuites = append(cipherSuites, getCipherSuite(tls.TLS_CHACHA20_POLY1305_SHA256))
+	}
 }

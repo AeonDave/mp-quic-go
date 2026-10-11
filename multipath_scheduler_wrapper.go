@@ -1,11 +1,11 @@
 package quic
 
 import (
-	"net"
+	"slices"
 	"sync"
+	"time"
 
 	"github.com/AeonDave/mp-quic-go/internal/protocol"
-	"github.com/AeonDave/mp-quic-go/internal/wire"
 )
 
 // SchedulingPolicy defines the scheduling algorithm to use
@@ -17,41 +17,74 @@ const (
 	SchedulingPolicyLowLatency
 )
 
-// PathSchedulerWrapper integrates the path manager with scheduling algorithms
+// PathSchedulerWrapper is a MultipathController that selects paths using the scheduler of a SchedulingPolicy.
+// It collects the statistics of the paths from the packet events (see MultipathObserver).
 type PathSchedulerWrapper struct {
 	mu               sync.RWMutex
-	pathManager      *MultipathPathManager
 	scheduler        PathScheduler
+	policy           SchedulingPolicy
 	multipathEnabled bool
+	// statistics of the paths, by path ID
+	pathStats map[PathID]*schedulerPathStats
 }
 
-// NewMultipathScheduler creates a new multipath scheduler
-func NewMultipathScheduler(pm *MultipathPathManager, policy SchedulingPolicy) *PathSchedulerWrapper {
+// schedulerPathStats are the statistics of a path.
+type schedulerPathStats struct {
+	smoothedRTT time.Duration
+	rttVar      time.Duration
+	packetsSent uint64
+	bytesSent   ByteCount
+	packetsLost uint64
+}
+
+var (
+	_ multipathControllerCloner = &PathSchedulerWrapper{}
+	_ MultipathObserver         = &PathSchedulerWrapper{}
+)
+
+// NewMultipathScheduler creates a new multipath controller using the scheduler of the policy.
+func NewMultipathScheduler(policy SchedulingPolicy) *PathSchedulerWrapper {
 	var scheduler PathScheduler
 
 	switch policy {
 	case SchedulingPolicyRoundRobin:
 		scheduler = NewRoundRobinScheduler()
-	case SchedulingPolicyMinRTT, SchedulingPolicyLowLatency:
+	case SchedulingPolicyMinRTT:
+		// pure minimum RTT: the path with the lowest RTT whose congestion window isn't full
+		scheduler = NewMinRTTScheduler(1)
+	case SchedulingPolicyLowLatency:
 		scheduler = NewLowLatencyScheduler()
 	default:
 		scheduler = NewRoundRobinScheduler()
 	}
 
 	return &PathSchedulerWrapper{
-		pathManager: pm,
-		scheduler:   scheduler,
+		scheduler: scheduler,
+		policy:    policy,
+		pathStats: make(map[PathID]*schedulerPathStats),
 	}
 }
 
-// EnableMultipath enables multipath support
+// cloneForConnection creates a scheduler with the same configuration, but without any paths.
+func (s *PathSchedulerWrapper) cloneForConnection() MultipathController {
+	return NewMultipathScheduler(s.policy)
+}
+
+// RemovePath is called when a path is abandoned. The statistics of the path are removed.
+func (s *PathSchedulerWrapper) RemovePath(pathID PathID) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.pathStats, pathID)
+}
+
+// EnableMultipath is called when IETF Multipath QUIC becomes active on the connection.
 func (s *PathSchedulerWrapper) EnableMultipath() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.multipathEnabled = true
 }
 
-// DisableMultipath disables multipath support
+// DisableMultipath stops updating the scheduler's quota (see RecordSent).
 func (s *PathSchedulerWrapper) DisableMultipath() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -65,51 +98,6 @@ func (s *PathSchedulerWrapper) IsMultipathEnabled() bool {
 	return s.multipathEnabled
 }
 
-// selectPathInternal selects the best path for sending the next packet (internal)
-func (s *PathSchedulerWrapper) selectPathInternal(hasRetransmission bool) protocol.PathID {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if !s.multipathEnabled || s.pathManager == nil {
-		return protocol.InvalidPathID
-	}
-
-	// Get active paths from path manager
-	activePaths := s.pathManager.GetActivePaths()
-	if len(activePaths) == 0 {
-		return protocol.InvalidPathID
-	}
-
-	// Convert to scheduler path info
-	pathInfos := make([]SchedulerPathInfo, 0, len(activePaths))
-	for _, path := range activePaths {
-		if path.State != MultipathPathStateActive {
-			continue
-		}
-
-		pathInfo := SchedulerPathInfo{
-			PathID:         protocol.PathID(path.PathID),
-			SendingAllowed: true,
-			SmoothedRTT:    path.RTT,
-			BytesSent:      ByteCount(path.BytesSent),
-			PacketsSent:    0, // Field not available in MultipathPath
-		}
-		pathInfos = append(pathInfos, pathInfo)
-	}
-
-	if len(pathInfos) == 0 {
-		return protocol.InvalidPathID
-	}
-
-	// Use scheduler to select path
-	selected := s.scheduler.SelectPath(pathInfos, hasRetransmission)
-	if selected == nil {
-		return protocol.InvalidPathID
-	}
-
-	return selected.PathID
-}
-
 // RecordSent updates scheduler state after sending a packet
 func (s *PathSchedulerWrapper) RecordSent(pathID protocol.PathID, packetSize uint64) {
 	s.mu.Lock()
@@ -119,177 +107,56 @@ func (s *PathSchedulerWrapper) RecordSent(pathID protocol.PathID, packetSize uin
 		return
 	}
 
-	s.scheduler.UpdateQuota(PathID(pathID), ByteCount(packetSize))
+	s.scheduler.UpdateQuota(pathID, ByteCount(packetSize))
 }
 
-// SelectPath implements MultipathController interface
+// SelectPath implements MultipathController interface.
+// It selects one of the paths in ctx.Paths, using the statistics collected for these paths.
+// It returns false if ctx.Paths is empty, or if the scheduler doesn't select any of the paths.
 func (s *PathSchedulerWrapper) SelectPath(ctx PathSelectionContext) (PathInfo, bool) {
-	pathID := s.selectPathInternal(ctx.HasRetransmission)
-	if pathID == protocol.InvalidPathID {
+	if len(ctx.Paths) == 0 {
 		return PathInfo{}, false
 	}
-
 	s.mu.RLock()
-	pm := s.pathManager
-	enabled := s.multipathEnabled
-	s.mu.RUnlock()
-	if !enabled || pm == nil {
-		return PathInfo{}, false
-	}
-
-	path := pm.GetPath(pathID)
-	if path == nil || path.RemoteAddr == nil {
-		return PathInfo{}, false
-	}
-
-	return PathInfo{
-		ID:         PathID(path.PathID),
-		LocalAddr:  path.LocalAddr,
-		RemoteAddr: path.RemoteAddr,
-	}, true
-}
-
-// PathIDForPacket implements MultipathController interface
-func (s *PathSchedulerWrapper) PathIDForPacket(remoteAddr, localAddr net.Addr) (PathID, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	if !s.multipathEnabled || s.pathManager == nil {
-		return 0, false
-	}
-
-	paths := s.pathManager.GetAllPaths()
-	for _, path := range paths {
-		if addrsEqual(path.RemoteAddr, remoteAddr) && matchLocalAddr(path.LocalAddr, localAddr) {
-			return PathID(path.PathID), true
+	pathInfos := make([]SchedulerPathInfo, 0, len(ctx.Paths))
+	for _, path := range ctx.Paths {
+		info := SchedulerPathInfo{
+			PathID:         path.ID,
+			SendingAllowed: true,
+			Backup:         path.isBackup(),
 		}
+		if stats, ok := s.pathStats[path.ID]; ok {
+			info.SmoothedRTT = stats.smoothedRTT
+			info.RTTVar = stats.rttVar
+			info.PacketsSent = stats.packetsSent
+			info.BytesSent = stats.bytesSent
+			info.PacketsLost = stats.packetsLost
+		}
+		pathInfos = append(pathInfos, info)
 	}
+	s.mu.RUnlock()
 
-	return 0, false
+	applyPathCongestion(pathInfos, ctx)
+	// ACK-only packets and retransmissions may be sent on paths that are congestion limited.
+	selected := s.scheduler.SelectPath(pathInfos, ctx.HasRetransmission || ctx.AckOnly)
+	if selected == nil {
+		return PathInfo{}, false
+	}
+	idx := slices.IndexFunc(ctx.Paths, func(p PathInfo) bool { return p.ID == selected.PathID })
+	if idx == -1 {
+		return PathInfo{}, false
+	}
+	return ctx.Paths[idx], true
 }
 
-// RegisterPath registers the primary path for scheduling.
+// RegisterPath is called when a path becomes active.
+// The statistics collected for the path are used when it is passed to SelectPath.
 func (s *PathSchedulerWrapper) RegisterPath(info PathInfo) {
-	s.mu.RLock()
-	pm := s.pathManager
-	s.mu.RUnlock()
-
-	if pm == nil {
-		return
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.pathStats[info.ID]; !ok && info.ID != InvalidPathID {
+		s.pathStats[info.ID] = &schedulerPathStats{}
 	}
-	if info.ID == 0 {
-		pm.SetPrimaryPath(info.LocalAddr, info.RemoteAddr)
-		s.EnableMultipath()
-		return
-	}
-	pm.AddPath(info.LocalAddr, info.RemoteAddr)
-}
-
-// AddPath adds a new path and returns the assigned path ID.
-func (s *PathSchedulerWrapper) AddPath(info PathInfo) (PathID, bool) {
-	s.mu.RLock()
-	pm := s.pathManager
-	enabled := s.multipathEnabled
-	s.mu.RUnlock()
-
-	if !enabled || pm == nil || info.RemoteAddr == nil {
-		return InvalidPathID, false
-	}
-	pathID := pm.AddPath(info.LocalAddr, info.RemoteAddr)
-	if pathID == protocol.InvalidPathID {
-		return InvalidPathID, false
-	}
-	return PathID(pathID), true
-}
-
-// GetAvailablePaths returns active paths suitable for scheduling.
-func (s *PathSchedulerWrapper) GetAvailablePaths() []PathInfo {
-	s.mu.RLock()
-	pm := s.pathManager
-	enabled := s.multipathEnabled
-	s.mu.RUnlock()
-
-	if !enabled || pm == nil {
-		return nil
-	}
-
-	active := pm.GetActivePaths()
-	paths := make([]PathInfo, 0, len(active))
-	for _, path := range active {
-		if path.RemoteAddr == nil {
-			continue
-		}
-		paths = append(paths, PathInfo{
-			ID:         PathID(path.PathID),
-			LocalAddr:  path.LocalAddr,
-			RemoteAddr: path.RemoteAddr,
-		})
-	}
-	return paths
-}
-
-// PathInfoForID returns path information for a given ID.
-func (s *PathSchedulerWrapper) PathInfoForID(pathID PathID) (PathInfo, bool) {
-	s.mu.RLock()
-	pm := s.pathManager
-	s.mu.RUnlock()
-
-	if pm == nil {
-		return PathInfo{}, false
-	}
-	path := pm.GetPath(protocol.PathID(pathID))
-	if path == nil || path.RemoteAddr == nil {
-		return PathInfo{}, false
-	}
-	return PathInfo{
-		ID:         PathID(path.PathID),
-		LocalAddr:  path.LocalAddr,
-		RemoteAddr: path.RemoteAddr,
-	}, true
-}
-
-// ValidatePath marks a path as validated and active.
-func (s *PathSchedulerWrapper) ValidatePath(pathID PathID) {
-	s.mu.RLock()
-	pm := s.pathManager
-	enabled := s.multipathEnabled
-	s.mu.RUnlock()
-
-	if !enabled || pm == nil {
-		return
-	}
-	pm.ValidatePath(protocol.PathID(pathID))
-}
-
-// HandleAddAddressFrame forwards ADD_ADDRESS frames to the path manager.
-func (s *PathSchedulerWrapper) HandleAddAddressFrame(frame *wire.AddAddressFrame) {
-	s.mu.RLock()
-	pm := s.pathManager
-	enabled := s.multipathEnabled
-	s.mu.RUnlock()
-
-	if !enabled || pm == nil {
-		return
-	}
-	pm.HandleAddAddressFrame(frame)
-}
-
-// HandlePathsFrame forwards PATHS frames to the path manager.
-func (s *PathSchedulerWrapper) HandlePathsFrame(frame *wire.PathsFrame) {
-	_ = frame
-}
-
-// HandleClosePathFrame forwards CLOSE_PATH frames to the path manager.
-func (s *PathSchedulerWrapper) HandleClosePathFrame(frame *wire.ClosePathFrame) {
-	s.mu.RLock()
-	pm := s.pathManager
-	enabled := s.multipathEnabled
-	s.mu.RUnlock()
-
-	if !enabled || pm == nil {
-		return
-	}
-	pm.HandleClosePathFrame(frame)
 }
 
 // OnPacketSent updates scheduler and path statistics.
@@ -297,16 +164,14 @@ func (s *PathSchedulerWrapper) OnPacketSent(ev PathEvent) {
 	if ev.PathID == InvalidPathID || ev.IsPathProbe || ev.IsPathMTUProbe || !ev.AckEliciting {
 		return
 	}
-	s.RecordSent(protocol.PathID(ev.PathID), uint64(ev.PacketSize))
+	s.RecordSent(ev.PathID, uint64(ev.PacketSize))
 
-	s.mu.RLock()
-	pm := s.pathManager
-	enabled := s.multipathEnabled
-	s.mu.RUnlock()
-	if !enabled || pm == nil {
-		return
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if stats := s.pathStats[ev.PathID]; stats != nil {
+		stats.packetsSent++
+		stats.bytesSent += ev.PacketSize
 	}
-	pm.RecordPathUsage(protocol.PathID(ev.PathID), uint64(ev.PacketSize))
 }
 
 // OnPacketAcked updates RTT statistics for a path.
@@ -314,17 +179,22 @@ func (s *PathSchedulerWrapper) OnPacketAcked(ev PathEvent) {
 	if ev.PathID == InvalidPathID || ev.SmoothedRTT == 0 {
 		return
 	}
-	s.mu.RLock()
-	pm := s.pathManager
-	enabled := s.multipathEnabled
-	s.mu.RUnlock()
-	if !enabled || pm == nil {
-		return
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if stats := s.pathStats[ev.PathID]; stats != nil {
+		stats.smoothedRTT = ev.SmoothedRTT
+		stats.rttVar = ev.RTTVar
 	}
-	pm.UpdatePathRTT(protocol.PathID(ev.PathID), ev.SmoothedRTT)
 }
 
-// OnPacketLost is a no-op for scheduler wrapper.
+// OnPacketLost updates the loss statistics of a path.
 func (s *PathSchedulerWrapper) OnPacketLost(ev PathEvent) {
-	_ = ev
+	if ev.PathID == InvalidPathID || ev.IsPathProbe || ev.IsPathMTUProbe || !ev.AckEliciting {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if stats := s.pathStats[ev.PathID]; stats != nil {
+		stats.packetsLost++
+	}
 }
